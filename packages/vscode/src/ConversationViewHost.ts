@@ -34,6 +34,8 @@ export class ConversationViewHost {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private gate: TurnGate = NO_TURN;
   private held: PromptHold = EMPTY_HOLD;
+  /** The open turn produced output since the last flush; see `plannerTurnAlive`. */
+  private alive = false;
 
   constructor(private readonly post: (msg: HostToWebview) => void) {}
 
@@ -48,7 +50,14 @@ export class ConversationViewHost {
     }
     const wasOpen = this.gate.open;
     this.update(followTurn(this.view, this.gate, msg));
-    if (this.gate.open !== wasOpen) this.announceTurn();
+    if (this.gate.open !== wasOpen) {
+      this.announceTurn();
+    } else if (wasOpen !== null && 'turnId' in msg && msg.turnId === wasOpen) {
+      // Only an event tagged with the turn the gate holds open: untagged or
+      // late traffic of an ended or stopped one must never re-lock the input.
+      this.alive = true;
+      this.timer ??= setTimeout(() => this.flush(), FLUSH_MS);
+    }
   }
 
   note(role: LocalEntry['role'], text: string): void {
@@ -107,7 +116,13 @@ export class ConversationViewHost {
       this.post({ type: 'promptUnsent', text: all.text });
       this.showHeld(all.rest);
     }
-    if (this.gate.open === null) return;
+    if (this.gate.open === null) {
+      // The webview locks its composer at send, before the host has opened the
+      // turn. Announcing the closed turn releases that gate even when there is
+      // nothing here to stop; otherwise later plan updates stay dropped.
+      this.post({ type: 'plannerTurn', active: false });
+      return;
+    }
     this.update(stopTurn(this.view, this.gate));
     this.announceTurn();
   }
@@ -129,13 +144,11 @@ export class ConversationViewHost {
 
   /**
    * A new session or a cleared plan. A turn the webview asked for that never
-   * opened here belongs to the old session too, and stop() would not announce
-   * it, so the turn is said closed either way.
+   * opened here belongs to the old session too: replace() stops whatever is
+   * open and announces the closed turn either way (see stop()).
    */
   reset(): void {
-    const wasOpen = this.gate.open !== null;
     this.replace(EMPTY_CONVERSATION);
-    if (!wasOpen) this.post({ type: 'plannerTurn', active: false });
   }
 
   /** A new webview holds nothing, so it is sent every block. */
@@ -147,13 +160,19 @@ export class ConversationViewHost {
   }
 
   flush(): void {
+    this.send(false);
+  }
+
+  private send(replaced: boolean): void {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     const patch = diffConversation(this.sent, this.view.blocks);
     this.sent = this.view.blocks;
-    if (patch) this.post(patch);
+    if (patch) this.post(replaced ? { ...patch, replaced } : patch);
+    if (this.alive && this.gate.open !== null) this.post({ type: 'plannerTurnAlive' });
+    this.alive = false;
   }
 
   // A turn still open belongs to the view being replaced; stopping it keeps
@@ -163,7 +182,7 @@ export class ConversationViewHost {
     if (this.held.length > 0) this.showHeld(EMPTY_HOLD);
     this.stop();
     this.view = view;
-    this.flush();
+    this.send(true);
   }
 
   private showHeld(held: PromptHold): void {

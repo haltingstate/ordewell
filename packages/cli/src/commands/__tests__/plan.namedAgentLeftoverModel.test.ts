@@ -221,6 +221,7 @@ describe('ordewell plan --no-chat with a named coding agent and a vendor model l
 
     const runner: IRunner = { activeCount: 0, spawn: vi.fn(), stop: vi.fn(), stopAll: vi.fn() } as unknown as IRunner;
     pool = new OrchestratorPool({
+      accountLimitCollectors: () => [],
       modelResolver: catalogResolver(),
       runner,
       runnerInstallation: { plannerUsability: async () => ({ usable: true as const }), filterInstalled: async (ids: string[]) => ids.filter((id) => (AGENTS as readonly string[]).includes(id)) },
@@ -231,7 +232,7 @@ describe('ordewell plan --no-chat with a named coding agent and a vendor model l
     const port = (server.address() as AddressInfo).port;
     const { token, file } = mintDaemonToken(port);
     const admission = { port, token, tokenFile: file };
-    server.on('request', createRequestListener(createApp(pool, admission)));
+    server.on('request', createRequestListener(createApp(pool, admission), admission));
     attachWsHandler(server, pool, admission);
     client = new ApiClient(port, workspace);
   });

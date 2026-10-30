@@ -16,7 +16,7 @@ const frame = (state: TuiState): string => render(state).join('\n');
 
 const task: TaskView = { id: 't1', order: 1, title: 'Build', type: 'ai', status: 'in_progress', dependencies: [] };
 const plan = (over: Partial<TuiState> = {}): TuiState =>
-  initialState({ sessionId: 's1', rows: 40, cols: 120, focus: 'plan', tasks: [task], ...over });
+  initialState({ sessionId: 's1', rows: 40, cols: 120, focus: 'plan', tasks: [task], runSettingsKnown: true, ...over });
 /** The user's run settings as the daemon answered them (ADR-0030). */
 const loaded = (state: TuiState, run: Partial<GlobalRunSettings>): TuiState =>
   apply(state, { type: 'settingsLoaded', settings: { run: { ...RUN_SETTINGS_DEFAULTS, ...run } } }).state;
@@ -30,15 +30,14 @@ describe('run settings in the TUI (ADR-0030)', () => {
   it('lists them in the welcome screen\'s Setup block, with the commands that change them', () => {
     const welcome = frame(loaded(initialState({ rows: 40, cols: 120 }), { supervisorLevel: 'act', autorun: true }));
 
-    expect(welcome).toMatch(/Autonomy\s+Full\s*\n/);
+    expect(welcome).toMatch(/Autonomy\s+Guarded\s*\n/);
     expect(welcome).toMatch(/Run\s+supervisor Act · auto-merge off · autorun on\s+\/settings/);
-    expect(welcome).toMatch(/Research\s+runs within the Parallel limit\s*\n/);
-    expect(welcome).not.toMatch(/Research[^\n]*\/settings/);
+    expect(welcome).not.toMatch(/Research/);
   });
 
   it('shows them on the status line, and the run\'s own level where it differs', () => {
-    expect(frame(plan())).toContain('● Full · supervisor Watch');
-    expect(frame(loaded(plan(), { supervisorLevel: 'act', mergeAtGatesAutomatically: true, autorun: true }))).toContain('● Full · supervisor Act · auto-merge · autorun');
+    expect(frame(plan())).toContain('● Guarded · supervisor Watch');
+    expect(frame(loaded(plan(), { supervisorLevel: 'act', mergeAtGatesAutomatically: true, autorun: true }))).toContain('● Guarded · supervisor Act · auto-merge · autorun');
 
     const lowered = apply(loaded(plan({ status: 'executing' }), { supervisorLevel: 'act' }), { type: 'planUpdated', sessionId: 's1', plan: {
       tasks: [task], runSettings: { mergeAtGatesAutomatically: false, supervisorLevel: 'watch' },

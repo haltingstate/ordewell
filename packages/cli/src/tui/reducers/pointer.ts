@@ -1,6 +1,6 @@
-import { chatPaneWidth, paneColumns, planPaneWidth } from '../geometry';
 import {
-  bodyRows, bottomRowInView, chatScrollMax, planOffset, planScrollExtent, revealOffset, rowNearestView, topRowInView,
+  bodyPanes, bottomRowInView, type BodyPanes, chatScrollMax, planOffset, planScrollExtent, revealOffset, rowNearestView, selectionArea, selectionColumns, stackedPaneAtRow,
+  topRowInView,
 } from '../layout';
 import { selectedText } from '../render';
 import type { Cell, Focus, Selection, TuiState } from '../state';
@@ -30,17 +30,24 @@ export function pageNotch(viewport: number): number {
  * Lines a scroll key moves, positive being *back* through the content, or
  * `null` when it is not a scroll key. The viewport is measured only for the
  * page keys — every other keystroke in the chat pane comes through here on its
- * way to the editor.
+ * way to the editor — and it is the viewport of the pane being scrolled: a
+ * stacked pane is shorter than the body, and a page of the body's height would
+ * skip the lines in between.
  */
-export function scrollDelta(key: Key, state: TuiState): number | null {
+export function scrollDelta(key: Key, state: TuiState, pane: Focus): number | null {
   if (key.name === 'scrollup') return WHEEL_NOTCH;
   if (key.name === 'scrolldown') return -WHEEL_NOTCH;
-  if (key.name === 'pageup') return pageNotch(bodyRows(state));
-  if (key.name === 'pagedown') return -pageNotch(bodyRows(state));
-  return null;
+  if (key.name !== 'pageup' && key.name !== 'pagedown') return null;
+  const { chat, plan } = bodyPanes(state);
+  const page = pageNotch((pane === 'plan' && plan ? plan : chat).rows);
+  return key.name === 'pageup' ? page : -page;
 }
 
 export const isWheel = (key: Key): boolean => key.name === 'scrollup' || key.name === 'scrolldown';
+
+/** A key that only moves a viewport, so scrolling never dismisses a task view's notice. */
+export const isScrollKey = (key: Key): boolean =>
+  key.name === 'pageup' || key.name === 'pagedown' || isWheel(key) || key.name === 'wheelignored';
 
 export const isMouseSelect = (key: Key): boolean =>
   key.name === 'mousedown' || key.name === 'mousedrag' || key.name === 'mouseup';
@@ -58,10 +65,19 @@ export const isMouseSelect = (key: Key): boolean =>
  * The divider counts as the plan side: a one-column dead strip between two
  * scrollable panes is a bug the user would experience as the wheel randomly
  * failing, and a press landing on it as a selection that refuses to start.
+ *
+ * Stacked, the panes are told apart by row instead, and the rows under the body
+ * (status, composer, footer) are neither pane's — they fall back to focus.
  */
 export function pointerPane(state: TuiState, key: Key): Focus {
-  if (key.col === undefined || planPaneWidth(state) === 0) return state.focus;
-  return key.col <= chatPaneWidth(state) ? 'chat' : 'plan';
+  return pointedPane(bodyPanes(state), key) ?? state.focus;
+}
+
+/** The pane the pointer is over, or `null` when it is over neither or reported no position. */
+function pointedPane(panes: BodyPanes, key: Key): Focus | null {
+  if (!panes.plan) return null;
+  if (panes.mode === 'stacked') return key.row === undefined ? null : stackedPaneAtRow(panes, key.row);
+  return key.col === undefined ? null : key.col <= panes.chat.cols ? 'chat' : 'plan';
 }
 
 export function scrollPointed(state: TuiState, key: Key): Step {
@@ -95,9 +111,18 @@ export function toggleDetail(state: TuiState): Step {
  * jumping when the selection is still visible.
  */
 export function settlePlan(state: TuiState): TuiState {
-  if (planPaneWidth(state) === 0) return state;
   const layout = planScrollExtent(state);
+  if (layout.rows === 0) return state;
   return { ...state, planScroll: revealOffset(layout, planOffset(layout, state.planScroll), layout.anchor) };
+}
+
+/**
+ * Re-clamps both panes to the sizes they now have. Anything that moves the
+ * boundary between them (a resize, a focus change in a body too short to hold
+ * both) leaves each offset measured against a height it no longer has.
+ */
+export function settlePanes(state: TuiState): TuiState {
+  return settlePlan({ ...state, scroll: clamp(state.scroll, chatScrollMax(state)) });
 }
 
 /**
@@ -126,18 +151,19 @@ export function scrollPlan(state: TuiState, delta: number, paged: boolean): Step
 // ── Selection ────────────────────────────────────────────────────────────────
 
 /**
- * Where a mouse report lands *within a pane*: the reported cell, with its
- * column pulled back inside that pane's span. This is what stops a drag that
- * wandered across the divider from selecting the neighbour — it extends down
- * the origin pane instead, which is the only way a copied line can be one
- * pane's text rather than a splice of both.
+ * Where a mouse report lands *within the region the drag belongs to*: the
+ * reported cell, pulled back inside that region in both directions. This is
+ * what stops a drag that wandered across the divider — or off the bottom of the
+ * transcript into the plan — from selecting the neighbour: it extends down the
+ * origin pane instead, which is the only way a copied line can be one pane's
+ * text rather than a splice of both. A drag that starts on the chrome under the
+ * body has no pane to pin to, so it takes whole frame rows instead.
  */
-function selectionCell(state: TuiState, pane: Focus, key: Key): Cell {
-  const { first, last } = paneColumns(state, pane);
-  return {
-    col: clampRange(key.col ?? first, first, last),
-    row: clampRange(key.row ?? 1, 1, state.rows),
-  };
+function selectionCell(state: TuiState, pane: Focus, from: number, key: Key, panes: BodyPanes): Cell {
+  const area = selectionArea(state, pane, from, panes);
+  const row = clampRange(key.row ?? area.firstRow, area.firstRow, area.lastRow);
+  const { firstCol, lastCol } = selectionColumns(area, row);
+  return { col: clampRange(key.col ?? firstCol, firstCol, lastCol), row };
 }
 
 function clampRange(value: number, low: number, high: number): number {
@@ -152,8 +178,11 @@ export function handleMouseSelect(state: TuiState, key: Key): Step {
   if (key.name === 'mousedown') {
     // The pane is decided once, here, and carried for the whole drag —
     // `pointerPane` is the same aim the wheel uses, divider fallback included.
-    const pane = pointerPane(state, key);
-    const cell = selectionCell(state, pane, key);
+    // Under the body there is no pane to aim at, but the row still decides the
+    // region, so the composer is selectable whole in either layout.
+    const panes = bodyPanes(state);
+    const pane = pointedPane(panes, key) ?? state.focus;
+    const cell = selectionCell(state, pane, key.row ?? 1, key, panes);
     return step({ ...state, selection: { anchor: cell, head: cell, pane } });
   }
 
@@ -162,7 +191,7 @@ export function handleMouseSelect(state: TuiState, key: Key): Step {
   // owned the mouse (a tmux reattach mid-drag), not the tail of a selection.
   if (!selection) return step(state);
 
-  const moved = { ...selection, head: selectionCell(state, selection.pane, key) };
+  const moved = { ...selection, head: selectionCell(state, selection.pane, selection.anchor.row, key, bodyPanes(state)) };
   if (key.name === 'mousedrag') return step({ ...state, selection: moved });
 
   // A click with no movement is how the user dismisses a selection; treating it

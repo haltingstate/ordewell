@@ -18,9 +18,9 @@ interface PillOption<T> {
 function PillRow<T>({ label, options, current, onPick }: { label: string; options: PillOption<T>[]; current: T; onPick(value: T): void }) {
   const hint = options.find((o) => o.value === current)?.hint;
   return (
-    <div className="run-setting" role="group" aria-label={label}>
+    <div className="run-setting">
       <span className="run-setting-label">{label}</span>
-      <div className="planner-backends">
+      <div className="run-setting-pills" role="group" aria-label={label}>
         {options.map((o) => (
           <button
             key={o.label}
@@ -131,22 +131,16 @@ function RunSettingsRows({ value, onChange }: { value: RunSettingsValue; onChang
   const { run } = value;
   return (
     <>
-      <div className="setup-block-hint">How much Ordewell does for you. Saved at once, for every session.</div>
+      <div className="setup-block-hint">Supervisor, automerge and autorun apply to this session; your last change is the default for new ones.</div>
+      <div className="setup-block-hint run-settings-scope-note">Autonomy and Parallel tasks apply to every session.</div>
       <PillRow label="Autonomy" options={AUTONOMY} current={value.autonomous} onPick={(autonomous) => onChange({ autonomous })} />
       <PillRow label="Supervisor" options={SUPERVISOR} current={run.supervisorLevel} onPick={(supervisorLevel) => onChange({ run: { supervisorLevel } })} />
       {run.supervisorLevel !== 'off' && (
-        <>
-          <NumberRow
-            label="Supervisor retries" value={run.supervisorRetryLimit} min={0} host={value}
-            hint={(n) => (n === 0 ? 'Never retry a task.' : `Retry one task up to ${plural(n, 'time', 'times')}.`)}
-            onCommit={(supervisorRetryLimit) => onChange({ run: { supervisorRetryLimit } })}
-          />
-          <NumberRow
-            label="Supervisor reads" value={run.wakeUpReadBudget} min={1} host={value}
-            hint={(n) => `Up to ${plural(n, 'read', 'reads')} each time it wakes.`}
-            onCommit={(wakeUpReadBudget) => onChange({ run: { wakeUpReadBudget } })}
-          />
-        </>
+        <NumberRow
+          label="Supervisor retries" value={run.supervisorRetryLimit} min={0} host={value}
+          hint={(n) => (n === 0 ? 'Never retry a task.' : `Retry one task up to ${plural(n, 'time', 'times')}.`)}
+          onCommit={(supervisorRetryLimit) => onChange({ run: { supervisorRetryLimit } })}
+        />
       )}
       <PillRow label="Automerge" options={AUTOMERGE} current={run.mergeAtGatesAutomatically} onPick={(mergeAtGatesAutomatically) => onChange({ run: { mergeAtGatesAutomatically } })} />
       <PillRow label="Autorun" options={AUTORUN} current={run.autorun} onPick={(autorun) => onChange({ run: { autorun } })} />

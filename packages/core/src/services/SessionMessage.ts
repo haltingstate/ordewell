@@ -1,4 +1,5 @@
-import type { AwaitingReason, ConversationMessage, LegacyPlanState, PlanState, PendingPlanTurn, ReplyRun, ResearchStep, RunnerId, RunSettings, SkillLoadNotice, SubagentOutcome, Task, TaskSkillNotice, TaskSnapshot, Verdict } from '../models/Task';
+import type { AccountLimitSnapshot } from '../models/AccountLimits';
+import type { AwaitingReason, ConversationMessage, LegacyPlanState, PlanState, PendingPlanTurn, PlannerCompaction, ReplyRun, ResearchStep, RunnerId, RunSettings, SkillLoadNotice, SubagentOutcome, Task, TaskSkillNotice, TaskSnapshot, Verdict } from '../models/Task';
 import type { SessionBilling, AttemptUsage, ContextFill, ModelUsage, PlanUsage, UsageTotals } from '../models/Usage';
 import type { ExecutionRecord } from '../models/Execution';
 import type { TaskLoop } from '../models/Loop';
@@ -22,6 +23,20 @@ export type SerializedTaskStatus = {
   verdict: { outcome: 'pass' | 'fail'; reason: string; checks: Verdict['checks']; reported?: Verdict['reported'] } | null;
   /** Advisory silence timestamp from VerdictEngine — not part of task status semantics. */
   idleSince?: string | null;
+  /**
+   * What the runner reported through `task_complete`, received while its
+   * attempt winds down (ADR-0018, L1): a receipt, not the verdict, which
+   * `verdict` and `status` carry once it is decided. Absent once the attempt
+   * ends or a new turn voids the report, and never saved.
+   */
+  completionReceived?: NonNullable<Verdict['reported']>;
+  /**
+   * Which spawn of a starting runner waits for Ordewell's tools to connect
+   * (ADR-0025): 1, then 2 after its one respawn. Nothing was sent to the
+   * runner yet. Absent once they connect, and when the attempt ends; a second
+   * miss holds the task, which `holdReason` says.
+   */
+  attaching?: 1 | 2;
   /** Absent unless the plan has an isolation run, so a shared-root plan's updates are unchanged. */
   isolation?: TaskIsolation;
   /** What an `awaiting_user` task waits on, when it was saved (ADR-0018, W1). */
@@ -61,6 +76,8 @@ export type SerializedTaskStatus = {
   research?: true;
   /** The latest attempt's handoff, as the plan keeps it (ADR-0047); absent when the attempt left none. */
   handoff?: HandoffDigest;
+  /** An attempt has started: its chat exists from then on. Absent on a task never run. */
+  attempted?: true;
   attemptUsage?: AttemptUsage[];
   /** Set only on a loop's check, so a stream of statuses alone can say which task is one (ADR-0045). */
   loop?: TaskLoop;
@@ -111,6 +128,8 @@ export type SerializedTask = {
   skills?: string[];
   /** Set only on a task an Act supervisor added (ADR-0029). */
   addedBy?: 'supervisor';
+  /** An attempt has started: its chat exists from then on. Absent on a task never run. */
+  attempted?: true;
   attemptUsage?: AttemptUsage[];
   /** A script task's body and time limit (ADR-0035); absent on any other task. */
   commands?: string[][];
@@ -152,26 +171,14 @@ export type SerializedPlan = {
   runSettings?: LegacyPlanState['runSettings'];
   /** What waits on the planner's usage limit, and when it goes, so a surface can say so and offer to cancel it. */
   plannerResend?: LegacyPlanState['plannerResend'];
+  /** The planner paused on its context, so a surface can say why and offer Retry compaction. */
+  plannerContextPause?: LegacyPlanState['plannerContextPause'];
   tasks: SerializedTask[];
   runners: RunnerId[];
   generatedAt: string;
   conversationHistory?: SerializedConversationMessage[];
   prdMarkdown?: string;
 };
-
-/** What a held edit does to a task once it lands. */
-export type HeldEditMark = 'added' | 'changed' | 'removed';
-
-/**
- * The plan as the open planner turn's edit would leave it, in plan order with
- * the removed tasks where they were; flat, a subtask after its parent. `label`
- * is the task's `#2.1` reference; `mark` is absent for a task the edit leaves
- * alone. Proposed, not approved: the tasks need the user's go-ahead to run.
- */
-export interface HeldEdit {
-  turnId: string;
-  tasks: Array<{ label: string; mark?: HeldEditMark; task: SerializedTask }>;
-}
 
 /** How a planner turn ended: the reply kind it settled on, a user stop, or a failure. */
 export type PlannerTurnOutcome = 'message' | 'plan' | 'task_ops' | 'stopped' | 'error';
@@ -220,13 +227,6 @@ export type SessionMessage =
    */
   | { type: 'planner_turn_started'; turnId: string; prompt?: string; skills?: SkillLoadNotice[]; wakeUps?: string[]; supervisor?: true; forced?: true }
   | { type: 'planner_skill_loaded'; turnId: string; skill: SkillLoadNotice }
-  /**
-   * What the open planner turn's task edit would leave, sent whenever the
-   * edit it holds changes (ADR-0029: it lands as the reply ends). `held` is
-   * null once nothing is held: the edit landed, was refused as it landed, or
-   * the turn ended without it. The plan itself is untouched until it lands.
-   */
-  | { type: 'plan_edit_held'; held: HeldEdit | null }
   /**
    * A planner turn is over; nothing more carries its `turnId`. Emitted exactly
    * once per `planner_turn_started`, stop and failure included, after the
@@ -287,7 +287,16 @@ export type SessionMessage =
    * planner; `usage` is its own share, already counted in `planner_usage`.
    */
   | { type: 'subagent_finished'; turnId?: string; subagentId: string; outcome: SubagentOutcome; digest: string; usage?: UsageTotals }
-  | { type: 'status_update'; tasks: SerializedTaskStatus[]; runMerge?: RunMergeView; usage?: PlanUsage }
+  /**
+   * One phase of a planner compaction (see {@link PlannerCompaction}); never a
+   * subagent's, nor a task runner's. A surface folds both phases into one
+   * block by `compaction.id`, and a repeat of either changes nothing. A
+   * condensed one's summary arrives in the transcript, its checkpoint carrying
+   * the same id. `turnId`: the turn it happened in; absent for a `/compact`,
+   * which is no user turn. A fact, not a turn's stream: a stop never cuts it off.
+   */
+  | { type: 'planner_compaction'; compaction: PlannerCompaction; turnId?: string }
+  | { type: 'status_update'; tasks: SerializedTaskStatus[]; runMerge?: RunMergeView; usage?: PlanUsage; activity?: RunActivity }
   | { type: 'review_needed'; tasks: SerializedTask[] }
   | { type: 'review_approved' }
   | { type: 'checkpoint'; taskId: string; taskTitle: string; summary: string }
@@ -373,11 +382,40 @@ export type PlanSnapshot = { type: 'plan_snapshot'; plan: SurfacePlan | SurfaceP
 /** What only the status stream says about a task; a plan refresh keeps these as they were. */
 export type RunTaskStatus = Partial<Pick<
   SerializedTaskStatus,
-  'verdict' | 'idleSince' | 'isolation' | 'checkpoint' | 'queued' | 'continuable' | 'awaitingApproval' | 'mergeGate' | 'forcedPastGate' | 'waitsForApproval' | 'holdReason' | 'handoff'
+  'verdict' | 'idleSince' | 'completionReceived' | 'attaching' | 'isolation' | 'checkpoint' | 'queued' | 'continuable' | 'awaitingApproval' | 'mergeGate' | 'forcedPastGate' | 'waitsForApproval' | 'holdReason' | 'handoff' | 'attempted'
 >>;
 
 /** A task in the run view: the plan's fields, then the status stream's. */
 export type RunTask = Omit<SerializedTask, 'subtasks'> & RunTaskStatus & { subtasks: RunTask[] };
+
+/**
+ * What the scheduler is doing with the plan, independent of any one task:
+ * the authoritative word a surface shows a start by, and a guard reads before
+ * acting on the plan. Kept apart from a task's status so a start that has not
+ * claimed anything yet is never drawn as work in progress.
+ */
+export interface RunActivity {
+  /** A start is admitted and has not claimed a task: work is on its way. */
+  starting: boolean;
+  /** At least one attempt is live. */
+  running: boolean;
+  /** The scheduler is driving the plan: ready tasks start as slots free. */
+  scheduled: boolean;
+  /** A run with nothing starting that something still resumes by itself (a usage limit's reset, a retry). */
+  resumable: boolean;
+  /**
+   * Something could still move a task on without being asked: a start on its
+   * way, a queued start behind its dependencies, an attempt in any phase, a
+   * scheduler driving the plan, or a usage-limit hold. The same fact core
+   * refuses a manual override on (ADR-0029), so a surface never asks a
+   * question the seam would then refuse. A run that ended on a failure is not
+   * here: overriding the failed task is the way out.
+   */
+  advancesOnItsOwn: boolean;
+}
+
+/** A run with nothing at work and nothing on its way. */
+export const IDLE_ACTIVITY: RunActivity = { starting: false, running: false, scheduled: false, resumable: false, advancesOnItsOwn: false };
 
 /**
  * A session's run as every surface draws it (the [run view](../../../../CONTEXT.md)):
@@ -392,8 +430,8 @@ export interface RunView {
   usage?: PlanUsage;
   handoff: IsolationHandoff | null;
   mergeResult: IsolationMergeResult | null;
-  /** The edit the open planner turn holds, as it would leave the plan; absent when it holds none. */
-  heldEdit?: HeldEdit;
+  /** What the scheduler is doing with the plan, as {@link RunActivity}. */
+  activity?: RunActivity;
 }
 
 export type RunInput = SessionMessage | PlanSnapshot;
@@ -432,6 +470,7 @@ export function serializeTask(t: SurfaceTask): SerializedTask {
     ...(t.ops ? { ops: true as const } : {}),
     ...(t.research !== undefined ? { research: t.research } : {}),
     ...(t.handoff ? { handoff: structuredClone(t.handoff) } : {}),
+    ...(t.attempted ? { attempted: true as const } : {}),
     ...(t.attemptUsage ? { attemptUsage: structuredClone(t.attemptUsage) } : {}),
     ...(t.skills?.length ? { skills: [...t.skills] } : {}),
     ...(t.addedBy ? { addedBy: t.addedBy } : {}),
@@ -453,6 +492,8 @@ export function serializeTaskStatus(
   checkpoint = '',
   waitsForApproval = false,
   holdReason: string | null = null,
+  completionReceived: Verdict['reported'] | null = null,
+  attaching: 1 | 2 | null = null,
 ): SerializedTaskStatus {
   return {
     id: t.id,
@@ -462,6 +503,9 @@ export function serializeTaskStatus(
       ? { outcome: t.verdict.outcome, reason: t.verdict.reason, checks: t.verdict.checks || [], ...(t.verdict.reported ? { reported: t.verdict.reported } : {}) }
       : null,
     idleSince,
+    ...(completionReceived ? { completionReceived } : {}),
+    ...(attaching ? { attaching } : {}),
+    ...(t.attempted ? { attempted: true as const } : {}),
     ...(t.attemptUsage ? { attemptUsage: structuredClone(t.attemptUsage) } : {}),
     ...(isolation ? { isolation } : {}),
     ...(t.status === 'awaiting_user' && t.awaitingReason ? { awaitingReason: t.awaitingReason } : {}),
@@ -522,6 +566,7 @@ export function serializePlan(plan: LegacyPlanState): SerializedPlan {
     generatedAt: plan.generatedAt,
     runSettings: plan.runSettings,
     ...(plan.plannerResend ? { plannerResend: plan.plannerResend } : {}),
+    ...(plan.plannerContextPause ? { plannerContextPause: plan.plannerContextPause } : {}),
     conversationHistory: surfaceConversation(plan.conversationHistory),
     prdMarkdown: plan.prdMarkdown,
   };
@@ -559,4 +604,10 @@ export function truncateCheckpointSummary(summary: string): string {
   const firstLine = summary.split('\n')[0].trim();
   if (firstLine.length <= CHECKPOINT_TRUNCATE_LENGTH) return firstLine;
   return firstLine.slice(0, CHECKPOINT_TRUNCATE_LENGTH - 1) + '…';
+}
+
+/** Host-owned live data: never part of a Session's transcript or saved plan. */
+export interface AccountLimitsMessage {
+  type: 'account_limits';
+  limits: readonly AccountLimitSnapshot[];
 }

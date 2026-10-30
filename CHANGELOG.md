@@ -8,8 +8,228 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-29
+
+### Fixed
+
+- **Repository configuration introduced during a run waits for your consent.**
+  A task landing that adds or edits configuration its runner loads at launch,
+  such as `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json`,
+  Claude Code's hooks, plugins and plugin manifests, OpenCode's project config,
+  agent definitions, plugins and tools, and `.codex/`, no longer reaches a
+  later task's launch on its own. The start that would read it is held and
+  names each path; commit the configuration and start a new run whose base
+  holds it, or remove it. Configuration already present when the run started,
+  instruction files such as `CLAUDE.md` and `AGENTS.md`, and a worktree's own
+  setup are not held.
+- **A repository MCP server cannot take Ordewell's name.** A Claude Code change
+  or ops task does not start when the directory it runs in declares a server
+  named `ordewell` in `.mcp.json`, `.claude/settings.json` or
+  `.claude/settings.local.json`. Claude Code does not document which of those
+  wins against the server Ordewell passes, so the task could lose the route it
+  reports completion through. Rename or remove that server to start the task.
+
+## [0.11.2] - 2026-10-29
+
 ### Added
 
+- **`/resume` opens the session browser in the planner chat.** It answers as
+  an alias of `/sessions` in the terminal UI and VS Code, and is listed beside
+  it in `/help` and the command suggestions. It loads a saved session; it does
+  not restart a task (#139; thanks @Logic769).
+- **A guide to how planners and runners get their models and credentials.**
+  [docs/planners-and-runners.md](docs/planners-and-runners.md) explains where
+  each one's models and keys come from, and where to see and change them, and
+  the README links to it (#140; thanks @hskl18).
+
+### Fixed
+
+- **Claude Code offers the models you added to its own picker.** Entries in
+  `modelPicker.options` of Claude Code's settings, such as a gateway's
+  `gproxy/default`, now appear beside the discovered Claude models and can be
+  picked for the planner and for tasks. As in Claude Code, a managed settings
+  file's list replaces your own, and your own is read where the workspace's
+  runners find it: under `CLAUDE_CONFIG_DIR`, else in `.claude` under the
+  `HOME` (`USERPROFILE` on Windows) the workspace's environment sets. Each
+  workspace one daemon serves reads its settings, and switches the planner,
+  against its own account's models, even before any of them were listed; a
+  model picked in one workspace is not handed to another whose account does
+  not serve it. The planner's own local MCP servers and saved tool output come
+  from that account too, and Codex and OpenCode list their models under the
+  workspace's environment as well. A model Claude Code already lists keeps its own
+  label and effort levels, and a missing or malformed file changes nothing.
+  The files are read when Ordewell discovers Claude's models, so an edit made
+  while Ordewell runs shows after a restart. Only a planner switch, or a
+  settings read whose model only the catalog can place, waits for a runner to
+  list its models; picking a model, saving a key or changing any other setting
+  does not (#117).
+- **Stopping a task whose runner is still connecting Ordewell's tools stops
+  the runner at once.** It no longer finishes its wait, or respawns, after the
+  task was stopped.
+- **A task whose runner is still starting says so.** Until the runner reports
+  Ordewell's tools connected, its row, its VS Code card and its task chat read
+  "Connecting Ordewell's tools" instead of plain Running or Working, and
+  "Connecting Ordewell's tools, retry" once the one respawn takes over. No
+  prompt has been sent at that point, and nothing waits on an answer from you.
+  The wait, the respawn and the hold after a second miss are unchanged (#117).
+- **VS Code: a failed task has a Retry button.** It shows on the task's and
+  the subtask's card once the run has ended as well as during it, beside
+  Skip, in place of a Run Task that Ordewell refused on a failed task.
+- **VS Code: the palette's Force Start, Skip, Retry and Cancel Task commands
+  work.** Run from the Command Palette, they did nothing; they now ask which
+  task, listing only the tasks the action applies to.
+- **VS Code warns before a new plan stops a run.** `/new` now says that a run
+  in progress is stopped, and Regenerate Plan asks first while a run is live.
+- **VS Code: smaller fixes.** Clear All Tasks shows, and starts the next plan
+  with, the run settings from your settings file instead of the cleared
+  plan's. The palette's Toggle Runner keeps the last enabled runner on, as the
+  chat's runner switches do. Save Session says when nothing was saved, and
+  why. An error from a command typed after `/new`, such as `/fork`, now shows
+  in the chat.
+- **Claude Code's named usage limits resume tasks at reset.** Messages such
+  as the five-hour limit are recognized as usage limits; when a reset time is
+  available, the paused task resumes with its existing session and any kept worktree.
+- **Task execution and landing are more reliable.** A runner silent from the
+  start is now flagged as quiet, exited runners no longer leave the host waiting
+  on pipes held by descendants, and overlapping starts, landings and conflict
+  repairs keep their worktrees and holds until they are safe to release.
+- **TUI session changes keep their own state.** Late replies and settings reads
+  no longer leak into another session or overwrite newer settings. If a revived
+  opening is refused, typed prompts return to the editor and the welcome screen
+  restores its run settings.
+- **Planner shell protections cover more Git and text commands.** Git reads use
+  an allowlist; remote listings with URLs or expanded destinations are refused,
+  and approval for a remote listing stays scoped to its command line. Unsafe
+  file and environment reads through sed and awk, and writes through Git and
+  sort, are also refused.
+- **VS Code's Skip picker includes blocked tasks.** Regenerate Plan also asks
+  before replacing an existing plan with tasks, including when no run is active.
+
+### Changed
+
+- **Windows onboarding is clearer.** The README distinguishes the extension's
+  native support from the terminal UI, which has not been verified on native
+  Windows, and documents the limits of Windows testing.
+- **Refresh help describes what happens.** The CLI and TUI re-check runners and
+  reread settings and cached models; refresh does not rediscover provider catalogs.
+
+## [0.11.1] - 2026-10-27
+
+### Changed
+
+- **The VS Code Marketplace and Open VSX overview no longer opens with a
+  session recording.** The listing leads with the written introduction.
+- **No runtime code changed.** This release carries the version bump and the
+  listing text.
+
+## [0.11.0] - 2026-10-27
+
+This release lets a plan do more than run coding agents in order.
+A plan can now hold script tasks, check-and-fix loops and research tasks;
+every task hands over a structured handoff; read-only tasks work the same on
+every runner and can save a prototype as a patch. Ordewell shows your coding agents' account
+limits, and an API planner compacts its own context.
+
+### Upgrade notes
+
+Before upgrading from 0.10.12:
+
+- **New installations start in Guarded.** A settings file with no autonomy
+  level used to mean Full. A level you saved, or set with
+  `ORDEWELL_AUTONOMOUS_MODE`, is kept.
+- **Run settings apply per open session.** Supervisor level, auto-merge at
+  gates, autorun, retry limit and wake-up read budget start from
+  `~/.ordewell/settings.json`. A change in `/settings` updates that session,
+  including its active run, and saves the default for new or reopened sessions.
+  Other open sessions keep their values, including for their next run. Autonomy
+  (Full/Guarded), parallelism and the Planned-with trailer remain shared.
+- **A read-only task is defined by Ordewell.** It can change files in its own
+  throwaway worktree through sealed commands and lands nothing.
+- **The planner's `submit_plan` and `edit_plan` apply as the call answers**,
+  not when its reply ends, and the "Proposed" preview is gone.
+- **The local daemon's per-control routes are replaced by one
+  `POST /api/plans/:id/execute-command` route**, and the Merge and Split
+  routes are gone. Hand-written daemon clients have to move.
+- **A session is open in one host at a time**; a second VS Code window, CLI
+  command or TUI that opens it is refused.
+- **The VS Code setting `ordewell.researchEnabled` is gone.**
+
+### Added
+
+- **Sign in to a coding agent from the chat.** A signed-out Claude Code or
+  Codex stays selectable and is flagged in the TUI welcome and planner picker,
+  and on VS Code's Planner and Runners pills and first screen. The welcome
+  lists each signed-out agent, with the active planner first. The TUI marks
+  signed-out names in red; VS Code uses a red dot and a **Log in** segment on
+  each pill. Each agent's login remains available after the chat starts. In
+  the TUI, `/login` signs in the active planner and `/login <runner>` signs in another
+  agent; VS Code's **Log in** opens that agent's integrated terminal. Both run
+  the agent's own login with the workspace's environment and confirm its status
+  afterwards, without changing the planner choice. A confirmed signed-out
+  planner is refused before a turn is sent, with its login command in the
+  message; task runners are not blocked by this preflight. Unknown status never
+  blocks, including Codex setups using an API key or a custom provider whose
+  login its status command cannot judge. OpenCode declares no status or login
+  command and stays unflagged
+  ([ADR-0052](docs/adr/routing/0052-a-signed-out-coding-agent-is-flagged-and-signs-in-from-the-chat.md)).
+- **Account limits for your coding agents.** Ordewell reads what your Codex,
+  Claude Code and OpenCode Go accounts have used of their plan's windows (five
+  hours, a week, a month) from each runner's own account protocol, never from
+  usage records. A Codex or Claude Code read starts a short-lived process
+  that opens no session and sends no message. OpenCode Go is read from the
+  login OpenCode would pay with, sent only to OpenCode's own quota addresses.
+  Each read uses the workspace's environment, so a workspace that picks its own
+  account shows that account. The planner footer shows a coding-agent
+  planner's limits, and a task's footer shows only its runner's, in the order
+  context, limits, cost, in the TUI and VS Code alike. Limits are read about once
+  a minute while the window has focus, never saved, and never pause or resume
+  work
+  ([ADR-0051](docs/adr/platform/0051-opencode-go-limits-from-the-selected-login-read-in-place.md)).
+- **An API planner compacts its own context.** An OpenAI, OpenRouter,
+  OpenAI-compatible or Gemini planner targets a prompt budget of 90% of the
+  model's known window, trimming older file reads first, then asking the same
+  model to condense the conversation. The chat shows one "Context compacted
+  automatically" block whose summary opens on demand. The original history is
+  kept, including after a manual `/compact`. Automatic compaction needs a known
+  model window; the context meter says when it is unavailable or turned off.
+  With a known window, a call the provider still refuses as too long is
+  compacted once more and sent again. If it still cannot fit, only the planner
+  pauses, with your message kept and running tasks carrying on, until you
+  choose Retry compaction (`/compact retry`, `ordewell compact retry`, or the button in
+  VS Code) or Stop. `"plannerAutoCompaction": false` turns it off. A harness
+  planner compacts its own context as before
+  ([ADR-0002](docs/adr/planner/0002-planner-as-conversation-loop.md)).
+- **The startup screen shows the repositories and branches tasks will use.**
+  The TUI welcome and VS Code's first screen list each detected repository
+  with its branch and commit, whether it has uncommitted changes, and whether
+  code tasks will get isolated worktrees. The preview only reads, starts
+  nothing, and is refreshed on focus and on a settings or workspace change.
+- **"Completion received" as soon as a task reports.** A valid
+  `task_complete` call marks the task at once in the TUI and VS Code while
+  its attempt winds down. It is not a verdict: verdict, landing and dependents
+  are unchanged
+  ([ADR-0018](docs/adr/runners/0018-structured-runner-transport.md)).
+- **Read-only tasks can read the web through Ordewell.** A read-only or
+  research task gets Ordewell's `fetch` and `web_search`, decided by the
+  planner's web-read policy without asking anyone, with a budget per attempt.
+  A read that would need your approval is refused, and the task reports the
+  gap. Each decision goes to the task's own log, not the planner chat
+  ([ADR-0046](docs/adr/planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md)).
+- **The TUI keeps the plan on screen below 70 columns.** It moves under the
+  transcript, at the full width and above the composer, instead of
+  disappearing; the transcript and the plan share the body by what each has to
+  show. Scrolling, the page keys, the wheel and a mouse selection follow the
+  pane they are over, and a copy never picks up the other pane's text.
+- **A read-only task can hand off its prototype as a patch.** It calls
+  `save_patch` and Ordewell saves its worktree changes as a patch beside the
+  attempt log, named in its handoff. The result lists exclusions and size limits;
+  saving requires an isolated worktree in a single repository and a working
+  sandbox. A change task that depends on it applies the patch with `apply_patch`,
+  a three-way merge that names any conflict for the task to resolve. The
+  planner's `task_diff` and the TUI, VS Code and CLI show a saved patch, and the
+  `explore` skill has explorers
+  save theirs and the build task apply the chosen one
+  ([ADR-0050](docs/adr/planner-envelope/0050-a-read-only-task-can-hand-off-its-prototype-as-a-patch.md)).
 - **Task handoffs.** Every task leaves a short summary, with optional numbered
   findings, evidence and artifacts. Dependents receive whole findings within
   the prompt limit and can pull the rest with `read_task`, including earlier
@@ -31,11 +251,11 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   push, a tag or one setting on a cloud resource no longer takes a runner
   session. The planner adds a script task and starts it in one step, and hears
   its verdict and the tail of its output; a script still running after a
-  minute reports back when it ends. Unless the effect allowlist covers it, you
-  approve it on the approval card, which shows the commands or the script
-  verbatim, and an unanswered or denied card leaves the task in the plan,
-  unapproved. A supervisor at Act may run one; at Watch it can only suggest
-  one.
+  minute reports back when it ends. In a user turn it asks for approval on a
+  card showing the commands or script verbatim, unless the effect allowlist
+  covers it or Full with autorun permits it on an approved plan. An unanswered
+  or denied card leaves the task unapproved. A supervisor at Act may run one
+  without asking; at Watch it can only suggest one.
 - **The effect allowlist names script tasks that run without asking**
   (`ordewell.effectAllowlist`, elsewhere `ORDEWELL_EFFECT_ALLOW`). A rule is
   matched against the whole command, every word in order and flags included:
@@ -55,9 +275,9 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   after a reload. Every surface draws a loop's rounds, and the planner plans
   one for work that repeats until it passes, such as a review and its fix
   ([ADR-0045](docs/adr/supervision/0045-a-check-repeats-with-its-fix-until-it-passes.md)).
-- **Research tasks.** The planner can hand an investigation that would outlive
-  its turn to a research task: a read-only task whose report comes back to the
-  planner. Its end, passed, failed or blocked, opens a planner turn with the
+- **Research tasks.** When the planner must decide something on what a
+  read-only task finds, it marks that task as research, and its report comes
+  back to the planner. Its end, passed, failed or blocked, opens a planner turn with the
   report at every supervisor level, Off included, and you can talk to the
   planner while it runs. Research tasks start without asking, the planner
   decides how many a message starts, and they run within the run's Parallel
@@ -103,9 +323,70 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   versions checked live, Claude Code 2.1.304–2.1.x and OpenCode 2.0.32–2.0.x;
   other versions, OpenCode 1.x and Linux keep `run_command` alone, and a
   notice says why. Codex already has its own shell. A workspace cannot set it.
+- **A daily version check, off with one variable.** Once a day Ordewell asks
+  `https://ordewell.ai/api/v1/ping` whether a newer version is out, and shows
+  one line when it is. The request carries two things: the version you run and
+  a random install ID, kept in `~/.ordewell/version-check.json` and shared by
+  the CLI and the VS Code extension. The ID is replaced every 30 days. Nothing
+  else is sent: no code, prompts, paths, file names or account details, though
+  ordewell.ai sees the IP address of any request, which the notice says too.
+  The first start on a machine shows a notice and sends nothing. To turn it
+  off, set `ORDEWELL_NO_VERSION_CHECK=1` or `DO_NOT_TRACK=1`; off, Ordewell
+  shows no notice, creates no ID and sends no request. The VS Code extension
+  also follows VS Code's telemetry setting
+  ([ADR-0048](docs/adr/platform/0048-a-daily-version-check-with-a-notice-first-and-one-install-per-machine.md)).
+- **Real commit messages.** A change task can state a `commit` (a subject and
+  a short body) in its `task_complete` call, and the commits Ordewell writes to
+  land it use that message in place of git's default `Merge branch 'ordewell/…'`.
+  Without one, the task title stands in. The handoff summary then stops
+  repeating what changed, and handoffs on every surface show the commit
+  ([ADR-0013](docs/adr/isolation/0013-worktree-isolation.md),
+  [ADR-0047](docs/adr/supervision/0047-structured-task-handoffs.md)).
+- **A `Planned-with: Ordewell` trailer on the commits Ordewell writes.** It is
+  on by default and is a git trailer `git interpret-trailers` reads. Commits a
+  coding agent made itself are not changed. Turn it off with
+  `ordewell trailer off` or `"plannedWithTrailer": false` in `settings.json`; it
+  is not a row in the settings panels
+  ([ADR-0030](docs/adr/supervision/0030-global-run-settings.md)).
+- **Installed coding agents that are switched off show in the VS Code Runners
+  block.** Clicking one saves it in the shared enabled-runner list, so the
+  planner can use it on the next turn, including in an existing conversation.
 
 ### Changed
 
+- **Run settings follow the session on screen.** The TUI's `/settings` and
+  VS Code's Run block show and change that session's values. Changes apply at
+  once and become the saved defaults, without changing other open sessions.
+  Headless settings commands and file edits change the defaults for sessions
+  opened afterwards. Reopening a session reads those defaults again. Autonomy and Parallel tasks
+  still apply across sessions, and the Planned-with setting is read at each
+  commit ([ADR-0030](docs/adr/supervision/0030-global-run-settings.md)).
+- **The first screen explains plan approval and autorun.** VS Code groups the
+  repository preview in its own card and shows whether a submitted plan will
+  wait for approval or start automatically. Settings has a clearer open state,
+  and the startup view and login controls support light themes.
+- **New installations start in Guarded autonomy.** A settings file with no
+  level fell back to Full; the default is now Guarded in core, the TUI and the
+  planner's mode choices, so a planned task gets its runner's safe mode and a
+  planner request the allowlist does not cover asks you. A saved or
+  environment-selected level is kept
+  ([ADR-0001](docs/adr/routing/0001-autonomous-mode-resolution.md),
+  [ADR-0030](docs/adr/supervision/0030-global-run-settings.md)).
+- **A planner's `submit_plan` and `edit_plan` apply as the call answers.**
+  The plan, the saved session and every surface show the change while the
+  planner is still replying, and the answer names the tasks it added, with
+  their ids and the handles the planner gave them, so it can read or start
+  them in the same reply. Each `edit_plan` call applies whole or not at all,
+  on its own; a later refused call leaves earlier ones in place. A change
+  stays if the reply is then stopped, fails or hits a usage limit, and the
+  message that asked for it is not sent again. The "Proposed: lands when this
+  reply ends" preview in the TUI and VS Code is gone, and a start asked for
+  after an edit runs the task as edited without waiting for the reply to end
+  ([ADR-0022](docs/adr/runners/0022-ordewell-mcp-server.md)).
+- **Merge and Split are planner requests, not task-card buttons.** VS Code's
+  task cards no longer carry the Merge/Split controls, `Session` and the daemon
+  no longer expose the matching request methods and routes, and the planner
+  applies the edit when you ask for it in chat.
 - **A read-only task is defined by Ordewell, the same on every runner.** It
   keeps its runner's own read and search tools, and its shell is Ordewell's
   `run_command`: what the planner would have to ask about runs sealed, with the
@@ -125,8 +406,89 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   rate.** A long command output streaming into a task's pane no longer stalls
   it; very large outputs, diffs and messages show their head and say how much
   is not shown.
-- **The VS Code Marketplace listing is rewritten**, and the README states the
-  approval promise in its opening paragraph and links the first-run Discussion.
+- **The planner chooses between its own agents and a research task by what the
+  result is, not by how long it will take.** A conclusion it needs this turn
+  stays in the turn. Evidence that needs a worktree, another runner's
+  judgement, your eye or that a later task acts on is a task of its own, which
+  the later task depends on, and its findings reach that task in its handoff.
+  It is marked as research only when the planner must decide something on its
+  report. A search that takes rounds is the `explore` skill
+  ([ADR-0037](docs/adr/supervision/0037-research-tasks-wake-the-planner.md)).
+- **The planner tells evidence from orientation by the brief.** If the finding
+  a later task acts on would end up in its brief, it is evidence: a task of its
+  own that the later task depends on and reads, instead of being re-typed. A
+  first plan may be research tasks alone when the plan cannot be outlined
+  without them. The `explore` skill can have several read-only explorers try
+  different approaches against one check fixed beforehand, and one judge task
+  recommend one when several pass
+  ([ADR-0037](docs/adr/supervision/0037-research-tasks-wake-the-planner.md)).
+- **The planner is sent its plan whole once, then only what changed.** A later
+  turn carries the tasks added or changed, the tasks removed and what runs now.
+  The whole plan goes again after a reorder, a reset or compaction, or a turn
+  that did not land
+  ([ADR-0012](docs/adr/planner/0012-the-task-query-read-channel.md)).
+- **A session is open in one host at a time.** A second host, whether another
+  VS Code window, a CLI command or a TUI, that opens a session another host
+  holds is refused with the holder named, instead of both continuing its run
+  and removing each other's live worktrees. The session is taken over once the
+  holder and the runners it started are gone
+  ([ADR-0049](docs/adr/isolation/0049-a-session-has-one-live-host.md)).
+- **The supervisor at Act answers a task's checkpoint** with
+  `answer_checkpoint`, approving or rejecting with a reason. A checkpoint that
+  asks about an irreversible or outward effect still goes to you, and a refusal
+  now says who has to answer it: the supervisor, or you in your own turn
+  ([ADR-0029](docs/adr/supervision/0029-the-supervisor.md)).
+- **The planner's `run_plan` joins a run under way.** A plan whose tasks the
+  planner started one by one can be made the plan's run, so their dependents
+  start; the join approves nothing, Guarded still asks you first, and an
+  unapproved plan is refused with that reason
+  ([ADR-0035](docs/adr/supervision/0035-effects-are-consented-and-recorded.md)).
+- **A start a Stop withdrew no longer answers success.** A Run, Force start,
+  `run_plan`, `approve_review`, a retry or a continue that began a start a Stop
+  then withdrew is refused, instead of answering done while the task stayed
+  pending.
+- **The chat's approval cards, the plan markers and the handoff preview use the
+  same words on both surfaces.** The plan marker reads
+  `Plan generated · 3 tasks`, and a handoff preview names its findings count,
+  severity, commit and the first line of the summary.
+- **The local daemon's per-control routes are replaced by one execution
+  route.** The TUI and CLI send task controls, run verbs and task messages
+  through `POST /api/plans/:id/execute-command`; VS Code calls the same core
+  command interface directly. Hand-written clients of the old per-control
+  routes have to move to the new route
+  ([ADR-0006](docs/adr/surfaces/0006-tui-pure-core-thin-driver.md)).
+- **Marking a task complete or not done is deliberate.** Mark complete and
+  Mark not done on an AI or script task are refused while a run could still
+  advance it, and once it is stopped they ask you to confirm, on every
+  surface. In VS Code a task's status circle only shows its status, and the
+  mark is at the bottom of the task's details.
+- **A queued task can be edited in VS Code while others run.** A task that
+  has not started keeps its runner, model, effort, mode, prompt, dependency,
+  skill and ops editors during a run, and an edit that races the task's start
+  is refused.
+- **A task's chat exists once an attempt has started.** A task that never ran
+  or was marked by hand offers no empty chat, a started chat survives
+  failure, cancel and reload, and VS Code's Open log is now Open chat.
+- **Starting the plan shows at once.** VS Code's Execute Plan reads
+  Starting… before the host answers and becomes Stop when a task starts, a
+  second start is folded into the first, and the TUI's `E` and `/run` follow
+  the run's state the same way.
+- **VS Code keeps the planner's activity visible for the whole turn**,
+  including while it streams its thinking.
+- **Planner edits can no longer put new work on a runner you switched off.**
+  A task an edit leaves on a switched-off runner stays as it is.
+- **The planner plans a loop only for an explicit iterate-until goal or a
+  named acceptance gate**, and says why in its outline; routine validation is
+  an ordinary task
+  ([ADR-0045](docs/adr/supervision/0045-a-check-repeats-with-its-fix-until-it-passes.md)).
+- **Supervisor reads left the settings panels.** The supervisor's wake-up
+  read budget is no longer a row in the TUI's `/settings` or VS Code's Run
+  block; set it with `ordewell supervisor reads <n>` or in `settings.json`. A
+  value you saved is kept
+  ([ADR-0030](docs/adr/supervision/0030-global-run-settings.md)).
+- **The VS Code `ordewell.researchEnabled` setting is gone.** It never changed
+  what the extension did. The `ORDEWELL_RESEARCH_ENABLED` variable is
+  unchanged.
 
 ### Security
 
@@ -142,8 +504,8 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   own edit, write and shell tools are withheld on Claude Code, Codex and
   OpenCode alike, so every write it makes is a sealed command's; before, Claude
   Code's plan mode could write its plan file outside the workspace. Its
-  runner's own web fetch and search are refused, since a task has no web
-  policy to check them.
+  runner's own web fetch and search are refused; its only web reads are
+  Ordewell's `fetch` and `web_search`, under the planner's web-read policy.
 - **Once a read-only task has run a command sealed, all its later commands run
   sealed too**, allowlisted ones included, with no network. A sealed run can
   rewrite a script or config file in the task's worktree, such as the `test`
@@ -151,8 +513,8 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   run it with the network and your files readable
   ([ADR-0046](docs/adr/planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md)).
 - **A read-only task's sealed runs cannot plant a git repository for later git
-  to load.** A sealed run can write the task's worktree — in a repo group each
-  worktree — but not the worktree root itself or its `.git`: on macOS Seatbelt
+  to load.** A sealed run can write the task's worktree, or each worktree in a
+  repo group, but not the worktree root itself or its `.git`: on macOS Seatbelt
   denies renaming or removing the root and any write to the `.git`, and on
   Linux the worktree mount refuses a rename while the `.git` is bound
   read-only. In a repo group the task workspace root, where the group's runner
@@ -164,17 +526,178 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   content or hooks. On macOS a sealed run also cannot create a `.git` anywhere
   in what it may write. A `.git` that was not there before the task's first
   sealed run is removed after every run; one that cannot be removed, or one the
-  checkout brought that changed, stops that task's shell. So git run later
-  outside the sandbox, Ordewell's at a repo root or the runner's own at the
-  task's working directory, loads no repository the run planted or armed with
-  its own hooks or filters, and `task_diff` refuses a read-only task on every
-  platform
+  checkout brought that changed, stops that task's shell. These checks keep
+  git outside the sandbox from loading a repository planted or armed by the
+  sealed run. For a read-only task, `task_diff` reads its saved patch instead
+  of inspecting the live worktree
   ([ADR-0046](docs/adr/planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md)).
 - **Consent to a script task is consent to what it runs.** An edit that
   changes an approved script task's commands, script or time limit, or turns
   it into another type of task, takes it out of the approved set. Autorun in
-  Guarded never approves one, and a denied or unanswered card leaves it
-  unapproved.
+  Guarded approves a script task only when the effect allowlist covers it;
+  a denied or unanswered card leaves it unapproved.
+- **The planner's shell closes three more escapes from its command rules.** A
+  `git branch` or `git tag` whose `-f`, `-m` or `-C` swallowed the ref name no
+  longer passes as a read, a glob such as `.?` that expands to `..` no longer
+  reads outside the workspace, and a `jq` or `yq` program that reads `$ENV` or
+  loads a module is refused or asks
+  ([ADR-0008](docs/adr/planner-envelope/0008-planner-exploration-envelope.md)).
+- **`ORDEWELL_AUTONOMOUS_MODE` can no longer raise your autonomy by accident.**
+  Only `true`, `1`, `false`, `0` and the level names count; `off`, a typo or an
+  unknown word no longer reads as Full.
+
+### Fixed
+
+- **Planner turns in the CLI and TUI are no longer cut off by the HTTP
+  client's five-second idle socket timer.** Planner requests wait for the turn
+  unless `ORDEWELL_HTTP_TIMEOUT_MS` sets an explicit timeout.
+- **TUI selection and Escape follow the focused area.** Dragging across the
+  composer selects its full width instead of stopping at a pane boundary.
+  Escape backs out of an open plan editor or task details on the focused side
+  before leaving the task chat.
+- **A planner keeps Ordewell's plan tools for the whole conversation.** The
+  attach is checked before every turn, not only when the agent starts: one whose
+  running process lost its connection is restarted once on a fresh credential,
+  its conversation resumed, instead of replying `No tool named … is currently
+  available` and promising plan edits it cannot make
+  ([ADR-0025](docs/adr/runners/0025-structured-only-runners.md)). A turn that
+  still cannot attach says so and sends nothing.
+- **Copying selected chat text works again in VS Code 1.143.** Cmd+C, Ctrl+C
+  and context-menu Copy of text selected with the mouse in the planner
+  conversation or the `Planner ctx` footer copied nothing once the composer had
+  been focused, because VS Code moved focus back to the composer before
+  copying. The selection now keeps focus, and is copied.
+- **A supervisor's `merge_all` after a run that merged itself is a quiet
+  no-op.** The run update says whether landed work is already merged, and a
+  supervisor woken after the automatic Merge all no longer shows a refusal in
+  the timeline, across restarts too
+  ([ADR-0029](docs/adr/supervision/0029-the-supervisor.md)).
+- **A supervisor at Act can start the task it just added.** Its `run_task`,
+  fresh `retry_task` or `run_plan` in the reply whose edit adds the task now
+  waits for the edit and then starts it, as the planner's start does in your
+  turn, instead of being refused and left for you to click. Below Act it is
+  still refused
+  ([ADR-0029](docs/adr/supervision/0029-the-supervisor.md)).
+- **Starting the plan no longer runs a task you stopped.** A task held by a
+  stop, or by taking its completion back, stays held when the plan is started
+  again, after Stop of the whole run, and when the plan is edited; only a retry
+  or a force start runs it
+  ([ADR-0034](docs/adr/supervision/0034-a-failed-task-blocks-only-its-dependents.md)).
+- **A usage limit that pauses a task no longer closes the run.** Whether the
+  limit ends the runner's turn, fails it or refuses the start, the task records
+  no verdict and waits for its reset, and the run stays open until then. A
+  retry or skip while it waits keeps the run held rather than closing it as
+  finished
+  ([ADR-0018](docs/adr/runners/0018-structured-runner-transport.md), U1).
+- **A task at a checkpoint or waiting for input keeps that wait through an
+  edit or a plan the planner reshapes.** Its runner is still live, so the plan
+  no longer carries it over as pending and runs its work twice.
+- **A control is refused while Mark complete is landing a task**, since
+  stopping or retrying it would end the attempt whose work is being merged.
+- **A conflict repair owed with every slot busy starts when one frees** instead
+  of waiting for another event.
+- **Ordewell's own git checks now see new files.** A
+  `status.showUntrackedFiles=no` in your git config made a worktree that held
+  only new files read as empty and be removed unkept; Ordewell asks git for
+  untracked files itself. Merge all also checks the untracked and staged files
+  its merge would write over, besides overlapping tracked edits, so it no
+  longer starts a merge that leaves a half-merge in a tree holding your work.
+  A merge or a landing that fails says what git said.
+- **Clearing up never deletes landed work.** A run's integration branches and
+  worktrees go only where your checked-out branch already contains the work, so
+  a retry that dropped a task's record no longer takes the branch holding its
+  landed work with it
+  ([ADR-0013](docs/adr/isolation/0013-worktree-isolation.md)).
+- **A stale worktree registration no longer blocks re-creating a task's
+  worktree.** Preparing a task prunes what no run record names, keeps any work
+  it finds on an `ordewell-preserved/…` branch, and never removes another
+  task's worktree. A prepare that fails after it replaced an attempt says where
+  that attempt's work was kept
+  ([ADR-0013](docs/adr/isolation/0013-worktree-isolation.md)).
+- **A planner goal that is refused no longer wipes the plan it was holding**,
+  and a Stop while the planner condenses its context reads as a stopped turn
+  rather than a refusal.
+- **A plan is checked against the runners enabled at the time**, both when the
+  planner submits it and when it lands, so a plan is no longer accepted with a
+  runner you had switched off while it planned.
+- **A VS Code Runners pill click is saved.** Switching a runner off or on in
+  the chat header saves it in the enabled runners every surface shares, so the
+  planner stops offering it on the next turn and on supervisor wake-ups.
+- **A chat reloaded after the planner answered no longer keeps an old message
+  marked as waiting.**
+- **A task log's header shows the attempt on screen.** Its usage is that
+  attempt's, with the task total beneath it, its `/` commands come from that
+  attempt, and a skipped task's reason and a live turn read the same in the
+  terminal and in VS Code.
+- **A planner reply lost in transit no longer drops the session.** A timeout or
+  a reset on a turn that is still running keeps the session and the queued
+  messages; the next reply continues the same conversation, and a reconnected
+  terminal reads the session back for the turn's end.
+- **A `task_complete` call that is refused says what arrived.** Every bounded
+  field names its received length and its limit, and tool-call markup leaked
+  into the summary is named so the runner can resend each argument.
+- **A coding-agent planner that exits before it answers reports its own
+  words**, instead of being respawned and then failing as an MCP attach error.
+- **An OpenCode command turn survives a POST whose socket died.** Requests
+  carry a deadline, so one that never answers fails instead of hanging, and an
+  interrupt is decided by the runner's own end, so the abort error OpenCode
+  raises for it is not shown as a failure.
+- **An OpenCode 2.x planner keeps its Ordewell tools after an hour idle.** The
+  tools used to come back behind code mode, out of the planner's reach, until
+  a later turn could not call one
+  ([ADR-0022](docs/adr/runners/0022-ordewell-mcp-server.md)).
+- **A crash mid-save cannot erase the only copy of a session or a plan.** Saves
+  are written beside the file and renamed into place, and a session file that
+  will not read is moved aside with its bytes kept rather than skipped
+  silently.
+- **A settings file that will not parse is kept aside instead of reset.** A
+  read error no longer marks a healthy session corrupt, a hand-edited model
+  allowlist written as one string no longer fails every planner turn, a
+  read-only home no longer breaks skill reads, and a settings watcher error no
+  longer takes the host down.
+- **A plan change that withdraws a task's approval now says so.** The approval
+  record is checked on each plan change, so a task the planner unapproves is
+  announced as a plan update and a status instead of changing silently at the
+  next save.
+- **Stop ends a Gemini turn.**
+- **`ordewell stop` checks the daemon's PID against the server before it
+  signals**, so a stale PID file cannot kill an unrelated process. A daemon
+  writes and removes its own PID file.
+- **A refused daemon call no longer reads as success** in a CLI command, and a
+  request body over the daemon's limit is refused with its reason.
+- **`add-task --depends-on` resolves order numbers and titles**, and refuses one
+  that names no task instead of adding a task that can start beside the one it
+  should wait for. `ordewell setup` stores a key under the variable it came
+  from, so a bare `OPENAI_API_KEY` is not saved as an OpenRouter key.
+- **The TUI keeps its colours at narrow widths and your place while you
+  copy.** A cut line no longer drops its colour, and a copy notice no longer
+  moves a transcript you have scrolled back.
+- **A Gemini planner's failed call no longer breaks its conversation.** The
+  planner keeps its own history, so a failed call no longer drops the tool
+  results Gemini needs paired with their calls.
+- **The terminal's keys work in terminals that send kitty's codepoints.** A
+  wrapped line keeps its colours and never splits an escape sequence, the
+  composer scrolls around the caret instead of hiding it, and `NO_COLOR` keeps
+  the caret, since inverse video marks a position rather than a colour.
+- **An idle terminal keeps following its session.** A dropped stream is retried
+  with a backoff, so a run the daemon starts on its own still shows, and a turn
+  whose end was missed settles when the stream is back.
+- **The CLI starts on every Node version its engines promise.** Its ESM-only
+  width library is bundled, so Node 20.0 to 20.18 no longer fails before
+  reading its arguments.
+- **The npm packages and the VSIX ship NOTICE, AUTHORS.md and the third-party
+  licences** of the code they bundle.
+- **A script task and a manual task no longer show a runner they do not have.**
+  The terminal's plan row and task header, the plan the planner reads, a task's
+  prompt plan map and the `task-runner`, `task-model`, `task-effort` and
+  `task-mode` commands (and their `/` forms) read a task's runner only for an
+  AI task, and refuse the others instead of sending an edit nothing applies.
+- **A script task's whole output is kept.** Its log still holds only the ends
+  of a long output, which lost the failing package of a command such as
+  `npm run ci`; the attempt's complete output is now saved in a file beside the
+  log, and the verdict and the handoff name it
+  ([ADR-0035](docs/adr/supervision/0035-effects-are-consented-and-recorded.md)).
+
 ## [0.10.12] - 2026-10-22
 
 ### Fixed
@@ -3115,6 +3638,9 @@ First public release.
 - Deep-interview planning modes: `grill-me`, PRD drafting, TDD augmentation,
   review and verify.
 
+[Unreleased]: https://github.com/ordewell/ordewell/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/ordewell/ordewell/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/ordewell/ordewell/compare/v0.10.12...v0.11.0
 [0.4.5]: https://github.com/ordewell/ordewell/releases/tag/v0.4.5
 [0.4.4]: https://github.com/ordewell/ordewell/releases/tag/v0.4.4
 [0.4.3]: https://github.com/ordewell/ordewell/releases/tag/v0.4.3

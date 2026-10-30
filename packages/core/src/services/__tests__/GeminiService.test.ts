@@ -6,8 +6,8 @@ import { fakeConfig, fakeFileSystem } from '../../testing';
 import type { SkillInfo } from '../SkillsService';
 import { TurnBudgets } from '../PlannerBudgets';
 
-/** The chat instance every getGenerativeModel().startChat() hands back. */
-const startChat = vi.hoisted(() => vi.fn());
+/** The content stream call every model call makes: the chat's, over the history it owns, and the plan emission's. */
+const generateContentStream = vi.hoisted(() => vi.fn());
 /** The model each getGenerativeModel() call was asked for, in order. */
 const modelsAsked = vi.hoisted((): string[] => []);
 
@@ -16,7 +16,7 @@ vi.mock('@google/generative-ai', () => ({
     getGenerativeModel = ({ model }: { model: string }) => {
       modelsAsked.push(model);
       // As the SDK does: the instance names the model by its resource path.
-      return { model: `models/${model}`, startChat: startChat, generateContentStream: vi.fn() };
+      return { model: `models/${model}`, generateContentStream: generateContentStream };
     };
   },
   SchemaType: { STRING: 'STRING', NUMBER: 'NUMBER', ARRAY: 'ARRAY', BOOLEAN: 'BOOLEAN', OBJECT: 'OBJECT' },
@@ -30,7 +30,13 @@ interface ChunkSpec {
   usageMetadata?: Record<string, unknown>;
 }
 
-type SendMessageStreamRequest = unknown;
+interface StreamRequest {
+  contents: Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+  tools: Array<{ functionDeclarations: { name: string }[] }>;
+}
+
+/** What a request adds after the history: the turn the call sends. */
+const sentTurn = (request: StreamRequest) => request.contents[request.contents.length - 1];
 
 function streamResult(chunks: ChunkSpec[]): { stream: AsyncIterable<ChunkSpec> } {
   return {
@@ -40,16 +46,14 @@ function streamResult(chunks: ChunkSpec[]): { stream: AsyncIterable<ChunkSpec> }
   };
 }
 
-/** Wire the mocked chat so each call pops one canned stream and records the request. */
-function scriptStreams(specs: { stream: AsyncIterable<ChunkSpec> }[]): { requests: SendMessageStreamRequest[] } {
-  const requests: SendMessageStreamRequest[] = [];
-  startChat.mockReturnValue({
-    sendMessageStream: async (request: SendMessageStreamRequest) => {
-      requests.push(request);
-      const spec = specs[requests.length - 1];
-      if (!spec) throw new Error('scripted streams exhausted');
-      return spec;
-    },
+/** Wire the mocked model so each call pops one canned stream and records the request. */
+function scriptStreams(specs: { stream: AsyncIterable<ChunkSpec> }[]): { requests: StreamRequest[] } {
+  const requests: StreamRequest[] = [];
+  generateContentStream.mockImplementation(async (request: StreamRequest) => {
+    requests.push(structuredClone(request));
+    const spec = specs[requests.length - 1];
+    if (!spec) throw new Error('scripted streams exhausted');
+    return spec;
   });
   return { requests };
 }
@@ -59,7 +63,7 @@ function geminiConfig(): IConfig {
 }
 
 describe('Gemini research chat streaming', () => {
-  beforeEach(() => { startChat.mockReset(); });
+  beforeEach(() => { generateContentStream.mockReset(); });
 
   it('streams a text reply as deltas under one segment per call, with one usage record from the final chunk', async () => {
     scriptStreams([
@@ -114,24 +118,11 @@ describe('Gemini research chat streaming', () => {
 
   it('follows a model switched within Gemini on the next turn, over the same history', async () => {
     modelsAsked.length = 0;
-    const said = (n: number) => ({ role: 'model', parts: [{ text: `reply ${n}` }] });
-    const chats: Array<{ history: unknown[]; sent: unknown[] }> = [];
-    let replies = 0;
-    startChat.mockImplementation(({ history }: { history: unknown[] }) => {
-      const chat = { history: [...history], sent: [] as unknown[] };
-      chats.push(chat);
-      return {
-        getHistory: async () => chat.history,
-        sendMessageStream: async (request: unknown) => {
-          chat.sent.push(request);
-          chat.history.push({ role: 'user', parts: [{ text: request }] }, said(++replies));
-          return streamResult([
-            { candidates: [{ content: { parts: [{ text: `reply ${replies}` }] }, finishReason: 'STOP' }] },
-            { usageMetadata: { promptTokenCount: 100 * replies, candidatesTokenCount: 2 } },
-          ]);
-        },
-      };
-    });
+    const reply = (n: number) => streamResult([
+      { candidates: [{ content: { parts: [{ text: `reply ${n}` }] }, finishReason: 'STOP' }] },
+      { usageMetadata: { promptTokenCount: 100 * n, candidatesTokenCount: 2 } },
+    ]);
+    const { requests } = scriptStreams([reply(1), reply(2)]);
     const config = fakeConfig({ aiProvider: 'google', apiKey: 'key', orchestratorModel: 'gemini:gemini-2.5-pro' });
     const service = new GeminiService(config);
     const progress: ResearchProgress[] = [];
@@ -141,9 +132,8 @@ describe('Gemini research chat streaming', () => {
     await service.continueConversation('and then?', (p) => progress.push(p));
 
     expect(modelsAsked).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
-    expect(chats).toHaveLength(2);
-    expect(chats[1].history.slice(0, -2)).toEqual(chats[0].history);
-    expect(chats[1].sent).toEqual(['and then?']);
+    expect(requests[1].contents.slice(0, -2)).toEqual(requests[0].contents);
+    expect(requests[1].contents.slice(-2)).toEqual([{ role: 'model', parts: [{ text: 'reply 1' }] }, { role: 'user', parts: [{ text: 'and then?' }] }]);
     expect(progress.filter((p) => p.type === 'usage').map((p) => p.record?.model)).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
   });
 
@@ -171,8 +161,7 @@ describe('Gemini research chat streaming', () => {
 
     // The tool round happened against the real loop, not inside this test.
     expect(progress.filter((p) => p.type === 'tool_call').map((p) => p.tool)).toEqual(['read_file']);
-    const funcResponses = (requests[1] as Array<{ functionResponse: { name: string } }>)[0];
-    expect(funcResponses.functionResponse.name).toBe('read_file');
+    expect(sentTurn(requests[1])).toMatchObject({ role: 'function', parts: [{ functionResponse: { name: 'read_file' } }] });
 
     // Preamble text streamed from the first call under one segment...
     const deltaSegments = progress.filter((p) => p.type === 'text_delta');
@@ -258,8 +247,71 @@ describe('Gemini research chat streaming', () => {
   });
 });
 
+describe('Gemini turn cancellation', () => {
+  beforeEach(() => { generateContentStream.mockReset(); });
+
+  // The SDK takes the signal as request options; without it a turn the user
+  // stopped keeps streaming (and billing) until the model finishes.
+  it('passes the caller signal to a streaming chat turn, so Stop settles it', async () => {
+    let sentOptions: { signal?: AbortSignal } | undefined;
+    generateContentStream.mockImplementation((_request: unknown, options?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        sentOptions = options;
+        options?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      }));
+    const service = new GeminiService(geminiConfig());
+    const caller = new AbortController();
+    const turn = service.startConversation({
+      goal: 'go',
+      runners: ['claude-code'],
+      modelsByRunner: {},
+      fs: fakeFileSystem() as IFileSystem,
+      onProgress: () => {},
+      signal: caller.signal,
+    });
+
+    await vi.waitFor(() => expect(sentOptions?.signal).toBeDefined());
+    caller.abort();
+
+    await expect(turn).rejects.toThrow(/abort/i);
+  });
+
+  it('passes the signal to the plan-emission content stream too', async () => {
+    generateContentStream.mockReturnValue({
+      stream: (async function* () {
+        yield { candidates: [{ content: { parts: [{ text: '{}' }] } }] };
+      })(),
+    });
+    class ExposedGeminiService extends GeminiService {
+      plan(prompt: string, signal: AbortSignal): Promise<string> {
+        return this.streamPlanText(prompt, undefined, () => {}, undefined, signal);
+      }
+    }
+    const caller = new AbortController();
+
+    await new ExposedGeminiService(geminiConfig()).plan('make a plan', caller.signal);
+
+    expect(generateContentStream.mock.calls[0][1]).toEqual({ signal: caller.signal });
+  });
+
+  it('passes the signal on the direct-plan path, where research is off', async () => {
+    generateContentStream.mockReturnValue({
+      stream: (async function* () {
+        yield { candidates: [{ content: { parts: [{ text: 'no plan here' }] } }] };
+      })(),
+    });
+    const caller = new AbortController();
+
+    await expect(
+      new GeminiService(geminiConfig()).generatePlanDirect('make a plan', ['claude-code'], {}, () => {}, undefined, undefined, undefined, undefined, caller.signal),
+    ).rejects.toThrow();
+
+    expect(generateContentStream.mock.calls[0][1]).toEqual({ signal: caller.signal });
+  });
+});
+
 describe('Gemini planner skill catalog', () => {
-  beforeEach(() => { startChat.mockReset(); });
+  beforeEach(() => { generateContentStream.mockReset(); });
 
   it('shows the task skills the planner may attach, and no planner skills, which load only through tools', async () => {
     scriptStreams([streamResult([{ candidates: [{ content: { parts: [{ text: 'Which cache?' }] }, finishReason: 'STOP' }] }])]);
@@ -273,31 +325,52 @@ describe('Gemini planner skill catalog', () => {
       skills: [skill('pr-style', 'task'), skill('review-plan', 'planner')],
     });
 
-    const [{ history }] = startChat.mock.calls[0] as [{ history: { parts: { text: string }[] }[] }];
-    const system = history[0].parts[0].text;
+    const [{ contents }] = generateContentStream.mock.calls[0] as [StreamRequest];
+    const system = String(contents[0].parts[0].text);
     expect(system).toContain('Task skills you may attach:\n- pr-style: pr-style description');
     expect(system).not.toMatch(/review-plan|load_skill/);
   });
 });
 
+describe('Gemini planner exploration', () => {
+  beforeEach(() => { generateContentStream.mockReset(); });
+
+  // F6: no createSubagentChat override, so spawn_research_agent would fail on every call.
+  it('tells the planner to read itself, since this service cannot run research subagents', async () => {
+    scriptStreams([streamResult([{ candidates: [{ content: { parts: [{ text: 'Which cache?' }] }, finishReason: 'STOP' }] }])]);
+    await new GeminiService(geminiConfig()).startConversation({
+      goal: 'add a cache', runners: ['claude-code'], modelsByRunner: {}, fs: fakeFileSystem() as IFileSystem, onProgress: () => {},
+    });
+
+    const [{ contents, tools }] = generateContentStream.mock.calls[0] as [StreamRequest];
+    const system = String(contents[0].parts[0].text);
+    const at = system.indexOf('\nWHO EXPLORES:\n');
+    expect(at).toBeGreaterThan(-1);
+    const rule = system.slice(at + 1, system.indexOf('\n\n', at + 1));
+    expect(rule).toContain('Find it with your own reads: you have no agents of your own here.');
+    expect(rule).not.toContain('spawn_research_agent');
+    expect(system).not.toContain('spawn_research_agent');
+    expect(tools.flatMap((t) => t.functionDeclarations.map((d) => d.name))).not.toContain('spawn_research_agent');
+  });
+});
+
 describe('Gemini turn budgets', () => {
-  beforeEach(() => { startChat.mockReset(); });
+  beforeEach(() => { generateContentStream.mockReset(); });
 
   it('appends the budget block to the turn\'s message and keeps it out of the system prompt', async () => {
     const reply = () => streamResult([{ candidates: [{ content: { parts: [{ text: 'Which cache?' }] }, finishReason: 'STOP' }] }]);
     const { requests } = scriptStreams([reply(), reply()]);
     let left = 40;
-    const service = new GeminiService(geminiConfig(), new TurnBudgets([() => `Web reads left this turn: ${left}.`]));
+    const service = new GeminiService(geminiConfig(), { turnBudgets: new TurnBudgets([() => `Web reads left this turn: ${left}.`]) });
 
     await service.startConversation({ goal: 'add a cache', runners: ['claude-code'], modelsByRunner: {}, fs: fakeFileSystem() as IFileSystem, onProgress: () => {} });
     left = 39;
     await service.continueConversation('in-process', () => {});
 
-    expect(requests).toEqual([
+    expect(requests.map((r) => sentTurn(r).parts.at(-1)?.text)).toEqual([
       'add a cache\n\nCONTEXT AND BUDGETS (this turn):\n- Web reads left this turn: 40.',
       'in-process\n\nCONTEXT AND BUDGETS (this turn):\n- Web reads left this turn: 39.',
     ]);
-    const [{ history }] = startChat.mock.calls[0] as [{ history: { parts: { text: string }[] }[] }];
-    expect(history[0].parts[0].text).not.toContain('CONTEXT AND BUDGETS');
+    expect(requests[0].contents[0].parts[0].text).not.toContain('CONTEXT AND BUDGETS');
   });
 });

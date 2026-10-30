@@ -19,8 +19,8 @@ import type { Action } from './reducer';
  * subscription, a second run socket, or the socket a reload opened while the
  * old one still drained — is dropped. Nothing about it belongs to a
  * subscription, so a socket that is gone leaves nothing behind to hold back a
- * later broadcast that happens to read the same, as two clears of a held edit
- * do. A daemon older than the stamp is deduped by content instead (`Copies`).
+ * later broadcast that happens to read the same, as two identical status
+ * updates do. A daemon older than the stamp is deduped by content instead (`Copies`).
  */
 
 export type Dispatch = (action: Action) => void;
@@ -46,7 +46,7 @@ type ConversationMessage = Partial<StreamStamp> & Extract<
       | 'planner_message' | 'planner_turn_started' | 'planner_turn_ended' | 'planner_text_delta' | 'planner_thinking_delta'
       | 'planner_skill_loaded'
       | 'planner_text_retracted' | 'plan_token' | 'plan_generated' | 'research_step' | 'research_step_done'
-      | 'subagent_started' | 'subagent_finished' | 'planner_usage' | 'planner_liveness'
+      | 'subagent_started' | 'subagent_finished' | 'planner_usage' | 'planner_liveness' | 'planner_compaction'
       | 'approval_request' | 'approval_settled' | 'approval_decided'
       | 'execution_action';
   }
@@ -59,7 +59,7 @@ const CONVERSATION_TYPES: ReadonlySet<string> = new Set<ConversationMessage['typ
   'planner_message', 'planner_turn_started', 'planner_turn_ended', 'planner_text_delta', 'planner_thinking_delta',
   'planner_skill_loaded',
   'planner_text_retracted', 'plan_token', 'plan_generated', 'research_step', 'research_step_done',
-  'subagent_started', 'subagent_finished', 'planner_usage', 'planner_liveness',
+  'subagent_started', 'subagent_finished', 'planner_usage', 'planner_liveness', 'planner_compaction',
   'approval_request', 'approval_settled', 'approval_decided',
   'execution_action',
 ]);
@@ -104,7 +104,7 @@ function replyKey(content: string, timestamp?: string): string {
 }
 
 /** A broadcast this client may have had more than once. */
-type Broadcast = Exclude<WsEvent, RunSnapshotFrame>;
+type Broadcast = Exclude<WsEvent, RunSnapshotFrame | { type: 'account_limits' }>;
 
 function stampOf(frame: Partial<StreamStamp>): StreamStamp | null {
   return frame.stream !== undefined && frame.seq !== undefined ? { stream: frame.stream, seq: frame.seq } : null;
@@ -116,7 +116,7 @@ function stampOf(frame: Partial<StreamStamp>): StreamStamp | null {
  * applying it after the snapshot would bring back what the snapshot says is
  * over — a preview cleared, a request answered.
  */
-const COVERED: ReadonlySet<string> = new Set<Broadcast['type']>(['plan_edit_held', 'status_update', 'task_updated', 'approval_request', 'approval_settled']);
+const COVERED: ReadonlySet<string> = new Set<Broadcast['type']>(['status_update', 'task_updated', 'approval_request', 'approval_settled']);
 
 /**
  * The sequence numbers of one daemon's broadcasts this client has delivered
@@ -168,7 +168,7 @@ class Delivered {
 
 /** A clear or a drop: applying one twice changes nothing, so an unstamped copy is never held back. */
 function isClear(event: Broadcast): boolean {
-  return (event.type === 'plan_edit_held' && event.held === null) || event.type === 'approval_settled';
+  return event.type === 'approval_settled';
 }
 
 /**
@@ -253,12 +253,6 @@ export interface SessionInbound {
    * segment it streamed under.
    */
   backfill(content: string, timestamp?: string, runs?: ReplyRun[]): void;
-  /**
-   * A redrawn transcript now holds this entry (a compaction's summary), so a
-   * socket copy arriving afterwards is the broadcast the redraw already
-   * covers — not a new turn.
-   */
-  redrawn(content: string, timestamp?: string): void;
   /** A burst held for batching goes out now, in order. */
   flush(): void;
   /**
@@ -268,7 +262,11 @@ export interface SessionInbound {
    * dropped — a request answered elsewhere meanwhile among them.
    */
   holdSnapshot(): void;
-  /** Delivers the snapshot held and what came after it, in order (when `deliver`), then hands them out as they come again. */
+  /**
+   * Delivers the snapshot held and what came after it, in order (when
+   * `deliver`), then hands them out as they come again. A load releases them
+   * on top of what it read: they are newer.
+   */
   releaseSnapshot(deliver: boolean): void;
 }
 
@@ -294,6 +292,15 @@ export function inboundFor(api: object, dispatch: Dispatch, sessionId: string): 
   return inbound;
 }
 
+/**
+ * Drop what one session's sockets counted, for a session the TUI has closed or
+ * deleted. A long-lived TUI browsing `/sessions` would otherwise keep a
+ * window and three dedupe sets for every session it ever opened.
+ */
+export function forgetInbound(api: object, sessionId: string): void {
+  inbounds.get(api)?.delete(sessionId);
+}
+
 function createInbound(dispatch: Dispatch, sessionId: string): SessionInbound {
   const delivered = new Delivered(256);
   const copies = new Copies(64);
@@ -312,6 +319,7 @@ function createInbound(dispatch: Dispatch, sessionId: string): SessionInbound {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let holdingSnapshot = false;
   let heldSnapshot: RunSnapshotFrame | null = null;
+  let limitsPosition: { stream: string; revision: number } | null = null;
   let heldAfter: (() => void)[] = [];
 
   const flush = (): void => {
@@ -406,6 +414,13 @@ function createInbound(dispatch: Dispatch, sessionId: string): SessionInbound {
       heldAfter.push(() => receive(kind, id, event));
       return;
     }
+    if (event.type === 'account_limits') {
+      if (event.sessionId !== sessionId) return;
+      if (limitsPosition?.stream === event.stream && event.revision <= limitsPosition.revision) return;
+      limitsPosition = { stream: event.stream, revision: event.revision };
+      dispatch({ type: 'accountLimits', limits: event.limits, sessionId });
+      return;
+    }
     if (isStreamed(event)) {
       // Streamed prose has one voice: the planning subscription. A run's own
       // socket ignores it, as it always has — and does not count as its copy.
@@ -440,11 +455,6 @@ function createInbound(dispatch: Dispatch, sessionId: string): SessionInbound {
       // is this same reply, so the next matching copy is swallowed.
       if (timestamp) pending.add(replyKey(content, timestamp));
     },
-    redrawn: (content, timestamp) => {
-      shown.add(replyKey(content, timestamp));
-      shownTexts.add(content);
-      pending.add(replyKey(content, timestamp));
-    },
     flush,
     holdSnapshot: () => {
       holdingSnapshot = true;
@@ -478,6 +488,7 @@ function dispatchLifecycle(dispatch: Dispatch, event: LifecycleMessage, sessionI
         tasks: event.tasks,
         ...(event.runMerge ? { runMerge: event.runMerge } : {}),
         ...(event.usage ? { usage: event.usage } : {}),
+        ...(event.activity ? { activity: event.activity } : {}),
         sessionId,
       });
       return;
@@ -517,11 +528,6 @@ function dispatchLifecycle(dispatch: Dispatch, event: LifecycleMessage, sessionI
     // How the run isolates. The daemon has no toast channel, so this is the only place the user hears it.
     case 'notice':
       dispatch({ type: 'notice', message: event.message, level: event.level });
-      return;
-
-    // The pane draws it apart from the plan's rows; the reducer folds it into the run view.
-    case 'plan_edit_held':
-      dispatch({ type: 'heldEdit', held: event.held, sessionId });
       return;
 
     case 'isolation_handoff':

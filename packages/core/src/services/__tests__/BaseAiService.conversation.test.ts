@@ -68,6 +68,26 @@ describe('runConversationTurn plan commit', () => {
   });
 });
 
+describe('runConversationTurn runner scope', () => {
+  const codexPlan = PLAN_JSON.replace('"claude-code"', '"codex"');
+
+  it('checks an envelope plan against the runners enabled now, not those the conversation opened with', async () => {
+    const chat = new ScriptedChat([proseTurn(codexPlan)]);
+    const ctx: ConversationTurnContext = { ...makeCtx(chat), liveScope: () => ({ runners: ['claude-code', 'codex'] }) };
+    const turn = await new TestService(fakeConfig()).runTurn(ctx, 'go');
+    expect(turn.kind).toBe('plan');
+    expect(chat.sent).toHaveLength(1);
+  });
+
+  it('refuses an envelope plan for a runner switched off since the conversation opened', async () => {
+    const chat = new ScriptedChat([proseTurn(codexPlan), proseTurn('Sorry'), proseTurn('Sorry')]);
+    const ctx: ConversationTurnContext = { ...makeCtx(chat), runners: ['claude-code', 'codex'], liveScope: () => ({ runners: ['claude-code'] }) };
+    const turn = await new TestService(fakeConfig()).runTurn(ctx, 'go');
+    expect(turn.kind).toBe('message');
+    expect(chat.sent[1]).toContain('invalid assignedRunner "codex"');
+  });
+});
+
 describe('runConversationTurn budgets', () => {
   it('appends the budget block to the turn\'s input, and only to the first send', async () => {
     const chat = new ScriptedChat([proseTurn('Which store?')]);
@@ -302,29 +322,17 @@ describe('runConversationTurn JSON repair', () => {
   });
 });
 
-describe('runConversationTurn proactive compaction', () => {
-  it('compacts once a research turn reports prompt-token pressure, before the plan emission', async () => {
+// The fixed 100k-token trigger is gone: what fits is the chat's to decide,
+// before each of its calls, against its own model's window.
+describe('runConversationTurn and context pressure', () => {
+  it('prunes nothing on a reported prompt count by itself', async () => {
     const chat = new ScriptedChat([
       { text: '', toolCalls: [{ name: 'read_file', args: { path: 'x.ts' }, id: 'c1' }], hasToolCalls: true, promptTokens: 150_000 },
-      { ...proseTurn(PLAN_JSON), promptTokens: 90_000 },
+      { ...proseTurn(PLAN_JSON), promptTokens: 190_000 },
     ]);
     let compactions = 0;
     chat.compactHistory = () => { compactions++; return 500; };
-    const svc = new TestService(fakeConfig());
-    const turn = await svc.runTurn(makeCtx(chat), 'go');
-    expect(turn.kind).toBe('plan');
-    expect(compactions).toBe(1);
-  });
-
-  it('never compacts while usage stays under the threshold', async () => {
-    const chat = new ScriptedChat([
-      { text: '', toolCalls: [{ name: 'read_file', args: { path: 'x.ts' }, id: 'c1' }], hasToolCalls: true, promptTokens: 20_000 },
-      { ...proseTurn(PLAN_JSON), promptTokens: 25_000 },
-    ]);
-    let compactions = 0;
-    chat.compactHistory = () => { compactions++; return 0; };
-    const svc = new TestService(fakeConfig());
-    const turn = await svc.runTurn(makeCtx(chat), 'go');
+    const turn = await new TestService(fakeConfig()).runTurn(makeCtx(chat), 'go');
     expect(turn.kind).toBe('plan');
     expect(compactions).toBe(0);
   });

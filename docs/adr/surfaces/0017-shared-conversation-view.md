@@ -99,11 +99,78 @@ own presentation; it never re-derives the conversation from raw messages.
   deliberately leaves out thinking and everything that streamed and never settled —
   no `transcriptAt` beyond what the transcript itself records, and no reliance
   on the in-flight view. What reload shows is what was saved, not what was seen.
-- **Expansion is one toggle per surface (X1).** Collapsed is the default: a
-  command row reads `Name(keyArg)`, a subagent is one line, and one detail flag
-  (the TUI's ctrl+o, VS Code's header button) shows arguments, full output,
-  subagent children and digests. The flag is surface state, keyed on block
-  ids that stay stable for as long as the block exists — never stored in core.
+- **Expansion is surface state, collapsed by default (X1).** A command row
+  reads `Name(keyArg)` with a short preview, and a subagent is one line and its
+  digest. The TUI keeps one detail toggle, ctrl+o, that shows every block's
+  arguments, full output, subagent children and digests at once. VS Code folds
+  each run of activity between two messages — thinking, calls, subagents,
+  setup notices, a runner's compaction notices, answered approvals — into one line that
+  says what it did (`Ran 4 commands, fetched 2 pages (2 failed)`), counted
+  from the blocks' own facts: a call by its kind and how it ended, and never
+  as run when it was refused, denied or not executed (`1 command denied`,
+  `Ran a command (1 more not run)`); an Ordewell tool the same whichever
+  planner called it; a subagent once, never its steps; a `load_skill` call
+  and its notice once; a granted approval only when no call stands beside it,
+  and a denial once: on the call it stopped when that call stands beside it
+  (a runner's call its denied request names reads `1 command denied`, though
+  its result came back failed), and as the approval otherwise; and work still
+  running as running. A line with a
+  failure, denial or interruption in it is coloured as one. Opening the line
+  draws its rows as the TUI's collapsed previews; each row, each of a
+  subagent's steps and each long report opens on its own. A waiting approval,
+  an error, other notices, the skills a user's own message loaded and every
+  message stay outside any fold. A script task's log folds nothing and opens
+  nothing: it is commands, their output and their exits (ADR-0035), with no
+  prose for a fold to keep in view, so each row is drawn whole, its command
+  once, in its head, with no arguments block repeating it. What is open
+  is surface state, keyed on block ids that stay stable for as long as the
+  block exists — a run by the ids of the blocks it holds — never stored in
+  core, and dropped when the conversation is replaced (a new session or a
+  reload, whose blocks are numbered afresh) or another attempt is shown. A
+  compaction replaces nothing (C1), so what was open stays open.
+- **A compaction is one quiet block where it happened (C1).** The planner's
+  compaction reaches a surface as `planner_compaction`, one phase at a time
+  under one stable id. Ordewell's own announces `started`, then `ended` with
+  its outcome (condensed, pruned, unchanged, stopped, failed or paused), and
+  the checkpoint a condensed one writes carries the same id (ADR-0002); an API
+  planner's automatic one is announced in the turn it happens in, and a
+  pruning, over as it begins, reports only its end. A
+  harness planner's native compaction is reported only as `ended`, with the
+  sizes it stated, because that is all its protocol says: no start, summary or
+  size is invented, and a subagent's never reaches the planner's view. The
+  view folds both phases and the transcript entry into one `compaction` block
+  by that id, so a phase heard twice, or the transcript first, draws one
+  block; an end that changed nothing draws nothing in a view that never saw it
+  start, one that had nothing to do takes its block back, and a turn cut short
+  closes one still running. A turn let go while it compacts announces that
+  compaction's end, as stopped, before its own, so a surface joining later is
+  not told it still runs. While it runs a surface says so (`Compacting
+  context…`) where it says a turn is working, and the planner is held as in a
+  turn: Stop stops it and a message waits for it. Once over it is a quiet line
+  of its own, outside any fold (`Context compacted`, with sizes only when both
+  were reported), worded once in core (`compactionText`); its summary opens
+  from it and is never shown whole, and no notification announces a routine
+  success. The transcript keeps every message (ADR-0002), so nothing is
+  rebuilt: the draft, the scroll position, task output and what was open stay.
+  A reload draws the same block from the transcript, a legacy summary first as
+  before. A native or pruning compaction, and one that condensed only a
+  turn's own rounds, is display-only: never written, so it never touches what
+  the planner replays. A surface that joins while one runs
+  is owed its start, which `Session.plannerCompaction()` holds until its end,
+  as announced approvals are held. The daemon hands it on three ways, all the
+  start as announced: beside `plannerTurnId` in the answers to a session's
+  read and adoption, and as the frame after the run snapshot when a socket
+  joins, unstamped so the fold, idempotent by id, never counts it as a
+  broadcast it already holds. The TUI folds the events as the view does, with
+  no redraw: its status is `compacting` for one it did not ask for (its end
+  frees the planner and sends what was typed meanwhile) and `condensing` for
+  its own `/compact`, which the call's answer settles, carrying the plan whose
+  transcript holds the summary should a frame have been lost. A call that
+  fails closes the block it left running. Reconnecting during one, or reading
+  a lost reply back, adopts the running one without a redraw; when the daemon
+  holds none and the transcript has no checkpoint for it, the block goes, since
+  nothing is known to have happened. In the terminal the line is quiet and
+  its summary opens with the detail key (ctrl+o).
 
 ### Queued prompts
 
@@ -153,12 +220,26 @@ the same word.)
   Rejected there per D1; the conversational view strengthens the point — a
   block list is renderable as strings, and that is all the renderer has ever
   needed from a state.
-- **Per-block focus and expansion** — one expanded flag per block, navigated
-  with keys, remembered per block. It is more keys and more state than the use
-  case needs: what a user wants is *all* the detail or *none*, and the user
-  chose a single toggle, as in Claude Code. A per-block flag would also have to
-  live in surface state keyed on block ids, growing with the conversation, for
-  a distinction nobody asked for.
+- **Per-block focus and expansion in the TUI** — one expanded flag per
+  block, navigated with keys, remembered per block. It is more keys and more
+  state than a terminal needs: there a user wants *all* the detail or *none*,
+  and the user chose a single toggle, as in Claude Code. A terminal has no
+  pointer to open one row with, so ctrl+o stays.
+- **One expand-all toggle in VS Code** (the design until 2026-10-25: a header
+  button, the TUI's ctrl+o by another spelling). A long turn drew every row
+  of every call, so the planner's and the agent's words were lost among them;
+  and the toggle could only show everything, which buried the one row a
+  reader opened it for under every other row's full output. A pointer can
+  open one row, so the webview folds each run of activity into a sentence and
+  opens one level at a time. The open choices live in the webview, keyed on
+  block ids, and are dropped with the conversation they belong to.
+- **Every run of activity open, its rows collapsed.** It keeps each call one
+  line, but a fifty-call turn is still fifty lines between two sentences of
+  prose.
+- **Counting what a call ran** (`curl` three times in one script as three
+  pages fetched). A script's contents are free text; a summary that guessed
+  at them would claim work nobody saw done. A call is counted by its tool's
+  kind, as its row is named.
 - **One settled message per reply, replacing its final segment** (the design
   until 2026-10-18). A harness planner's reply joins the text on both sides of
   its tool calls, so one message could not replace one segment: the turn's
@@ -186,3 +267,10 @@ the same word.)
 - 2026-10-19 — the meter counts a call's context as its runner does and resets on a compaction, and a window reported anywhere in the session is known to every later stream (U1). Claude Code states a window only on a turn's last line, so a task, often one long turn, showed no share for its whole run even with the planner on the same model.
 - 2026-10-19 — a turn whose calls did not stream has their tokens taken once from its result (U1). A session billing fact is kept with the source that stated it, so a planner switched before its first cost is not shown as the old one's subscription.
 - 2026-10-19 — the Tasks total names a runner as reporting no cost only once an attempt of it has ended having reported usage (U1). Claude Code states a cost only at a turn's end, so a first Claude Code task read as `claude-code reports no cost` for as long as its turn ran.
+- 2026-10-25 — VS Code folds each run of activity into one summarised line, opened a level at a time, in place of its expand-all button; the TUI keeps ctrl+o (X1). A long turn's rows buried the prose between them, and showing everything was the only way to see one row in full.
+- 2026-10-25 — a script task's log is drawn whole, unfolded; a summary never counts a call that did not run as run and keeps a denied approval; a failed line is coloured; a compaction drops what was open (X1). Found in review: a failing script's output was hidden behind one closed line, and a denied command read `Ran a command`.
+- 2026-10-25 — a denial is counted once, on the call it stopped when that call is in the line, and a script row draws its command once (X1). Found in review: a runner's denied command read `Ran a command (1 failed)` beside its denied approval, and a planner's denial was counted twice.
+- 2026-10-25 — a planner compaction is one quiet block folded in by id where it happened, with its start and end announced, Stop and queued messages as in a turn, and nothing rebuilt (C1). Before it, `/compact` rebuilt the whole VS Code conversation, collapsing what was open, behind a progress notification and a success popup, and a harness planner's own compaction was not shown at all.
+- 2026-10-25 — the daemon carries a running planner compaction in its read, adoption and socket-join answers, and the TUI folds the lifecycle without a redraw, holding the planner and its queue until the end (C1). Before it, `/compact` redrew the TUI conversation and reset its scroll, a surface that joined mid-compaction saw a silent planner, and a lost reply was read back as a lost turn.
+- 2026-10-25 — C1: an API planner's automatic compaction is announced in its turn, a pruning by its end alone, and one that condensed only the turn's own rounds is never written ([ADR-0002](../planner/0002-planner-as-conversation-loop.md)).
+- 2026-10-25 — C1, found in review: a turn let go mid-compaction ends it as stopped, and the TUI keeps a session loaded mid-turn held until that turn ends, whatever compacts inside it. Before it, the session reported the compaction running for good, and an in-turn compaction's end freed the TUI's planner and sent a held prompt while the turn ran.

@@ -1,4 +1,4 @@
-import { flattenTasksWithParents, pausedOnLimit, waitsForReset, type Task, type TaskReportTo, type TaskStatus } from '../models/Task';
+import { flattenTasks, flattenTasksWithParents, pausedOnLimit, waitsForReset, type Task, type TaskReportTo, type TaskStatus } from '../models/Task';
 import { resolveTaskRef, resolveUserTaskRef } from './TaskRefs';
 import type { ExecutionActor, ExecutionCommandName, ExecutionRecord, ScriptConsent, ScriptResult, SupervisorLevel } from '../models/Execution';
 import { sameScriptBody, scriptBodyOf, scriptBodyText, type ScriptBody } from '../models/ScriptTask';
@@ -9,6 +9,7 @@ import { continuability } from './continuation';
 import type { GuardTarget, GuardTrip } from './LoopGuards';
 import { STOPPED_BEFORE_START, type StartAdmission } from './TaskOrchestrator';
 import { waitOf, type StartWait } from './readiness';
+import { manualOverrideConfirmation, manualOverrideStopFirst, type OverrideDirection } from '../taskRow/texts';
 
 /** One call at the command seam, as every route words it (ADR-0029). Task references are resolved here. */
 export type ExecutionCommand =
@@ -32,10 +33,16 @@ export type ExecutionCommand =
   | { command: 'skip_task'; task: string; reason?: string }
   /** The user's force start: past a failed dependency or a merge gate, queued behind dependencies still under way (ADR-0035). */
   | { command: 'force_start'; task: string }
-  /** The user vouches for the task's work, which lands as a passed verdict's would; never anyone else (ADR-0029). */
-  | { command: 'mark_complete'; task: string }
-  /** The user takes a completion back: the task is not started again, and held until it is retried or started. */
-  | { command: 'mark_not_done'; task: string }
+  /**
+   * The user vouches for the task's work, which lands as a passed verdict's
+   * would; never anyone else (ADR-0029). An AI or script task is refused while
+   * a run could advance it, and otherwise needs `confirmed`: the user's yes to
+   * {@link manualOverrideConfirmation}, which a call cannot imply. `seen` is
+   * the status the user was asked about: one that moved on since is refused.
+   */
+  | { command: 'mark_complete'; task: string; confirmed?: boolean; seen?: TaskStatus }
+  /** The user takes a completion back: the task is not started again, and held until it is retried or started. Confirmed as Mark complete is. */
+  | { command: 'mark_not_done'; task: string; confirmed?: boolean; seen?: TaskStatus }
   /** Stop a structured task's running turn, keeping its session: it then waits for the user's message. */
   | { command: 'interrupt_task'; task: string }
   /** Force send a message queued behind the running turn (ADR-0023, F1); `id` is the one `message_task` answered with. */
@@ -44,7 +51,11 @@ export type ExecutionCommand =
   | { command: 'remove_queued'; task: string; id: string }
   /** Keep a task paused on a usage limit from resuming on its own at the reset: it waits for the user's Resume now or Retry. */
   | { command: 'cancel_resume'; task: string }
-  /** The user's answer to the checkpoint a task waits at: it goes on, or is told `reason` to act on. */
+  /**
+   * The answer to the checkpoint a task waits at: it goes on, or is told `reason`
+   * to act on, which anyone but the user must give. The user's, or the
+   * supervisor's at Act (ADR-0029).
+   */
   | { command: 'answer_checkpoint'; task: string; answer: 'approve' | 'reject'; reason?: string }
   /** The user signs off the plan's review: every task in it is approved, as executing it approves them, and it runs. */
   | { command: 'approve_review' }
@@ -158,6 +169,8 @@ export interface ExecutionHost {
   hasLiveWork(): boolean;
   /** Something will start without being asked again: a start admitted and not yet claimed, or a scheduled resume. */
   startsPending(): boolean;
+  /** Something could move a task on without being asked: a start, an attempt in any phase, the scheduler or a usage-limit hold. */
+  advancesOnItsOwn(): boolean;
   /** Admit a start that waits before it claims; see {@link StartAdmission}. */
   admitStart(): StartAdmission;
   /** The task's attempt is live: starting, running or landing. */
@@ -167,8 +180,7 @@ export interface ExecutionHost {
   runBlocked(): boolean;
   /**
    * Every reason the task cannot start now, from the scheduler's one start
-   * rule (ADR-0034). Takes the task, not its id: one a held edit changes or
-   * adds is judged as the edit leaves it.
+   * rule (ADR-0034). Takes the task, not its id: the one the seam located.
    */
   startWaits(task: Readonly<Task>): readonly StartWait[];
   /** The runner requests waiting on a task for an answer. */
@@ -176,11 +188,12 @@ export interface ExecutionHost {
   /** A start is told who asked: whether a run it opens continues the last one depends on it (ADR-0029). */
   runPlan(actor: ExecutionActor): Promise<void>;
   /**
-   * The user's Execute while a run is under way, once it approved every task:
-   * the run takes them in, each starting once its dependencies finish. Answers
-   * the line that says so, naming how many had waited for approval.
+   * Execute while a run is under way: the run takes in the tasks approved, each
+   * starting once its dependencies finish. The user's Execute approves every
+   * task first, `approved` of which had waited; the planner's approves none, and
+   * `left` still wait. Answers the line that says so.
    */
-  joinRun(approved: number): Promise<string>;
+  joinRun(approved: number, left: number): Promise<string>;
   startTask(taskId: string, actor: ExecutionActor): Promise<void>;
   /** Force start the task; answers the line saying it waits for its dependencies, when it was queued behind them rather than started. */
   forceStart(taskId: string): Promise<string | undefined>;
@@ -213,29 +226,14 @@ export interface ExecutionHost {
   answerRequest(requestId: string, decision: ApprovalDecision): boolean;
   /** Merge all, through the queue it shares with landings. */
   mergeAll(): Promise<IsolationMergeResult>;
+  /** The plan's last isolated run closed with everything it landed merged into the user's branch, and no run has decided since. */
+  runMerged(): boolean;
   /** Keep the call in the timeline, worded as `text`. */
   record(record: ExecutionRecord, text: string): void;
   /** A loop guard stopped a call: the user is told, as the supervisor's message. */
   guardTripped(trip: GuardTrip): void;
-  /**
-   * The open planner turn holds an edit — to this task, or to any when none is
-   * named — that lands only when its reply ends.
-   */
-  heldEdit(taskId?: string): boolean;
-  /** The plan's task tree as the open turn's held edit leaves it: as it is, when it holds none or one that would not apply. */
-  editedTasks(): readonly Task[];
-  /** The id of the task the open turn's held edit makes under this batch handle; undefined when it names none. */
-  heldHandle(name: string): string | undefined;
-  /**
-   * Run the command again, as the same actor, once the open turn's reply has
-   * landed its edit; `intent` names it if it never does. `admission` is
-   * released once it has run or been dropped.
-   */
-  deferUntilLanded(command: ExecutionCommand, actor: ExecutionActor, intent: string, admission: StartAdmission): void;
-  /** A command deferred behind an edit did not run once the edit landed: the user is told, and so is the planner's next turn. */
-  queuedNotRun(text: string): void;
-  /** The open planner turn holds a whole plan, which replaces the plan as its reply ends. */
-  heldPlan(): boolean;
+  /** The task an edit the open planner turn committed gave this handle; undefined when none did (ADR-0022 P2). */
+  turnHandle(name: string): string | undefined;
   /**
    * The script task a `run_script` call would add (ADR-0035), checked as
    * edit_plan's add is, the supervisor's against its loop guards too — or
@@ -243,7 +241,7 @@ export interface ExecutionHost {
    * before anything changes.
    */
   draftScript(call: RunScript, actor: ExecutionActor): { ok: true; task: Task } | { ok: false; errors: string[] };
-  /** Put a drafted script task in the plan now, past the turn's held edit, and unapproved. */
+  /** Put a drafted script task in the plan now, unapproved. */
   addScript(task: Task, actor: ExecutionActor): void;
   /** Start an approved task once its merge gate opens, never past it; see {@link TaskOrchestrator.startAtGate}. */
   startAtGate(taskId: string): void;
@@ -271,6 +269,12 @@ export interface ExecutionCommandsDeps {
 /** Commands that start work: they need the user's approval of what they start, and ask in Guarded. */
 const STARTS: ReadonlySet<ExecutionCommandName> = new Set(['run_plan', 'run_task', 'retry_task', 'force_start', 'approve_review', 'run_script']);
 
+/**
+ * What waits for a landing override, besides the starts: a skip restarts a run
+ * that ended on a failure, so it would start work under the landing task.
+ */
+const HELD_BY_LANDING_OVERRIDE: ReadonlySet<ExecutionCommandName> = new Set([...STARTS, 'skip_task']);
+
 /** The user's own controls, by the names they press them by: a model asking for one is refused. */
 const USERS_ONLY: Partial<Record<ExecutionCommandName, string>> = {
   force_start: 'Force start',
@@ -280,11 +284,22 @@ const USERS_ONLY: Partial<Record<ExecutionCommandName, string>> = {
   force_send_queued: 'Force send',
   remove_queued: 'Taking back a queued message',
   cancel_resume: 'Cancelling a scheduled resume',
-  answer_checkpoint: 'Answering a checkpoint',
   approve_review: 'Approving the review',
 };
 
 const MERGE_IS_USERS = 'Merge all is the user\'s: they are in this conversation, and press Merge all themselves. Tell them the work is ready to merge.';
+
+const NOT_APPROVED_YET = 'The user has not approved this plan yet: they approve it by executing it themselves (Execute plan). Ask them to.';
+
+const CHECKPOINT_CARD = 'The user answers it from the task\'s checkpoint card (Approve or Reject): tell them what the runner asks and what you would answer, with why.';
+
+const CHECKPOINT_IS_USERS = `A checkpoint is the user's to answer in their own turn: they are in this conversation. ${CHECKPOINT_CARD} Only the supervisor at Act answers one, in a wake-up turn.`;
+
+/** The supervisor's own refusal for a checkpoint, by the level that denies it: the general one says the user's reply applies a suggestion, which a checkpoint's cannot. */
+const CHECKPOINT_BELOW_ACT: Record<Exclude<SupervisorLevel, 'act'>, string> = {
+  watch: `You are the supervisor at Watch: you read and suggest, and cannot answer a checkpoint. ${CHECKPOINT_CARD}`,
+  off: `The supervisor is off for this run, so it cannot answer a checkpoint. ${CHECKPOINT_CARD}`,
+};
 
 const SKIP_IS_USERS = 'Skipping a task is the user\'s in their own turn: they are in this conversation, and skip it themselves. Suggest it, with why; only the supervisor at Act skips, in a wake-up turn.';
 
@@ -292,7 +307,8 @@ const SCRIPTS_ARE_THE_PLANNERS = 'run_script is the planner\'s: a person adds a 
 
 const NO_PLAN_FOR_SCRIPT = 'There is no plan yet, so there is nowhere to add a script task. Submit a plan that holds it: the user approves it by executing the plan.';
 
-const SCRIPT_UNDER_HELD_PLAN = 'Your submit_plan in this reply replaces the plan as the reply ends, and would leave out a script task added now. Put the script task in the plan you submit, or call run_script once that plan has landed.';
+
+const OVERRIDE_LANDING = 'Another manual override is landing: wait for it to finish, then start or override again.';
 
 const NEVER_ALLOWS = 'answer_approval never allows. A runner asks because its mode did not cover the request, and allowing it would widen the mode the plan gave the task. Deny it with a note saying what to do instead, or escalate it to the user.';
 
@@ -349,6 +365,12 @@ export class ExecutionCommands {
    * them out, or a no on the card would come after a yes it never gave.
    */
   private readonly carded = new Set<string>();
+  /**
+   * The AI or script tasks whose manual override is landing. One lands at a
+   * time, and nothing starts meanwhile: a run requested under it would race
+   * the work it is landing, which was judged against a plan with no run.
+   */
+  private readonly overriding = new Set<string>();
 
   constructor(private readonly deps: ExecutionCommandsDeps) {
     this.host = deps.host;
@@ -360,17 +382,14 @@ export class ExecutionCommands {
   }
 
   /**
-   * `admitted`: a deferred start's admission, taken as it was queued, which
-   * its owner releases; a start asked for now takes its own. `signal` ends a
-   * wait on the caller's behalf: `run_script` then answers that its task is
-   * still running.
+   * `signal` ends a wait on the caller's behalf: `run_script` then answers
+   * that its task is still running. A planner's call reads the plan as
+   * committed, its own edits in the turn included (ADR-0022 P2).
    */
-  async run(asked: ExecutionCommand, actor: ExecutionActor, admitted?: StartAdmission, signal?: AbortSignal): Promise<CommandOutcome> {
+  async run(asked: ExecutionCommand, actor: ExecutionActor, signal?: AbortSignal): Promise<CommandOutcome> {
     if (asked.command === 'run_script') return this.runScript(asked, actor, signal);
     if (!this.host.tasks()) return { ok: false, outcome: 'refused', message: 'There is no plan yet, so there is nothing to run or stop.' };
     const located = 'task' in asked ? this.locate(asked.task, actor) : undefined;
-    // A start queued before the user's Stop is what the Stop withdrew, whatever else has changed since.
-    if (admitted && !admitted.current()) return this.refuse(asked, actor, located, STOPPED_BEFORE_START);
     // A paused task has no turn to message: what is sent to it resumes it, and is consented to, guarded and recorded as that resume.
     const command: ExecutionCommand = asked.command === 'message_task' && located?.paused
       ? { command: 'retry_task', task: asked.task, from: 'session', message: asked.text }
@@ -378,39 +397,25 @@ export class ExecutionCommands {
     const consent = this.consent(actor, command.command);
     if ('task' in command && !located) {
       if (actor.kind === 'user') return this.refuse(command, actor, undefined, `There is no task "${command.task}" in this plan.`);
-      const missing = `No task matches "${command.task}" in the current plan.`;
-      const naming = 'Name it by id, "#order" (a subtask "#order.sub") or exact title.';
-      if (!this.host.heldEdit()) return this.refuse(command, actor, undefined, `${missing} ${naming}`);
-      // The turn's own edit may be adding it: a start the user is asked for, or one under the autorun exception, waits for it, as a start of an edited task does.
-      if (startsFromPrompt(command) && (this.addedMayStart(actor) || this.asksToApprove(actor))) {
-        return this.locateAsEdited(command.task)
-          ? this.judgeAsEdited(command, actor, undefined, consent)
-          : this.refuse(command, actor, undefined, `${missing} Your edit does not add it either. ${naming}`);
-      }
-      // A task the turn's own edit adds is not in the plan until the reply ends, and nothing then starts it on the turn's behalf.
-      return this.refuse(command, actor, undefined, command.command === 'skip_task'
-        ? `${missing} If your edit adds it, a task you add in this reply cannot be skipped in it: leave it out of the edit instead.`
-        : `${missing} If your edit adds it, it lands as this reply ends, so it cannot start in this turn: tell the user, who starts it.`);
+      return this.refuse(command, actor, undefined, `No task matches "${command.task}" in the current plan. Name it by id, "#order" (a subtask "#order.sub"), exact title, or the handle an edit_plan call of this reply gave it.`);
     }
 
     if (consent.kind === 'refuse') return this.refuse(command, actor, located, consent.reason);
-    // The plan holds what runs (ADR-0029): a start the turn's own held edit changes waits for that edit to land.
-    if (actor.kind !== 'user' && startsFromPrompt(command) && this.host.heldEdit(located?.task.id)) {
-      return this.judgeAsEdited(command, actor, located, consent);
-    }
 
     const first = this.prepare(command, actor, located);
     if ('refusal' in first) return this.refuse(command, actor, located, first.refusal);
     if ('nothing' in first) return { ok: true, message: first.nothing };
+    // After the call's own refusals, which name the task an override is landing.
+    if (this.overriding.size > 0 && HELD_BY_LANDING_OVERRIDE.has(command.command)) return this.refuse(command, actor, located, OVERRIDE_LANDING);
     const tripped = this.tripped(command, actor, located);
     if (tripped) return tripped;
 
     // A start counts as live work for Stop until it has acted — on the card, and while it starts (ADR-0029).
-    const admission = admitted ?? (STARTS.has(command.command) ? this.host.admitStart() : null);
+    const admission = STARTS.has(command.command) ? this.host.admitStart() : null;
     try {
       return await this.carryOut(command, actor, located, consent, first, admission);
     } finally {
-      if (!admitted) admission?.release();
+      admission?.release();
     }
   }
 
@@ -447,14 +452,17 @@ export class ExecutionCommands {
       const refused = this.refuse(command, actor, located, err instanceof Error ? err.message : String(err));
       return err instanceof Stopped ? { ...refused, payload: err.payload } : refused;
     }
+    // A Stop while the act awaited withdrew the start it reports, whichever verb it was: the claim under way
+    // ended its attempt quietly, so only the seam's admission sees that the Stop came.
+    if (stopped()) return this.refuse(command, actor, located, STOPPED_BEFORE_START);
     this.keep(command, actor, located, 'done', doneDetail(command));
     return { ok: true, message: acted.message, ...(acted.payload ? { payload: acted.payload } : {}) };
   }
 
   /**
    * `run_script` (ADR-0035): a script task the planner adds and starts in one
-   * step, past the turn's held edit, so nothing the turn holds can change it
-   * before it runs. Who may is ADR-0035's table ({@link scriptConsent}). A
+   * step, on the plan as committed, the turn's own edits included (ADR-0022
+   * P2). Who may is ADR-0035's table ({@link scriptConsent}). A
    * card unanswered or denied leaves the task in the plan, unapproved, for the
    * user to start or remove: absence is denial (ADR-0008, T5). It takes the
    * merge gate and the Merge-all exclusion an ops task takes as it starts, and
@@ -465,11 +473,11 @@ export class ExecutionCommands {
     if (!this.host.tasks()) return this.refuse(command, actor, undefined, NO_PLAN_FOR_SCRIPT);
     const consent = this.scriptConsent(actor, scriptBodyOf({ type: 'script', commands: command.commands, script: command.script, timeoutMs: command.timeoutMs }));
     if (consent.kind === 'refuse') return this.refuse(command, actor, undefined, consent.reason);
-    if (this.host.heldPlan()) return this.refuse(command, actor, undefined, SCRIPT_UNDER_HELD_PLAN);
     const draft = this.host.draftScript(command, actor);
     if (!draft.ok) return this.refuse(command, actor, undefined, `The script task was not added: ${draft.errors.join('; ')}`);
     const unready = this.scriptUnready(draft.task);
     if (unready) return this.refuse(command, actor, undefined, unready);
+    if (this.overriding.size > 0) return this.refuse(command, actor, undefined, OVERRIDE_LANDING);
     const tripped = this.tripped(command, actor, undefined);
     if (tripped) return tripped;
 
@@ -605,7 +613,7 @@ export class ExecutionCommands {
 
   /**
    * Of the tasks a planner edit in the user's turn wrote, the ones autorun
-   * approves as the edit lands: all of them, but for a script task, which
+   * approves as the edit commits: all of them, but for a script task, which
    * runs unasked only where `run_script` would run it unasked (ADR-0035), so
    * under Guarded it waits for the user unless their effect allowlist covers
    * it. Its row shows the body verbatim, and starting it is their consent.
@@ -627,44 +635,6 @@ export class ExecutionCommands {
     this.keep({ command: 'run_script', title: located.task.title }, actor, located, 'done', undefined, { consent: to.consent, result: scriptResultOf(located.task), ended: true });
   }
 
-  /**
-   * A command deferred behind the turn's edit, run now that the edit landed.
-   * Nobody reads its answer, so one that does not run is kept as refused and
-   * said, to the user and to the planner's next turn.
-   */
-  async replay(command: ExecutionCommand, actor: ExecutionActor, admission: StartAdmission): Promise<void> {
-    const located = 'task' in command ? this.locate(command.task, actor) : undefined;
-    let outcome: CommandOutcome;
-    try {
-      outcome = await this.run(command, actor, admission);
-    } catch (err) {
-      outcome = this.refuse(command, actor, located, err instanceof Error ? err.message : String(err));
-    }
-    if (outcome.ok || outcome.outcome !== 'refused') return;
-    this.host.queuedNotRun(admission.current()
-      ? `The queued ${queued(command, located)} did not run: ${outcome.message}`
-      : `Not done: the queued ${queued(command, located)} was stopped before it could start.`);
-  }
-
-  /**
-   * A start that waits for the turn's edit is judged now, against the plan as
-   * that edit leaves it — the edit counts as the change a retry needs — so one
-   * that could never run is refused while the caller still reads the answer,
-   * and one the user will be asked about says so. `located` is the task as the
-   * plan has it now, absent for a task the edit adds.
-   */
-  private judgeAsEdited(command: ExecutionCommand, actor: ExecutionActor, located: Located | undefined, consent: Consent): CommandOutcome {
-    const tasks = this.host.editedTasks();
-    const asEdited = located ? this.located(located.task.id, tasks) : 'task' in command ? this.locateAsEdited(command.task, tasks) : undefined;
-    if (located && !asEdited) return this.refuse(command, actor, located, `${capitalize(describe(located))} is removed by your edit, so it cannot start.`);
-    const prepared = this.prepare(command, actor, asEdited, tasks);
-    if ('refusal' in prepared) return this.refuse(command, actor, located, prepared.refusal);
-    if ('nothing' in prepared) return { ok: true, message: prepared.nothing };
-    // Named by id once the edit lands: a handle is the edit's alone, and an order or title may be what the edit changes.
-    const pinned = 'task' in command && asEdited ? { ...command, task: asEdited.task.id } : command;
-    return this.tripped(command, actor, asEdited) ?? this.defer(pinned, actor, asEdited, consent.kind === 'ask' ? prepared.approves ?? [] : null);
-  }
-
   private tripped(command: ExecutionCommand, actor: ExecutionActor, located: Located | undefined): CommandOutcome | null {
     for (const guard of this.guards) {
       const trip = guard(actor, command, located);
@@ -674,18 +644,6 @@ export class ExecutionCommands {
       return refused;
     }
     return null;
-  }
-
-  /** `approves` is null for a start that runs without asking, else what the user's yes would approve. */
-  private defer(command: ExecutionCommand, actor: ExecutionActor, located: Located | undefined, approves: readonly Located[] | null): CommandOutcome {
-    const intent = this.intent(command, located);
-    this.host.deferUntilLanded(command, actor, intent, this.host.admitStart());
-    return {
-      ok: true,
-      message: approves
-        ? `Queued: once your edit lands, as this reply ends, the user is asked on the approval card ${asking(command, intent, approves)}. Say so in your reply; you are not told what they answer.`
-        : `Queued: ${intent} happens once your edit lands, as this reply ends, so it runs as edited. Say so in your reply; you are not told how it goes.`,
-    };
   }
 
   /**
@@ -730,6 +688,7 @@ export class ExecutionCommands {
   private consent(actor: ExecutionActor, command: ExecutionCommandName): Consent {
     const control = USERS_ONLY[command];
     if (control && actor.kind !== 'user') return { kind: 'refuse', reason: usersOnly(command, control) };
+    if (command === 'answer_checkpoint') return this.checkpointConsent(actor);
     switch (actor.kind) {
       case 'user':
       case 'autorun': return { kind: 'allow' };
@@ -743,9 +702,27 @@ export class ExecutionCommands {
   }
 
   /**
+   * A checkpoint asks a person for judgement on the work, so the user answers
+   * it from the task's card; the supervisor may only at Act, in a wake-up turn
+   * (ADR-0029). A planner turn is in the user's own conversation, and autorun
+   * only starts plans.
+   */
+  private checkpointConsent(actor: ExecutionActor): Consent {
+    switch (actor.kind) {
+      case 'user': return { kind: 'allow' };
+      case 'supervisor': {
+        const consent = this.supervisor(actor.level, 'answer_checkpoint');
+        return consent.kind === 'refuse' && actor.level !== 'act' ? { kind: 'refuse', reason: CHECKPOINT_BELOW_ACT[actor.level] } : consent;
+      }
+      case 'planner-turn':
+      case 'autorun': return { kind: 'refuse', reason: CHECKPOINT_IS_USERS };
+    }
+  }
+
+  /**
    * Whether the command can run now, and how, judged against `tasks`: the
-   * plan, or the plan as the turn's held edit leaves it. Read afresh after a
-   * question, since answering takes time.
+   * plan as committed. Read afresh after a question, since answering takes
+   * time.
    */
   private prepare(command: ExecutionCommand, actor: ExecutionActor, located: Located | undefined, tasks: readonly Task[] = this.host.tasks() ?? []): Prepared {
     switch (command.command) {
@@ -761,13 +738,13 @@ export class ExecutionCommands {
       case 'merge_all': return this.prepareMergeAll(actor);
       case 'skip_task': return this.prepareSkip(located!, actor, command.reason);
       case 'force_start': return this.prepareForceStart(located!);
-      case 'mark_complete': return this.prepareMarkComplete(located!);
-      case 'mark_not_done': return this.prepareMarkNotDone(located!);
+      case 'mark_complete': return this.prepareMarkComplete(located!, command);
+      case 'mark_not_done': return this.prepareMarkNotDone(located!, command);
       case 'interrupt_task': return this.prepareInterrupt(located!);
       case 'force_send_queued': return this.prepareQueued(located!, command.id, 'force');
       case 'remove_queued': return this.prepareQueued(located!, command.id, 'remove');
       case 'cancel_resume': return this.prepareCancelResume(located!);
-      case 'answer_checkpoint': return this.prepareCheckpoint(located!, command);
+      case 'answer_checkpoint': return this.prepareCheckpoint(located!, command, actor);
       case 'approve_review': return this.prepareApproveReview();
       // Its task is not in the plan until the call adds it, so it has a path of its own: see runScript.
       case 'run_script': return { refusal: 'run_script adds its own task, so it is never judged against one.' };
@@ -778,12 +755,21 @@ export class ExecutionCommands {
     const all = this.all(tasks);
     const live = all.filter(({ task }) => this.host.running(task.id));
     if (this.host.hasLiveWork()) {
+      const waiting = all.filter(({ task }) => this.host.waitsForApproval(task.id) && !this.carded.has(task.id));
       // The user's Execute approves what waits rather than restarting the run under way; counted before the approval it records.
-      if (actor.kind === 'user') {
-        const waiting = all.filter(({ task }) => this.host.waitsForApproval(task.id) && !this.carded.has(task.id)).length;
-        return { act: async () => ({ message: await this.host.joinRun(waiting) }) };
+      if (actor.kind === 'user') return { act: async () => ({ message: await this.host.joinRun(waiting.length, 0) }) };
+      // Tasks started one by one are no scheduled run, so nothing starts their dependents: this call makes them one.
+      // It approves nothing, and the scheduler starts only approved tasks, so it grants what run_task already does (ADR-0035).
+      if (!this.host.planApproved()) {
+        return { refusal: `${NOT_APPROVED_YET} Tasks started with run_task are not a scheduled run, so their dependents start only once the user executes the plan.` };
       }
-      return { refusal: `The plan is already running (${named(live)} ${live.length === 1 ? 'is' : 'are'} running). Start one more ready task with run_task, or wait.` };
+      return {
+        act: async () => {
+          await this.host.joinRun(0, waiting.length);
+          const held = waiting.length === 0 ? '' : ` ${capitalize(named(waiting))} ${waiting.length === 1 ? 'was' : 'were'} added after the user approved the plan, so ${waiting.length === 1 ? 'it waits' : 'they wait'} until they start ${waiting.length === 1 ? 'it' : 'them'} or execute the plan.`;
+          return { message: `The plan is running: ${named(live)} ${live.length === 1 ? 'is' : 'are'} already running, and each approved task starts as its dependencies finish.${held}` };
+        },
+      };
     }
     // A new run leaves a skipped task skipped, as it leaves a completed one done.
     const toRun = all.filter(({ task }) => task.type !== 'user' && task.status !== 'completed' && task.status !== 'skipped');
@@ -793,7 +779,7 @@ export class ExecutionCommands {
     if (actor.kind !== 'user' && actor.kind !== 'autorun') {
       // Executing the plan is how the user first takes it as theirs, so no card stands in for it.
       if (!this.host.planApproved()) {
-        return { refusal: 'The user has not approved this plan yet: they approve it by executing it themselves (Execute plan). Ask them to.' };
+        return { refusal: NOT_APPROVED_YET };
       }
       approves = this.addedMayStart(actor) ? [] : toRun.filter(({ task }) => !this.host.taskApproved(task.id));
       if (approves.length > 0 && !this.asksToApprove(actor)) {
@@ -823,6 +809,8 @@ export class ExecutionCommands {
     const label = describe(located);
     const voice = voiceOf(actor);
     if (task.type === 'user') return { refusal: `${capitalize(label)} is a user task: ${voice.byHand}` };
+    const completing = this.completingRefusal(located);
+    if (completing) return { refusal: completing };
     if (this.host.running(task.id) || task.status === 'in_progress') {
       return { refusal: how === 'run' ? `${capitalize(label)} is already running.` : `${capitalize(label)} is running: ${voice.stopOrSteer}` };
     }
@@ -924,26 +912,83 @@ export class ExecutionCommands {
     };
   }
 
-  private prepareMarkComplete(located: Located): Prepared {
+  /**
+   * Mark complete's landing owns the task until it settles: a stop, retry or
+   * skip under it would end the attempt whose worktree it is merging, and the
+   * landing would complete the task anyway.
+   */
+  private completingRefusal(located: Located): string | null {
+    if (!waitOf(this.host.startWaits(located.task), 'completing')) return null;
+    return `${capitalize(describe(located))} is being marked complete: its work is landing.`;
+  }
+
+  /**
+   * Why an AI or script task is not the user's to override now, or null
+   * (ADR-0029). Read here in the core, so a stale click, the CLI and the API
+   * meet the same refusal; a manual task is the user's own sign-off and waits
+   * for no run. Checked before anything about the task itself: a completed
+   * task is held to it too.
+   */
+  private overrideBusy(located: Located, direction: OverrideDirection): string | null {
+    if (located.task.type === 'user') return null;
+    if (this.host.advancesOnItsOwn()) return manualOverrideStopFirst(direction, describe(located));
+    return this.overriding.size > 0 ? OVERRIDE_LANDING : null;
+  }
+
+  /**
+   * Whether the user's yes to this override is on the call, and about the task
+   * as it is: a task that moved on since they were asked is another question.
+   */
+  private overrideUnconfirmed(located: Located, command: Extract<ExecutionCommand, { command: 'mark_complete' | 'mark_not_done' }>): string | null {
+    const { task } = located;
+    if (task.type === 'user') return null;
+    const label = describe(located);
+    if (command.seen !== undefined && command.seen !== task.status) {
+      return `${capitalize(label)} has changed since you were asked: it ${statusWords(task)}. Nothing was changed; look at it again before deciding.`;
+    }
+    if (command.confirmed === true) return null;
+    return `${manualOverrideConfirmation(command.command === 'mark_complete' ? 'complete' : 'uncomplete', label)} Nothing was changed: it needs the user's explicit yes, so ask them and send the command again with "confirmed": true.`;
+  }
+
+  /** The act of an override: the one landing while it awaits, so a start or a second override sees it. */
+  private async overriddenBy(located: Located, act: () => Promise<void>): Promise<void> {
+    if (located.task.type === 'user') return act();
+    this.overriding.add(located.task.id);
+    try {
+      await act();
+    } finally {
+      this.overriding.delete(located.task.id);
+    }
+  }
+
+  private prepareMarkComplete(located: Located, command: Extract<ExecutionCommand, { command: 'mark_complete' }>): Prepared {
     const { task } = located;
     const label = describe(located);
+    const busy = this.overrideBusy(located, 'complete');
+    if (busy) return { refusal: busy };
     if (task.status === 'completed') return { refusal: `${capitalize(label)} has already completed.` };
-    if (waitOf(this.host.startWaits(task), 'completing')) return { refusal: `${capitalize(label)} is already being marked complete: its work is landing.` };
+    if (this.completingRefusal(located)) return { refusal: `${capitalize(label)} is already being marked complete: its work is landing.` };
+    const unconfirmed = this.overrideUnconfirmed(located, command);
+    if (unconfirmed) return { refusal: unconfirmed };
     return {
       act: async () => {
-        await this.host.markComplete(task.id);
+        await this.overriddenBy(located, () => this.host.markComplete(task.id));
         // A landing that conflicts leaves the task for the user to resolve, and its row says so.
         return { message: this.located(task.id)?.task.status === 'completed' ? `Marked ${label} complete.` : `Marked ${label} complete, but its work could not land yet: its row says why.` };
       },
     };
   }
 
-  private prepareMarkNotDone(located: Located): Prepared {
+  private prepareMarkNotDone(located: Located, command: Extract<ExecutionCommand, { command: 'mark_not_done' }>): Prepared {
     const label = describe(located);
+    const busy = this.overrideBusy(located, 'uncomplete');
+    if (busy) return { refusal: busy };
     if (located.task.status !== 'completed') return { refusal: `${capitalize(label)} has not completed, so there is nothing to mark not done.` };
+    const unconfirmed = this.overrideUnconfirmed(located, command);
+    if (unconfirmed) return { refusal: unconfirmed };
     return {
       act: async () => {
-        await this.host.markNotDone(located.task.id);
+        await this.overriddenBy(located, () => this.host.markNotDone(located.task.id));
         return { message: `Marked ${label} not done: it waits until you retry or start it.` };
       },
     };
@@ -973,16 +1018,19 @@ export class ExecutionCommands {
     };
   }
 
-  private prepareCheckpoint(located: Located, command: Extract<ExecutionCommand, { command: 'answer_checkpoint' }>): Prepared {
+  private prepareCheckpoint(located: Located, command: Extract<ExecutionCommand, { command: 'answer_checkpoint' }>, actor: ExecutionActor): Prepared {
     const label = describe(located);
     if (!this.host.awaitsCheckpoint(located.task.id)) {
       return { refusal: `${capitalize(label)} is not waiting at a checkpoint: it was answered already, withdrawn, or has no runner left to hear it.` };
     }
     const approve = command.answer === 'approve';
+    const reason = command.reason?.trim() || undefined;
+    if (!approve && !reason && actor.kind !== 'user') return { refusal: 'A rejection needs a reason: the runner is told it, and acts on it. Say what it should do instead.' };
     return {
       act: async () => {
-        this.host.answerCheckpoint(located.task.id, approve, command.reason?.trim() || undefined);
-        return { message: approve ? `Approved the checkpoint of ${label}: it goes on.` : `Rejected the checkpoint of ${label}: the runner is told${command.reason?.trim() ? ' your reason' : ''}.` };
+        this.host.answerCheckpoint(located.task.id, approve, reason);
+        const told = actor.kind === 'user' ? 'your reason' : 'the reason';
+        return { message: approve ? `Approved the checkpoint of ${label}: it goes on.` : `Rejected the checkpoint of ${label}: the runner is told${reason ? ` ${told}` : ''}.` };
       },
     };
   }
@@ -1040,6 +1088,8 @@ export class ExecutionCommands {
   private prepareStop(located: Located): Prepared {
     const { task } = located;
     const label = describe(located);
+    const completing = this.completingRefusal(located);
+    if (completing) return { refusal: completing };
     if (!this.host.running(task.id) && task.status !== 'in_progress') {
       return { refusal: `${capitalize(label)} is not running (it ${statusWords(task)}): there is nothing to stop.` };
     }
@@ -1078,6 +1128,9 @@ export class ExecutionCommands {
     const label = describe(located);
     if (located.task.type === 'script') return { refusal: scriptHasNoTurn(label, 'message') };
     if (command.force && actor.kind !== 'user') return { refusal: usersOnly('message_task', 'Force send') };
+    if (this.host.awaitsCheckpoint(located.task.id)) {
+      return { refusal: `${capitalize(label)} is at a checkpoint${actor.kind === 'user' ? ':' : ', which a message does not answer:'} ${voiceOf(actor).atCheckpoint}` };
+    }
     return {
       act: async () => {
         if (command.force) {
@@ -1150,6 +1203,13 @@ export class ExecutionCommands {
 
   private prepareMergeAll(actor: ExecutionActor): Prepared {
     const users = actor.kind === 'user';
+    // A Merge all asked for after the run's own merged everything and closed it
+    // — at its end, or as the run settled mid-turn — is a request with nothing
+    // left to do, not a fault for the timeline (ADR-0029). A plan that never
+    // isolated is still refused, by Merge all itself.
+    if (this.host.runMerged()) {
+      return { nothing: `Nothing to merge: everything the run landed is in ${users ? 'your' : 'the user\'s'} branch already, and the run is closed.` };
+    }
     return {
       act: async () => {
         const result = await this.host.mergeAll();
@@ -1197,6 +1257,8 @@ export class ExecutionCommands {
     const { task } = located;
     const label = describe(located);
     const why = reason?.trim() || undefined;
+    const completing = this.completingRefusal(located);
+    if (completing) return { refusal: completing };
     if (task.status === 'in_progress') return { refusal: `${capitalize(label)} is running: ${voiceOf(actor).stopOrWait}` };
     if (task.status === 'completed') return { refusal: `${capitalize(label)} has completed: its work landed, so there is nothing to skip.` };
     if (task.status === 'skipped') return { refusal: `${capitalize(label)} is already skipped.` };
@@ -1316,15 +1378,18 @@ export class ExecutionCommands {
     return this.all(tasks).find(({ task }) => task.id === id);
   }
 
-  /** A reference read against the plan as the held edit leaves it, where the handles its batch gives come first. */
-  private locateAsEdited(ref: string, tasks: readonly Task[] = this.host.editedTasks()): Located | undefined {
-    const id = this.host.heldHandle(ref.trim());
-    return id ? this.located(id, tasks) : this.locate(ref, undefined, tasks);
-  }
-
-  /** A reference as a caller writes one — see {@link resolveTaskRef}; the user's as they type one ({@link resolveUserTaskRef}). */
+  /**
+   * A reference as a caller writes one — see {@link resolveTaskRef}; the
+   * user's as they type one ({@link resolveUserTaskRef}). A planner's may be
+   * the handle an edit it committed in its turn gave the task (ADR-0022 P2).
+   */
   private locate(ref: string, actor?: ExecutionActor, tasks: readonly Task[] = this.host.tasks() ?? []): Located | undefined {
-    const task = actor?.kind === 'user' ? resolveUserTaskRef(tasks, ref) : resolveTaskRef(tasks, ref);
+    if (actor?.kind === 'user') {
+      const task = resolveUserTaskRef(tasks, ref);
+      return task && this.located(task.id, tasks);
+    }
+    const handled = actor ? this.host.turnHandle(ref.trim()) : undefined;
+    const task = handled !== undefined ? flattenTasks(tasks).find((t) => t.id === handled) : resolveTaskRef(tasks, ref);
     return task && this.located(task.id, tasks);
   }
 }
@@ -1372,6 +1437,8 @@ interface Voice {
   notMerged: string;
   /** A start a dirty checkout held back. */
   blockedRun: string;
+  /** What answers a task waiting at a checkpoint, which a message does not. */
+  atCheckpoint: string;
 }
 
 const MODEL_VOICE: Voice = {
@@ -1387,6 +1454,13 @@ const MODEL_VOICE: Voice = {
   startAgain: 'Start again with run_plan or run_task.',
   notMerged: 'Nothing was merged; tell the user, who resolves it.',
   blockedRun: 'Nothing started: the user\'s checkout has uncommitted changes, and the run waits for them to stash them or run without isolation. Tell them.',
+  atCheckpoint: 'the user answers it from the task\'s checkpoint card (Approve or Reject). Tell them what the runner asks and what you would answer, with why.',
+};
+
+/** The supervisor at Act answers checkpoints itself (ADR-0029); the planner's turn is the user's, and they answer. */
+const SUPERVISOR_VOICE: Voice = {
+  ...MODEL_VOICE,
+  atCheckpoint: 'answer it with answer_checkpoint (approve, or reject with a reason), or leave it to the user and tell them why.',
 };
 
 const USER_VOICE: Voice = {
@@ -1402,31 +1476,16 @@ const USER_VOICE: Voice = {
   startAgain: 'Run the plan or a task to start again.',
   notMerged: 'Nothing was merged.',
   blockedRun: 'Nothing started: your checkout has uncommitted changes. Stash them, or run without isolation.',
+  atCheckpoint: 'approve or reject it instead.',
 };
 
 function voiceOf(actor: ExecutionActor): Voice {
-  return actor.kind === 'user' ? USER_VOICE : MODEL_VOICE;
-}
-
-/** A deferred start as a noun: "retry of task #4 "Title"". */
-function queued(command: ExecutionCommand, located: Located | undefined): string {
-  const label = located ? describe(located) : 'task' in command ? `"${command.task}"` : '';
-  switch (command.command) {
-    case 'run_plan': return 'run of the plan';
-    case 'retry_task': return command.from === 'session' ? `continuation of ${label}` : `retry of ${label}`;
-    default: return `start of ${label}`;
+  switch (actor.kind) {
+    case 'user': return USER_VOICE;
+    case 'supervisor': return SUPERVISOR_VOICE;
+    case 'planner-turn':
+    case 'autorun': return MODEL_VOICE;
   }
-}
-
-/** What a Guarded start asks the user: "to approve and start task #2 "A", and run the plan". */
-function asking(command: ExecutionCommand, intent: string, approves: readonly Located[]): string {
-  if (approves.length === 0) return `to ${intent}`;
-  return command.command === 'run_plan' ? `to approve and start ${named(approves)}, and run the plan` : `to ${intent}, which approves it`;
-}
-
-/** A command that starts work from the task's prompt as the plan holds it. A continue starts from its message instead. */
-function startsFromPrompt(command: ExecutionCommand): boolean {
-  return command.command === 'run_plan' || command.command === 'run_task' || (command.command === 'retry_task' && command.from === 'fresh');
 }
 
 function withSubtasks(task: Readonly<Task>): string[] {

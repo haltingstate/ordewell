@@ -1,6 +1,6 @@
 import type { LegacyPlanState, PlannerResendState, RunnerId } from '../models/Task';
 import { readUsageLimitReset, type TurnFailure } from './runnerExit';
-import { RELAPSE_MS, RESUME_MARGIN_MS, UsageLimitWaits } from './UsageLimitWaits';
+import { RELAPSE_MS, RESUME_MARGIN_MS, ResetWaits } from './LimitPauses';
 import { resumeTime } from '../taskRow/status';
 
 export interface PlannerResendHost {
@@ -22,6 +22,8 @@ export interface PlannerLimit {
   resendAt: Date | null;
   /** Why nothing goes again on its own, when nothing does: what the planner did, as in "the planner hit its usage limit and …". */
   held?: string;
+  /** A planner tool's change in the turn took its inputs as answered (ADR-0022 P2): nothing of it waits to be sent again. */
+  answered?: true;
 }
 
 const HELD = 'Send a message once it has reset: what waits goes with it.';
@@ -44,7 +46,7 @@ const WAIT = 'planner';
  * one asked for since.
  */
 export class PlannerResend {
-  private readonly waits = new UsageLimitWaits(() => this.due());
+  private readonly waits = new ResetWaits(() => this.due());
   /** When the last resend at a reset went out, until a turn lands: a limit in that window is a relapse. */
   private resentAt: number | null = null;
 
@@ -77,6 +79,20 @@ export class PlannerResend {
     if (plan) plan.plannerResend = { runner, at: at.toISOString() };
     this.waits.arm(WAIT, at);
     return { text: `${name} usage limit, resets ${resumeTime(reset, now)}. Resending at ${resumeTime(at, now)}; anything you send meanwhile goes with it.`, resendAt: at };
+  }
+
+  /**
+   * A turn hit the planner's usage limit after a planner tool committed a
+   * change in it (ADR-0022 P2), which took the turn's inputs as answered:
+   * nothing waits to be sent again, so no resend is armed, and the user is
+   * told when the limit resets.
+   */
+  limitedAfterChange(said: TurnFailure): PlannerLimit {
+    const runner = this.host.plannerRunner() ?? undefined;
+    const now = new Date();
+    const reset = runner ? readUsageLimitReset(runner, said, now) : null;
+    const when = reset ? `, resets ${resumeTime(reset, now)}` : '';
+    return { text: `${runner ?? 'Planner'} usage limit${when}. What the planner changed before it stays, and nothing waits to be sent again.`, resendAt: null, held: 'had already made its change', answered: true };
   }
 
   /**

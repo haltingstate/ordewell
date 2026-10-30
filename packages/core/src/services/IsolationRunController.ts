@@ -1,5 +1,6 @@
 import { TASK_DIFF_UNAVAILABLE, type TaskDiffRead, type TaskDiffResult } from './taskDiffRead';
 import type { Task } from '../models/Task';
+import type { HandoffCommit } from '../models/Handoff';
 import type { IConfig } from '../interfaces/IConfig';
 import type { INotification } from '../interfaces/INotification';
 import type {
@@ -14,6 +15,7 @@ import type {
   IsolationView,
   IWorktreeIsolation,
   PlanIsolation,
+  PreparedTask,
   PrepareIntent,
   PreservedWork,
   PreviousWork,
@@ -23,9 +25,10 @@ import type {
   TaskIsolation,
   TreeSnapshot,
 } from '../interfaces/IWorktreeIsolation';
-import { describeMergeResult } from './mergeResultNotice';
+import { describeMergeResult, repairedLanded } from './mergeResultNotice';
 import { quotedList } from '../utils/quotedList';
-import { handoffOf, integrationBranchNameOf, layoutOf, SELF_REPO, taskIsolationOf } from './isolationRecord';
+import { handoffOf, layoutOf, PrepareFailedError, SELF_REPO, taskIsolationOf } from './isolationRecord';
+import { handoffBranchName } from './mergeWording';
 import type { IsolatedExecution } from './plannerModes';
 import { PlanEditError } from './PlanEditError';
 import { workspaceRepoGroup } from './repoGroup';
@@ -173,6 +176,8 @@ export class IsolationRunController {
   private readonly liveTasks: () => ReadonlySet<string>;
 
   private run: IsolationRun | null = null;
+  /** See {@link mergedRun}. */
+  private merged: string | null = null;
   /** An adoption stays scoped even while cleanup temporarily leaves no run record. */
   private adoptions = 0;
   /** Copied paths already reported for the current run: every task gets the same copies. */
@@ -187,6 +192,7 @@ export class IsolationRunController {
   /** Resolver task id → the conflicted task it resolves; see {@link linkResolver}. */
   private resolvers: Record<string, string> = {};
   private opening: Promise<boolean> | null = null;
+  private opened = 0;
   /** Bumped by an interrupt, so an activation in flight across it does not open the run it ended. */
   private activations = 0;
   /** The start a dirty tree turned away, handed back once the user chooses how to go on. */
@@ -206,7 +212,19 @@ export class IsolationRunController {
   /** The plan's run record, open or not; null when the plan has not isolated. */
   get current(): IsolationRun | null { return this.run; }
 
+  /**
+   * The id of the plan's last isolated run once it closed with everything it
+   * landed merged into the user's branch and was cleared up: what tells a
+   * Merge all asked for after it, which has nothing to merge, from one in a
+   * plan that never isolated (ADR-0029). Null while the plan holds a run
+   * record, and once a later run decides how it executes. Saved with the plan.
+   */
+  get mergedRun(): string | null { return this.run ? null : this.merged; }
+
   get isOpen(): boolean { return this.mode !== null; }
+
+  /** How many runs have opened: what tells one run's launches from the next one's. */
+  get epoch(): number { return this.opened; }
 
   /** The open run has decided whether it isolates. */
   get decided(): boolean { return this.mode === 'isolated' || this.mode === 'shared'; }
@@ -263,12 +281,14 @@ export class IsolationRunController {
    * restore) would otherwise write a new session file on every reload. What
    * git changed is returned instead, for the caller to save where it can and
    * announce. A plan loaded meanwhile supersedes this adoption, which then
-   * touches nothing and resolves `unchanged`.
+   * touches nothing and resolves `unchanged`. `mergedRun` is the plan's saved
+   * {@link mergedRun}.
    */
-  async adopt(state: PlanIsolation | null): Promise<AdoptOutcome> {
+  async adopt(state: PlanIsolation | null, mergedRun?: string): Promise<AdoptOutcome> {
     const adoption = ++this.adoptions;
     this.run = state?.run ?? null;
     this.resolvers = { ...(state?.resolvers ?? {}) };
+    this.merged = this.run ? null : mergedRun ?? null;
     const run = this.run;
     if (!run) return 'unchanged';
     try {
@@ -293,11 +313,12 @@ export class IsolationRunController {
     const resolvers = this.resolvers;
     this.run = null;
     this.resolvers = {};
+    this.merged = run.id;
     const discarded = await this.discardMerged(run);
     if (this.adoptions !== adoption) return 'unchanged';
     if (!discarded) {
       // Refused: the record is the one pointer to what could not be let go.
-      if (this.run === null) { this.run = run; this.resolvers = resolvers; }
+      if (this.run === null) { this.run = run; this.resolvers = resolvers; this.merged = null; }
       return outcome;
     }
     // A start opened while git was deleting: the run in force is that one.
@@ -308,6 +329,7 @@ export class IsolationRunController {
   open(): void {
     if (this.mode) return;
     this.mode = 'undecided';
+    this.opened += 1;
   }
 
   /**
@@ -415,7 +437,15 @@ export class IsolationRunController {
   }
 
   private async prepareCwd(task: Task, run: IsolationRun, intent: PrepareIntent, readOnly: boolean): Promise<AttemptWorkspace> {
-    const { cwd, copied, setupFailed, preserved, restoration } = await this.isolation.prepare(task, run, intent, readOnly ? { readOnly } : {});
+    let result: PreparedTask;
+    try {
+      result = await this.isolation.prepare(task, run, intent, readOnly ? { readOnly } : {});
+    } catch (err) {
+      // The attempt this one replaced is gone, record and all: only this says where its work went.
+      if (err instanceof PrepareFailedError) this.report({ preserved: err.preserved, refused: [] });
+      throw err;
+    }
+    const { cwd, copied, setupFailed, preserved, restoration } = result;
     this.reportCopies(copied);
     this.reportSetupFailures(setupFailed ?? []);
     if (preserved) this.report({ preserved, refused: [] });
@@ -432,10 +462,10 @@ export class IsolationRunController {
    * a crash mid-landing leaves the tips to roll back to, and again once it
    * settles. A git error is `failed`, never a throw.
    */
-  async integrate(task: Task): Promise<IsolationOutcome> {
+  async integrate(task: Task, commit?: HandoffCommit): Promise<IsolationOutcome> {
     const run = this.run;
     if (!run) return 'failed';
-    const outcome = await this.isolation.integrate(task, run, () => this.listener.changed()).catch((): IsolationOutcome => 'failed');
+    const outcome = await this.isolation.integrate(task, run, () => this.listener.changed(), commit).catch((): IsolationOutcome => 'failed');
     this.listener.changed();
     return outcome;
   }
@@ -604,9 +634,9 @@ export class IsolationRunController {
    */
   async merge(): Promise<IsolationMergeResult> {
     const run = this.requireRun();
-    const repaired = handoffOf(run).landed.filter((t) => t.repairedFiles?.length);
+    const repaired = repairedLanded(handoffOf(run));
     const result = await this.isolation.mergeIntoCheckedOut(run);
-    const branch = integrationBranchNameOf(run);
+    const branch = handoffBranchName(run);
     const group = run.repos.some((r) => r.path !== SELF_REPO);
     const { level, message } = describeMergeResult(result, branch, group, repaired);
     this.tell(level, message);
@@ -669,7 +699,7 @@ export class IsolationRunController {
       this.tell('info', `The run is not cleared up: ${why.join(', and ')}, so ${one ? 'its worktree stays' : 'their worktrees stay'}, and so do the run's branches.`);
       return;
     }
-    if (await this.discardMerged(run)) this.forget();
+    if (await this.discardMerged(run)) this.forget(run.id);
   }
 
   /** The records that keep a settled run from being cleared up: live, or holding work that never landed. */
@@ -700,9 +730,11 @@ export class IsolationRunController {
     for (const { worktree, reason, task } of removal.refused) this.tell('warn', refusedNotice(worktree, reason, task));
   }
 
-  private forget(): void {
+  /** The run goes from the plan; `merged` names it as {@link mergedRun} when everything it landed was merged. */
+  private forget(merged?: string): void {
     this.run = null;
     this.resolvers = {};
+    this.merged = merged ?? null;
     this.listener.changed();
     this.listener.closed();
   }
@@ -760,6 +792,8 @@ export class IsolationRunController {
   private begin(mode: 'isolated' | 'shared'): void {
     this.open();
     this.mode = mode;
+    // This run's own merges are what count from here: a shared one has none to make.
+    this.merged = null;
   }
 
   /** What earlier runs left merged in the group goes; a failure here is worth a word, never a stopped run. */
@@ -785,10 +819,10 @@ export class IsolationRunController {
   }
 
   /**
-   * A run with no records at all holds only superseded attempts, so it goes
-   * whole. One that cannot be continued for another reason — it ran from a
-   * different workspace path — keeps its integration branch in each repo that
-   * has not merged it: only the user gives landed work up.
+   * A run with no records at all holds only superseded attempts, so it goes —
+   * but its integration branch only where the user's HEAD contains it, as does
+   * that of a run that cannot be continued for another reason (it ran from a
+   * different workspace path): only the user gives landed work up.
    *
    * False when `interrupted` came while git was minting: a newer activation
    * may be minting its own run, so this one is never installed over it, and
@@ -800,8 +834,8 @@ export class IsolationRunController {
     if (previous && live.length > 0) {
       this.tell('warn', `The last run's worktrees are left in place: ${tasksNamed(live)} ${live.length === 1 ? 'is' : 'are'} still running or waiting on you there.`);
     } else if (previous) {
-      const landed = Object.values(previous.tasks).some((r) => r.status === 'merged');
-      const removal = await this.isolation.discard(previous, { integration: landed ? 'delete-merged' : 'delete' }).catch(() => null);
+      // Not decided from the records: a retry drops a landed task's, and the branch then holds work no record names. A branch with nothing landed is behind HEAD, so this deletes it too.
+      const removal = await this.isolation.discard(previous, { integration: 'delete-merged' }).catch(() => null);
       if (removal) this.report(removal);
     }
     if (this.run === previous) this.run = null;

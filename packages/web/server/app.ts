@@ -16,6 +16,7 @@ import {
   type AdmissionDecision,
 } from './security/admission';
 import { OrchestratorPool } from './pool/orchestratorPool';
+import type { ServerInfoResponse } from '@ordewell/core';
 
 export function createApp(pool: OrchestratorPool, admission: AdmissionContext) {
   const app = new Hono();
@@ -36,13 +37,18 @@ export function createApp(pool: OrchestratorPool, admission: AdmissionContext) {
     await next();
   });
 
+  // `ordewell stop --server` verifies a PID file against the process that
+  // actually owns the port before signalling anything, so a stale file cannot
+  // terminate an unrelated process. Behind admission like every other route.
+  app.get('/api/server', (c) => c.json({ pid: process.pid, port: admission.port } satisfies ServerInfoResponse));
+
   app.route('/api/sessions', sessionsRoute(pool));
   app.route('/api/plans', plansRoute(pool));
   app.route('/api/runners', runnersRoute(pool));
   app.route('/api/models', modelsRoute(pool));
   app.route('/api/settings', settingsRoute(pool));
   app.route('/api/commands', commandsRoute());
-  app.route('/api/workspaces', workspacesRoute());
+  app.route('/api/workspaces', workspacesRoute(pool));
   app.route('/api/approvals', approvalsRoute(pool));
 
   return app;

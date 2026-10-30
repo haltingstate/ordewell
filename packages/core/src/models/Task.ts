@@ -9,6 +9,7 @@ import type { TaskLoop } from './Loop';
 import type { HandoffDigest } from './Handoff';
 import { SKILL_NAME_PATTERN } from '../conversation/skillTokens';
 import { subtreeIds, walkPlan } from '../services/PlanTree';
+import { migratePlanStateIsolation } from '../services/isolationRecord';
 
 export interface UserStep {
   order: number;
@@ -140,6 +141,54 @@ export function dropRetiredPlanFields(plan: LegacyPlanState): void {
 }
 
 /**
+ * Move a mid-run edit an older build queued for its next batch boundary into
+ * the pending turns: it was never answered, so it waits like any other.
+ */
+function carryOverQueuedEdits(plan: LegacyPlanState): void {
+  const queued = plan.queuedMessages ?? [];
+  delete plan.queuedMessages;
+  if (queued.length === 0) return;
+  const carried = queued.map(({ id, text, timestamp, skills }): PendingPlanTurn => ({ id, source: 'user', text, timestamp, ...(skills ? { skills } : {}) }));
+  plan.pendingTurns = [...(plan.pendingTurns ?? []), ...carried];
+}
+
+/**
+ * Bring a loaded plan to the shape this build reads, in place: every plan-shape
+ * migration lives here, so each can be tested from an old shape without a whole
+ * Session, as {@link migrateLoadedTasks} does for tasks.
+ *
+ * `adopting` is false when a Session reloads the plan it already holds: the
+ * live run's task pauses are fresher than the save, so they stay.
+ */
+export function migrateLoadedPlan(plan: LegacyPlanState, { adopting = true }: { adopting?: boolean } = {}): void {
+  // Saved before approval had its own record: the status said it, and
+  // executing a plan approved every task it held. Read once, here, and never
+  // again — a surface rewrites the status for display.
+  plan.approved ??= plan.status !== 'draft' && plan.status !== 'rejected';
+  if (!plan.approvedTasks && plan.approved) {
+    plan.approvedTasks = flattenTasks(plan.tasks).map((t) => t.id);
+  }
+  // A saved reset time belonged to a run that is gone; loading is not consent
+  // to spend tokens (ADR-0044).
+  if (adopting) {
+    for (const task of flattenTasks(plan.tasks)) delete task.resumeAt;
+  }
+  migratePlanStateIsolation(plan);
+  // Older builds copied the since-removed transport setting onto the plan.
+  // Every plan now runs structured (ADR-0018), so the copy is not carried on.
+  delete (plan as { runnerTransport?: unknown }).runnerTransport;
+  // Run settings are the user's now (ADR-0030); an older plan's own copies
+  // are not read, and go with this save.
+  for (const key of ['supervisorLevel', 'mergeAtGatesAutomatically', 'supervisorRetryLimit', 'wakeUpReadBudget']) {
+    delete (plan as unknown as Record<string, unknown>)[key];
+  }
+  // The per-message research budget is gone (ADR-0037); a plan saved before
+  // its removal is read once and written back without its keys.
+  dropRetiredPlanFields(plan);
+  carryOverQueuedEdits(plan);
+}
+
+/**
  * A task skill as one attempt received it: read from the task's own worktree
  * (or global) at spawn, kept so the user can see what the runner was told
  * even after the skill's file changes.
@@ -238,6 +287,12 @@ export interface Task {
    * counts as approved to run (ADR-0029). Set by the session, never by an op.
    */
   addedBy?: 'supervisor';
+  /**
+   * An attempt of it has started, so its chat exists from then on: kept after
+   * a failure, a cancel, a skip or a completion, and restored with the plan.
+   * Set by the attempt's own start — never by a status or a manual mark.
+   */
+  attempted?: true;
   attemptUsage?: AttemptUsage[];
   /**
    * A script task's body (ADR-0035), exactly one of these two: argument
@@ -365,10 +420,11 @@ export interface ResearchProgress {
   // backend call that sends it has streamed.
   // 'usage' reports one model call (`record`). 'subagent_started' carries
   // `brief` and `model`; 'subagent_finished' carries `outcome`, `digest` and
-  // `usage`.
+  // `usage`. 'compaction' is one phase of the planner's own compaction
+  // (`compaction`); a subagent's never is one.
   type:
     | 'thinking' | 'tool_call' | 'tool_result' | 'plan_token' | 'interrupted' | 'liveness'
-    | 'text_delta' | 'text_retracted' | 'usage' | 'subagent_started' | 'subagent_finished';
+    | 'text_delta' | 'text_retracted' | 'usage' | 'subagent_started' | 'subagent_finished' | 'compaction';
   /** Minted by whoever runs the turn and passed through untouched; absent outside a turn. */
   turnId?: string;
   /** One continuous run of model text — text before a tool call is its own segment. */
@@ -393,6 +449,7 @@ export interface ResearchProgress {
   outcome?: SubagentOutcome;
   digest?: string;
   usage?: UsageTotals;
+  compaction?: PlannerCompaction;
 }
 
 export interface ThinkingBlock {
@@ -437,9 +494,12 @@ export interface DiscoveredModel {
   /**
    * The model's context window when the runner or catalog reports it (#49).
    * Read by the planner-model lookup so context fill can be shown; absent when
-   * unknown rather than defaulted to zero.
+   * unknown rather than defaulted to zero. Gemini's is its `inputTokenLimit`:
+   * the prompt alone, the reply limited by `maxOutputTokens` apart from it.
    */
   contextWindow?: number;
+  /** The longest reply the catalog says the model is served with, when it says. */
+  maxOutputTokens?: number;
 }
 
 export type PlanStatus = 'draft' | 'approved' | 'rejected' | 'running' | 'completed';
@@ -458,8 +518,8 @@ export interface ConversationMessage {
    * Timeline marker: 'plan_generated' records the point in the dialogue where
    * the plan was committed (the UI anchors the plan card there on restore);
    * 'system' is a host-injected notice; 'compaction' is the summary a
-   * user-triggered compaction left in place of the earlier messages — always
-   * the transcript's first entry. 'skill_load' is a skill loaded into the
+   * compaction appended, which stands in for the earlier messages in the
+   * planner's context while the transcript keeps them (see `checkpoint`). 'skill_load' is a skill loaded into the
    * conversation, its snapshot in `skill`; one the user invoked follows the
    * message that named it. 'execution' is a call at the command seam
    * (ADR-0029), its record in `execution`. 'wake_up' is the digest a wake-up
@@ -480,12 +540,62 @@ export interface ConversationMessage {
   /** A user's message that was force sent, stopping the turn before it (ADR-0023). */
   forced?: true;
   /**
+   * Set on a 'compaction' entry that is a checkpoint of the planner's context
+   * (ADR-0002). A 'compaction' entry without one is a legacy summary when it
+   * stands first — it replaced what it condensed — and a marker drawn but
+   * never replayed anywhere else.
+   */
+  checkpoint?: ContextCheckpoint;
+  /**
    * What a reply showed, run by run, where each began (ADR-0017 A1). Beside
    * `content`, which stays the reply as the planner is told it. Absent on
    * entries saved before runs were kept, which reload as one message.
    */
   runs?: ReplyRun[];
 }
+
+/**
+ * Where a compaction cut the planner's context (ADR-0002): its summary stands
+ * for every transcript entry before `keptFrom`, and the entries from there on
+ * replay verbatim. Entries are only appended, or inserted at a held turn's
+ * position, which no checkpoint's cut passes, so the index never moves.
+ */
+export interface ContextCheckpoint {
+  /** Stable across saves, forks and the wire, so a surface can tell this checkpoint from another with the same text. */
+  id: string;
+  /** An index into the whole transcript, at or before the checkpoint entry itself. */
+  keptFrom: number;
+  trigger: 'manual' | 'auto';
+}
+
+/**
+ * How a planner compaction ended. `condensed`: a summary stands in for the
+ * older context (a checkpoint was written, or a harness planner reported its
+ * own compaction done). `pruned`: older recoverable tool output was dropped
+ * from the live context alone. `unchanged`: nothing needed doing. `paused`:
+ * the context could not be brought to fit, so the planner waits.
+ */
+export type PlannerCompactionOutcome = 'condensed' | 'pruned' | 'unchanged' | 'stopped' | 'failed' | 'paused';
+
+/**
+ * One planner compaction's lifecycle as it was observed (ADR-0017): both
+ * phases share `id`, which is the checkpoint's id when one is written. Only
+ * Ordewell's own compaction announces a start; a harness planner's native one
+ * is reported when it is over, and nothing invents the start it never sent.
+ * Sizes are only ever what a backend reported.
+ */
+export type PlannerCompaction =
+  | { phase: 'started'; id: string; origin: 'ordewell'; trigger: ContextCheckpoint['trigger']; at: string }
+  | {
+      phase: 'ended';
+      id: string;
+      origin: 'ordewell' | 'native';
+      trigger: ContextCheckpoint['trigger'];
+      outcome: PlannerCompactionOutcome;
+      at: string;
+      preTokens?: number;
+      postTokens?: number;
+    };
 
 /**
  * One run of a planner reply's text: the segment it streamed under, its
@@ -604,6 +714,33 @@ export interface PlannerResendState {
   at?: string;
 }
 
+/**
+ * The planner paused on its context (ADR-0002): an API planner's call could
+ * not be brought inside its model's window, so the turn ended with nothing
+ * landed and the planner waits for the user's Retry compaction. What it
+ * keeps is bounded: the inputs stay in `pendingTurns`, and only the calls
+ * that changed something are listed, never the live context itself.
+ */
+export interface PlannerContextPause {
+  /** The model the call did not fit. */
+  model: string;
+  at: string;
+  /** What the user is told: why it paused, and what Retry compaction does. */
+  reason: string;
+  /** The pending inputs the paused turn took: a retry answers these, and what arrived since waits for the turn after it. */
+  inputs: string[];
+  /**
+   * The calls the paused turn made that changed something or reached out,
+   * each with the head of what it returned (`effectLedger`). It is never
+   * replayed to the planner as a note: it is what lets a retry see that a
+   * turn which ran effects cannot start again from the transcript, and what
+   * the refusal lists for the user.
+   */
+  done?: string[];
+  /** More such calls ran than `done` keeps: the refusal could not list all of them, and a retry without the live context stays refused. */
+  doneTruncated?: true;
+}
+
 export interface LegacyPlanState {
   /** Research profiles the planner approved as they landed: lifting one withdraws its approval (ADR-0037 R4). */
   researchApprovals?: string[];
@@ -631,12 +768,21 @@ export interface LegacyPlanState {
    * must leave it behind rather than share it.
    */
   isolation?: PlanIsolation;
+  /**
+   * The id of the plan's last isolated run, which closed with everything it
+   * landed merged into the user's branch; absent once a later run decides how
+   * it executes. With no run record left, it is what tells a Merge all asked
+   * for after that run from one in a plan that never isolated (ADR-0029).
+   */
+  mergedRun?: string;
   /** Kept so a reopened session shows the same token line (#49). */
   plannerUsage?: PlannerUsage;
   /** The windows reported over the session, so a reopened one knows each model's from its first call. */
   contextWindows?: ReportedWindow[];
   /** The planner hit its usage limit and the inputs its turn took wait to be sent again; absent otherwise. */
   plannerResend?: PlannerResendState;
+  /** The planner's context could not fit its model's window: its turn's inputs wait for Retry compaction; absent otherwise. */
+  plannerContextPause?: PlannerContextPause;
   /**
    * The tasks the user approved to run: every task when they executed the
    * plan, and each one they started or retried themselves since. A command
@@ -804,6 +950,7 @@ export function createTask(overrides: Partial<Task> = {}): Task {
     verdict: overrides.verdict,
     outputSummary: overrides.outputSummary,
     ...(overrides.handoff ? { handoff: structuredClone(overrides.handoff) } : {}),
+    ...(overrides.attempted ? { attempted: true as const } : {}),
     ...(overrides.attemptUsage ? { attemptUsage: structuredClone(overrides.attemptUsage) } : {}),
     assignedModel: overrides.assignedModel,
     assignedRunner: overrides.assignedRunner ?? DEFAULT_RUNNERS[0],
@@ -1001,6 +1148,11 @@ export function renumberTasks(tasks: readonly Task[]): Task[] {
   }));
 }
 
+/** A task waiting on the user with its attempt still live: the runner sits at a checkpoint or for input. */
+export function waitsMidAttempt(task: Pick<Task, 'status' | 'awaitingReason'>): boolean {
+  return task.status === 'awaiting_user' && (task.awaitingReason === 'checkpoint' || task.awaitingReason === 'input');
+}
+
 /** A task paused on its runner's usage limit, whether it resumes on its own or waits for the user (#84). */
 export function pausedOnLimit(task: Readonly<Task>): boolean {
   return task.status === 'awaiting_user' && task.awaitingReason === 'usage-limit';
@@ -1095,6 +1247,7 @@ export function keepExecutionState(current: readonly Task[], rewrite: Task[]): T
         runnerSessionOwner: prior?.runnerSessionOwner,
         carriedFrom: prior?.carriedFrom,
         attemptSkills: prior?.attemptSkills,
+        attempted: prior?.attempted,
         attemptUsage: prior?.attemptUsage,
         loopRound: prior?.loopRound,
         // Where a task that has run ran is fixed, like its runner session (ADR-0020).

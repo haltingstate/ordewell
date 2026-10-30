@@ -1,19 +1,30 @@
 import { taskPlacement } from '@ordewell/core/plan-utils';
-import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, EMPTY_RUN, NO_TURN, RUN_SETTINGS_DEFAULTS, isTaskRunning, taskRef, taskRefOf, titledTaskRef, titledTaskRefOf, type GlobalRunSettings, type AttemptUsage, type AiProvider, type ApprovalBlock, type AwaitingReason, type ConversationView, type HandoffDigest, type PromptHold, type RunnerCommand, type RunTask, type RunView, type SupervisorLevel, type TaskLogFollow, type TaskType, type TurnGate } from '@ordewell/core';
+import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, EMPTY_RUN, NO_TURN, RUN_SETTINGS_DEFAULTS, isTaskRunning, logContinues, logResumes, taskRef, taskRefOf, titledTaskRef, titledTaskRefOf, type AccountLimitSnapshot, type GlobalRunSettings, type OverrideDirection, type TaskStatus, type AttemptUsage, type AiProvider, type ApprovalBlock, type AwaitingReason, type ConversationView, type HandoffDigest, type IsolationHandoff, type IsolationLandedTask, type IsolationPreview, type PromptHold, type RunTask, type RunView, type SupervisorLevel, type TaskIsolation, type TaskLogFollow, type TaskType, type TurnGate } from '@ordewell/core';
 import { emptyEditor, type EditorState } from './editor';
+import type { RunnersResponse } from '../apiClient';
 import type { SaveSettingsEffect } from './reducers/settings';
 import type { StepperState } from './reducers/stepper';
 
-export type RunStatus = 'idle' | 'executing';
+export type RunStatus = 'idle' | 'starting' | 'executing';
 
 /**
  * This surface's own planner call: a turn, a /compact, or none. Apart from
  * `status` because the two overlap — a prompt sent mid-run, a run autorun
  * starts inside the turn that landed its plan — and neither may end the other.
+ * `awaiting` is a call whose reply was lost in transit: the daemon runs a turn
+ * to its end whether or not anyone waits, so the turn is neither failed nor
+ * over until the daemon says so. `compacting` is a compaction this surface did
+ * not ask for — the planner's own, another surface's, or one already running
+ * when the session was adopted: it has no call here to settle it, so the
+ * compaction's end event does (ADR-0017). `joined` is a turn the daemon was
+ * running when the session was adopted: no call here will return its plan, so
+ * the turn's own end on the stream settles it.
  */
-export type PlannerStatus = 'idle' | 'planning' | 'condensing';
+export type PlannerStatus = 'idle' | 'planning' | 'condensing' | 'compacting' | 'awaiting' | 'joined';
 
 export interface TaskView {
+  /** An attempt of it has started: its chat exists from then on. Absent on a task never run. */
+  attempted?: boolean;
   attemptUsage?: AttemptUsage[];
   id: string;
   order: number;
@@ -24,6 +35,10 @@ export interface TaskView {
   status: string;
   /** Advisory silence timestamp from VerdictEngine — set while the task's runner has gone quiet. */
   idleSince?: string | null;
+  /** What its runner reported through `task_complete`, received while the attempt winds down (ADR-0018, L1). */
+  completionReceived?: RunTask['completionReceived'];
+  /** Which spawn of its starting runner waits for Ordewell's tools to connect (ADR-0025). */
+  attaching?: RunTask['attaching'];
   dependencies: string[];
   assignedRunner?: string;
   taskMode?: string;
@@ -80,51 +95,15 @@ export interface TaskView {
   subtasks?: TaskView[];
 }
 
-/** Where a task's isolated work stands (ADR-0013); `none` is a task with no worktree in a run that has some. */
-export type TaskIsolationState = 'none' | 'active' | 'integrated' | 'conflict' | 'repairing' | 'kept';
-
-export interface TaskIsolationView {
-  state: TaskIsolationState;
-  branch?: string;
-  /** The task workspace; for a single repo, the task's worktree. */
-  worktree?: string;
-  /** Paths of the repos the task changed. */
-  repos?: string[];
-  conflictRepo?: string;
-  /** Repo-relative paths, in `conflictRepo`, that conflicted. */
-  conflictFiles?: string[];
-  /** The conflict repair running or last run (ADR-0015), of the most a task may have. */
-  repair?: { attempt: number; limit: number };
-  repairedFiles?: string[];
-}
-
-export interface LandedTaskView {
-  taskId: string;
-  order: number;
-  title: string;
-  /** Set when the task landed only after a conflict repair (ADR-0015): the files it was started for. */
-  repairedFiles?: string[];
-}
-
-/** One repo's part of a handoff: its integration branch, where it forked, and what landed in it. */
-export interface HandoffRepoView {
-  path: string;
-  integrationBranch: string;
-  baseRef: string;
-  /** The branch the run started on; absent when it started on a detached HEAD or the record never noted one. */
-  baseBranch?: string;
-  /** Set when the run started on a detached HEAD. */
-  startedDetached?: true;
-  landed: LandedTaskView[];
-}
-
-/** What an isolated run left for the user to land: each repo's branch and base, and what landed, in plan order. */
-export interface HandoffView {
-  repos: HandoffRepoView[];
-  landed: LandedTaskView[];
-  /** An Act supervisor looks at this run first and may merge it, so it is shown without taking over the screen. */
-  deferredTo?: 'supervisor';
-}
+/**
+ * The isolation view a surface shows, in core's own shape (ADR-0013): a mark
+ * per task the run touched, and the handoff, read from a live status update or
+ * from the saved plan by `isolationViewOfPlan`. The CLI names them for its own
+ * callers; none of the values is re-declared here.
+ */
+export type TaskIsolationView = TaskIsolation;
+export type LandedTaskView = IsolationLandedTask;
+export type HandoffView = IsolationHandoff;
 
 /**
  * Landed work not yet in the user's branch, including a possible merge gate.
@@ -160,10 +139,16 @@ export interface RewindTargetView {
   timestamp: string;
 }
 
-export interface RunnerView {
-  id: string;
-  name: string;
-  enabled: boolean;
+/** The daemon's runner row, as `getRunners` hands it over — auth included, never restated. */
+export type RunnerView = RunnersResponse['runners'][number];
+
+/**
+ * Only a runner's own signed-out verdict, with a way in, raises an alarm:
+ * `unknown` must never read as one, and a verdict without a login command has
+ * nowhere to send the user (ADR-0052).
+ */
+export function signedOutWithLogin(row: RunnerView): boolean {
+  return row.auth?.state === 'signed-out' && (row.auth.loginCommand?.length ?? 0) > 0;
 }
 
 export interface SessionView {
@@ -195,6 +180,12 @@ export interface PickerItem {
    * worse question than "Codex — not installed".
    */
   disabled?: boolean;
+  /**
+   * Needs attention but is still choosable: a signed-out agent can be picked
+   * and will ask for its own login before planning. Distinct from `disabled`,
+   * which cannot be chosen at all.
+   */
+  warn?: boolean;
 }
 
 /** What the runtime should do with the item(s) the user picks. */
@@ -314,6 +305,8 @@ export type ConfirmAction =
   | { kind: 'new-session' }
   | { kind: 'remove-task'; taskId: string }
   | { kind: 'force-start-gated'; taskId: string }
+  /** Mark complete or Mark not done; `seen` is the status the user was asked about, which the daemon holds the task to (ADR-0029). */
+  | { kind: 'mark-override'; taskId: string; direction: OverrideDirection; seen: TaskStatus }
   /** `menu` is the `/settings` stepper the question was asked from, reopened once it is answered. */
   | { kind: 'save-settings'; effect: SaveSettingsEffect; menu?: StepperState }
   | { kind: 'merge-run' }
@@ -356,9 +349,9 @@ export interface TaskLogState extends TaskLogFollow {
    */
   queuedIndex: number | null;
   /**
-   * Why the composer's last text was not sent, drawn in the view in place of
-   * its key hints until the next send: the planner chat, where other notices
-   * go, is not on screen.
+   * Why the last key was refused, drawn in the view in place of its key hints
+   * until the next key that is not a scroll: the planner chat, where other
+   * notices go, is not on screen.
    */
   notice?: string;
 }
@@ -387,6 +380,8 @@ export interface TuiState {
    * `SessionMessage` and every line the TUI adds itself as a `LocalEntry`.
    */
   conversation: ConversationView;
+  accountLimits: readonly AccountLimitSnapshot[];
+  servedModels: Record<string, { attempt: number; model?: string; assignment?: string }>;
   /** Set while the chat pane is drawing a structured task's log; null is the planner chat. */
   taskView: TaskLogState | null;
   /** The planner turn the conversation has open, and the one the user stopped — core's stop rule. */
@@ -474,6 +469,14 @@ export interface TuiState {
    * first frame painted before the daemon answers.
    */
   runSettingsKnown: boolean;
+  /** The newest settings answer applied; an older one's workspace values are dropped. */
+  settingsRead: number;
+  /**
+   * The newest answer applied for this session's run values. Apart from
+   * `settingsRead` because a write answers with no session's run, and must
+   * still outrank an older read without dropping the session's own (ADR-0030).
+   */
+  runSettingsRead: number;
   /**
    * Whether the daemon has named who plans and listed the installed runners.
    * It answers both only once its probe for coding agents has, so until then
@@ -484,6 +487,18 @@ export interface TuiState {
   runnersKnown: boolean;
   /** Whether `configuredProviders` came from the catalog; until then a key may be set and not yet reported. */
   providersKnown: boolean;
+  /**
+   * The repositories and branches the daemon would isolate, with the run
+   * settings that decide it: `undefined` before the launch read has been
+   * asked for or answered, `null` while a read is in flight, then the answer.
+   * Not cleared when a plan exists: the welcome owns it only while no plan
+   * has been produced, and only a run's own start check is authoritative.
+   */
+  isolationPreview: IsolationPreview | null | undefined;
+  /** The newest preview read this surface started; an older answer is dropped. */
+  isolationPreviewRead: number;
+  /** The version check's one-time notice (ADR-0048), on the one start that shows it; empty on every other. */
+  versionCheckNotice: string;
   runAutoMerge: boolean | null;
   /** The current run's own level, and why its supervisor stopped if it did; null before any run. */
   runSupervisor: { level: SupervisorLevel; unsupervised?: string } | null;
@@ -507,6 +522,8 @@ export interface TuiState {
   runMerge: RunMergeView | null;
   /** A planner turn that hit the planner's usage limit goes again at this time (read off the plan); null when none waits. */
   plannerResend: { runner?: string; at: string } | null;
+  /** The planner paused on its context, waiting for `/compact retry` or `/stop` (read off the plan); null when it is not. */
+  plannerPause: { model: string } | null;
   overlay: Overlay | null;
   /**
    * Approval prompts not yet shown. The planner blocks on each one, so they are
@@ -611,15 +628,6 @@ export function selectedPlanRow(state: TuiState): PlanRow | null {
   return planRows(state)[state.selectedTask] ?? null;
 }
 
-/** The commands the task's runner reported in the attempt on screen (#66): empty when it reported none. */
-export function runnerCommands(tv: TaskLogState): readonly RunnerCommand[] {
-  for (let i = tv.view.blocks.length - 1; i >= 0; i--) {
-    const block = tv.view.blocks[i];
-    if (block.type === 'runner_loaded') return block.commands;
-  }
-  return [];
-}
-
 /** The request the task view's approval keys answer: the oldest one still waiting in the attempt on screen. */
 export function waitingApproval(tv: TaskLogState): ApprovalBlock | undefined {
   return tv.view.blocks.find((b): b is ApprovalBlock => b.type === 'approval' && b.status === 'pending' && b.approvalId !== undefined);
@@ -637,17 +645,16 @@ export function waitingCheckpoint(task: TaskView | undefined): string | undefine
 /**
  * A finished structured task the daemon can continue in its saved session
  * (ADR-0018, K1), or one paused on a usage limit it can resume there: the
- * composer continues it rather than messaging a turn. The status is checked
- * too, so a start the daemon has not reported the flag's end for yet is not
- * continued twice.
+ * composer continues it rather than messaging a turn. The rule is core's, so
+ * the header that names the button and the key that runs it cannot disagree.
  */
 export function continuesTask(task: TaskView | undefined): boolean {
-  return task?.continuable === true && (task.status === 'completed' || task.status === 'failed' || task.status === 'skipped' || resumesTask(task));
+  return task ? logContinues(task) : false;
 }
 
 /** A task paused on a usage limit, whose composer resumes it now with what is typed. */
 export function resumesTask(task: TaskView | undefined): boolean {
-  return task?.status === 'awaiting_user' && task.awaitingReason === 'usage-limit';
+  return task ? logResumes(task) : false;
 }
 
 /**
@@ -657,6 +664,15 @@ export function resumesTask(task: TaskView | undefined): boolean {
  */
 export function findTask(tasks: TaskView[], id: string): TaskView | undefined {
   return taskPlacement(tasks, id)?.task;
+}
+
+/**
+ * Whether the chat pane is showing a script task's log. A script runs no model,
+ * so its log is output only: nothing queues, sends, interrupts or answers there
+ * (ADR-0035).
+ */
+export function scriptTaskView(state: TuiState): boolean {
+  return state.taskView ? findTask(state.tasks, state.taskView.taskId)?.type === 'script' : false;
 }
 
 /**
@@ -700,6 +716,8 @@ export function initialState(overrides: Partial<TuiState> = {}): TuiState {
   return {
     editor: emptyEditor(),
     conversation: EMPTY_CONVERSATION,
+    accountLimits: [],
+    servedModels: {},
     taskView: null,
     turnGate: NO_TURN,
     detailAll: false,
@@ -730,12 +748,17 @@ export function initialState(overrides: Partial<TuiState> = {}): TuiState {
     maxParallel: DEFAULT_MAX_PARALLEL,
     configuredProviders: [],
     allowlist: {},
-    autonomous: true,
+    autonomous: false,
     runSettings: { ...RUN_SETTINGS_DEFAULTS },
     runSettingsKnown: false,
+    settingsRead: 0,
+    runSettingsRead: 0,
     plannerKnown: false,
     runnersKnown: false,
     providersKnown: false,
+    isolationPreview: undefined,
+    isolationPreviewRead: 0,
+    versionCheckNotice: '',
     runAutoMerge: null,
     runSupervisor: null,
     mouseCapture: true,
@@ -744,6 +767,7 @@ export function initialState(overrides: Partial<TuiState> = {}): TuiState {
     handoff: null,
     runMerge: null,
     plannerResend: null,
+    plannerPause: null,
     overlay: null,
     pendingApprovals: [],
     queuedPrompts: EMPTY_HOLD,

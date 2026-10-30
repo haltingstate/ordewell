@@ -90,6 +90,82 @@ afterEach(() => {
   }
 });
 
+describe('handlePlan — a turn that fails signed out', () => {
+  it("rewords the terminal UI's /login sentence in the shell's own command", async () => {
+    const srv = await startServer((req, res) => {
+      if ((req.url || '').includes('/api/runners')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(RUNNERS));
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Claude Code not logged in. Sign in with /login, or run claude auth login and try again.' }));
+    });
+    const { handlePlan } = await import('../plan');
+    const { stderr, exitCode } = await capture(() => handlePlan(
+      ['--goal', 'ship it', '--no-chat', '--workspace', '/tmp'],
+      { api: new ApiClient(srv.port) },
+    ));
+    srv.close();
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('Claude Code not logged in. Run claude auth login to sign in, then try again.');
+    expect(stderr).not.toContain('/login');
+  });
+});
+
+describe('handlePlan — a planner call whose reply never comes back', () => {  /** Takes the request, then drops the connection without answering: the outcome is the daemon's alone. */
+  async function hangUpOn(fragment: string, hits: string[], answer: unknown = COMMITTED) {
+    return startServer((req, res) => {
+      const url = req.url || '';
+      hits.push(`${req.method} ${url}`);
+      if (url.includes(fragment)) return req.socket.destroy();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(url.includes('/api/runners') ? RUNNERS : { plan: answer }));
+    });
+  }
+
+  const sessionOf = (hits: string[]): string => hits.find((h) => h.includes('/converse/'))!.match(/\/api\/plans\/([^/]+)\//)![1];
+
+  it('names the session it minted, so the user resumes it instead of starting over', async () => {
+    const hits: string[] = [];
+    const srv = await hangUpOn('/converse/start', hits);
+    const { handlePlan } = await import('../plan');
+    const { stderr, exitCode } = await capture(() => handlePlan(['--goal', 'ship it', '--workspace', '/tmp'], { api: new ApiClient(srv.port) }));
+    srv.close();
+
+    const id = sessionOf(hits);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain(`ordewell sessions load ${id}`);
+    expect(stderr).toMatch(/may still be running|may have finished/);
+  });
+
+  it('says the same when a reply to the planner\'s question is the call that was lost', async () => {
+    const hits: string[] = [];
+    const srv = await hangUpOn('/converse/message', hits, { tasks: [], conversationHistory: [{ role: 'assistant', content: 'Which database?' }] });
+    const { handlePlan } = await import('../plan');
+    const { stderr } = await capture(() => handlePlan(['--goal', 'ship it', '--workspace', '/tmp'], {
+      api: new ApiClient(srv.port),
+      reader: { ask: async () => 'postgres', close: () => {} },
+    }));
+    srv.close();
+
+    expect(stderr).toContain(`ordewell sessions load ${sessionOf(hits)}`);
+  });
+
+  it('adds no resume hint when the daemon answered with a refusal', async () => {
+    const srv = await startServer((req, res) => {
+      res.writeHead(/\/api\/runners/.test(req.url || '') ? 200 : 500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(/\/api\/runners/.test(req.url || '') ? RUNNERS : { error: 'planner down' }));
+    });
+    const { handlePlan } = await import('../plan');
+    const { stderr, exitCode } = await capture(() => handlePlan(['--goal', 'ship it', '--workspace', '/tmp'], { api: new ApiClient(srv.port) }));
+    srv.close();
+
+    expect(exitCode).toBe(1);
+    expect(stderr).not.toContain('sessions load');
+  });
+});
+
 describe('handlePlan', () => {
   it('uses the conversational endpoint by default', async () => {
     const hits: string[] = [];
@@ -199,6 +275,26 @@ describe('handlePlan', () => {
     srv.close();
   });
 
+  it('names no runner on a script or a manual task, whatever runner the plan stores for it', async () => {
+    const stored = {
+      tasks: [
+        { id: 't1', order: 1, title: 'Build', type: 'ai', assignedRunner: 'opencode' },
+        { id: 't2', order: 2, title: 'Tag the release', type: 'script', commands: [['git', 'tag', 'v1']], assignedRunner: 'opencode' },
+        { id: 't3', order: 3, title: 'Sign off', type: 'user', assignedRunner: 'opencode' },
+      ],
+      runners: ['claude-code'],
+    };
+    const srv = await planServer({ '/converse/start': { plan: stored } }, []);
+    const { handlePlan } = await import('../plan');
+    const { stdout } = await capture(() =>
+      handlePlan(['--goal', 'ship it', '--workspace', '/tmp'], { api: new ApiClient(srv.port) }),
+    );
+    const rows = stdout.split('\n').filter((l) => l.includes('[SCR] Tag the release') || l.includes('[MAN] Sign off'));
+    expect(rows).toHaveLength(2);
+    expect(rows.join('\n')).not.toContain('opencode');
+    srv.close();
+  });
+
   it('prints a research task as [RES], with a legend line for it (ADR-0037)', async () => {
     const withResearch = {
       tasks: [
@@ -269,8 +365,8 @@ describe('handlePlan', () => {
 
     expect(hits.slice(0, 2)).toEqual(['PATCH /api/settings', 'PATCH /api/settings']);
     // The provider is a switch; the effort is only what this process inherited, never a pick to remember.
-    expect(JSON.parse(bodies[0])).toEqual({ env: { AI_PROVIDER: 'codex' } });
-    expect(JSON.parse(bodies[1])).toEqual({ env: { ORDEWELL_PLANNER_EFFORT: 'low' }, inherited: true });
+    expect(JSON.parse(bodies[0])).toEqual({ env: { AI_PROVIDER: 'codex' }, workspace: process.cwd() });
+    expect(JSON.parse(bodies[1])).toEqual({ env: { ORDEWELL_PLANNER_EFFORT: 'low' }, inherited: true, workspace: process.cwd() });
     srv.close();
   });
 

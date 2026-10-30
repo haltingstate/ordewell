@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as vscode from 'vscode';
-import { detectInstalledPlanner, resetInstalledPlanner, type RunnerInstallation } from '@ordewell/core';
+import { detectInstalledPlanner, resetInstalledPlanner, RunnerRegistry, type RunnerInstallation } from '@ordewell/core';
 import { registerCommands, type CommandDeps } from '../CommandRegistry';
+import { setRunnerEnabled, type EnableRunnerDeps } from '../enabledRunners';
 
 const registerCommand = vscode.commands.registerCommand as unknown as ReturnType<typeof vi.fn>;
 
@@ -32,6 +33,18 @@ describe('ordewell.toggleRunner', () => {
     expect(sendRunnerAndModels).toHaveBeenCalled();
   });
 
+  // An empty saved list leaves every surface with no runner to assign, as the chat header's switch knows.
+  it('keeps the last enabled runner on, and says why', async () => {
+    const showInformationMessage = vscode.window.showInformationMessage as unknown as ReturnType<typeof vi.fn>;
+    showInformationMessage.mockClear();
+    const { toggle, settingsService } = toggleOver(['codex'], ['claude-code']);
+
+    await toggle('codex');
+
+    expect(settingsService.updateEnabledRunners.mock.results[0]!.value).toEqual(['codex']);
+    expect(showInformationMessage).toHaveBeenCalledWith('codex is the only enabled runner, so it stays on: enable another runner first.');
+  });
+
   it('starts from the defaults only while the file holds no choice', async () => {
     const { toggle, settingsService } = toggleOver(undefined, ['codex', 'opencode']);
 
@@ -53,5 +66,88 @@ describe('ordewell.toggleRunner', () => {
     answer(false);
     await toggled;
     expect(settingsService.updateEnabledRunners).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The host's enable path over a settings service that applies the change to a list the test holds. */
+function enableOver(saved: string[] | undefined, defaults: string[]) {
+  const settingsService = {
+    updateEnabledRunners: vi.fn((change: (saved: string[] | undefined) => string[]) => change(saved)),
+  };
+  const sendRunnerAndModels = vi.fn(async () => {});
+  const deps: EnableRunnerDeps = {
+    runnerRegistry: new RunnerRegistry(),
+    settingsService,
+    config: { enabledRunners: defaults },
+    sendRunnerAndModels,
+  };
+  return {
+    enable: (runnerId: string) => setRunnerEnabled(deps, runnerId, true),
+    disable: (runnerId: string) => setRunnerEnabled(deps, runnerId, false),
+    settingsService,
+    sendRunnerAndModels,
+  };
+}
+
+describe('enabling an installed runner from the chat header', () => {
+  afterEach(() => resetInstalledPlanner());
+
+  it('adds it to the saved enabled runners and re-sends the list', async () => {
+    const { enable, settingsService, sendRunnerAndModels } = enableOver(['claude-code'], ['claude-code']);
+
+    const saved = await enable('codex');
+
+    expect(saved).toEqual(['claude-code', 'codex']);
+    expect(settingsService.updateEnabledRunners.mock.results[0]!.value).toEqual(['claude-code', 'codex']);
+    expect(sendRunnerAndModels).toHaveBeenCalled();
+  });
+
+  it('never turns one off: a repeated or stale click leaves the saved list as it is', async () => {
+    const { enable, settingsService } = enableOver(['claude-code', 'codex'], ['claude-code']);
+
+    const saved = await enable('codex');
+
+    expect(saved).toEqual(['claude-code', 'codex']);
+    expect(settingsService.updateEnabledRunners.mock.results[0]!.value).toEqual(['claude-code', 'codex']);
+  });
+
+  it('refuses an id no manifest names, saving and sending nothing', async () => {
+    const { enable, settingsService, sendRunnerAndModels } = enableOver(['claude-code'], ['claude-code']);
+
+    const saved = await enable('no-such-agent');
+
+    expect(saved).toBeNull();
+    expect(settingsService.updateEnabledRunners).not.toHaveBeenCalled();
+    expect(sendRunnerAndModels).not.toHaveBeenCalled();
+  });
+});
+
+describe('switching a runner off from the chat header', () => {
+  afterEach(() => resetInstalledPlanner());
+
+  it('takes it out of the saved enabled runners', async () => {
+    const { disable } = enableOver(['claude-code', 'codex', 'opencode'], ['claude-code']);
+
+    expect(await disable('codex')).toEqual(['claude-code', 'opencode']);
+  });
+
+  it('never turns one on: a repeated or stale click leaves the saved list as it is', async () => {
+    const { disable } = enableOver(['claude-code', 'opencode'], ['claude-code']);
+
+    expect(await disable('codex')).toEqual(['claude-code', 'opencode']);
+  });
+
+  it('keeps the last runner the saved list holds, whatever the clicker thought it held', async () => {
+    const { disable } = enableOver(['opencode'], ['claude-code', 'opencode']);
+
+    expect(await disable('opencode')).toEqual(['opencode']);
+  });
+
+  it('refuses an id no manifest names, saving and sending nothing', async () => {
+    const { disable, settingsService, sendRunnerAndModels } = enableOver(['claude-code'], ['claude-code']);
+
+    expect(await disable('no-such-agent')).toBeNull();
+    expect(settingsService.updateEnabledRunners).not.toHaveBeenCalled();
+    expect(sendRunnerAndModels).not.toHaveBeenCalled();
   });
 });

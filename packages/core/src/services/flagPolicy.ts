@@ -223,15 +223,16 @@ export const FLAG_POLICY: Record<string, FlagSpec> = {
   sort: {
     cluster: true,
     // Absent on purpose: `-o`/`--output` writes a file with no redirect for the
-    // redirect check to see, and `--compress-program` names a program that sort
-    // runs over its own temporary files — a permitted binary as an interpreter.
+    // redirect check to see, `-T`/`--temporary-directory` names where sort writes
+    // its run files, and `--compress-program` names a program that sort runs
+    // over its own temporary files — a permitted binary as an interpreter.
     booleans: ['-b', '-c', '-C', '-d', '-f', '-g', '-h', '-i', '-M', '-n', '-r', '-R', '-s', '-u',
       '-V', '-z', '--ignore-leading-blanks', '--check', '--dictionary-order', '--ignore-case',
       '--general-numeric-sort', '--human-numeric-sort', '--ignore-nonprinting', '--month-sort',
       '--numeric-sort', '--random-sort', '--reverse', '--stable', '--unique', '--version-sort',
       '--zero-terminated', '--debug'],
-    values: ['-k', '-t', '-S', '-T', '--key', '--field-separator', '--buffer-size',
-      '--temporary-directory', '--random-source', '--batch-size', '--parallel', '--sort'],
+    values: ['-k', '-t', '-S', '--key', '--field-separator', '--buffer-size',
+      '--random-source', '--batch-size', '--parallel', '--sort'],
   },
   uniq: {
     cluster: true,
@@ -476,6 +477,8 @@ export interface FlagScan {
   unknown?: string;
   /** Arguments that are not flags and not a flag's value. */
   operands: string[];
+  /** Where each operand sits in the segment's arguments, so a flag's value equal to it is never mistaken for it. */
+  operandAt: number[];
 }
 
 /**
@@ -492,6 +495,8 @@ export function scanFlags(seg: Segment): FlagScan | undefined {
   const booleans = new Set([...(spec.booleans ?? []), ...UNIVERSAL_FLAGS]);
   const values = new Set(spec.values ?? []);
   const operands: string[] = [];
+  const operandAt: number[] = [];
+  const operand = (at: number) => { operands.push(seg.args[at]); operandAt.push(at); };
 
   let i = 0;
   while (i < seg.args.length) {
@@ -500,14 +505,17 @@ export function scanFlags(seg: Segment): FlagScan | undefined {
     // spelled. Except where the arguments are an expression — see
     // {@link FlagSpec.expressionArgs} — in which case `--` falls through to the
     // matcher and is refused along with anything the caller hoped to hide there.
-    if (token === '--' && !spec.expressionArgs) { operands.push(...seg.args.slice(i + 1)); break; }
-    if (!/^-./.test(token)) { operands.push(token); i++; continue; }
+    if (token === '--' && !spec.expressionArgs) {
+      for (let j = i + 1; j < seg.args.length; j++) operand(j);
+      break;
+    }
+    if (!/^-./.test(token)) { operand(i); i++; continue; }
 
     const shape = matchFlag(spec, booleans, values, token);
-    if (shape === undefined) return { unknown: flagLabel(token), operands };
+    if (shape === undefined) return { unknown: flagLabel(token), operands, operandAt };
     i += shape === 'value' && takesNextToken(seg.args[i + 1]) ? 2 : 1;
   }
-  return { operands };
+  return { operands, operandAt };
 }
 
 /**

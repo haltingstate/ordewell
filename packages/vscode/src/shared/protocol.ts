@@ -1,5 +1,5 @@
-import type { GlobalRunSettings,
-  AiProvider, RunnerCommand, DisplayBlock, DiscoveredModel, PromptHold, RunnerId, RunView, SurfacePlan,
+import type { AccountLimitSnapshot, GlobalRunSettings, IsolationPreview,
+  AiProvider, RunnerAuth, RunnerCommand, DisplayBlock, DiscoveredModel, PromptHold, RunnerId, RunActivity, RunView, SurfacePlan,
   TaskModelAssignment,
 } from '@ordewell/core';
 
@@ -18,6 +18,8 @@ export interface PlannerBackend {
   runner?: string;
   usable: boolean;
   reason?: string;
+  /** The runner's own login verdict: a signed-out agent stays usable and is flagged, never blocked. */
+  auth?: RunnerAuth;
 }
 
 export interface RunnerMeta {
@@ -51,7 +53,7 @@ export interface ModelOption {
  */
 export type ChatState = 'empty' | 'planDraft' | 'approved';
 
-export type SystemCommand = 'cancel' | 'cancelResume' | 'cancelPlannerResend' | 'resumeNow' | 'skip' | 'retry' | 'forceStart' | 'runTask' | 'markComplete' | 'markIncomplete' | 'stopExecution' | 'executePlan';
+export type SystemCommand = 'cancel' | 'cancelResume' | 'cancelPlannerResend' | 'retryPlannerCompaction' | 'resumeNow' | 'skip' | 'retry' | 'forceStart' | 'runTask' | 'markComplete' | 'markIncomplete' | 'stopExecution' | 'executePlan';
 
 /**
  * One field edit from a task card. Named by kind rather than read off which
@@ -90,6 +92,11 @@ export interface ConversationPatch {
   type: 'conversationPatch';
   order: readonly string[];
   changed: readonly DisplayBlock[];
+  /**
+   * The view was replaced (a reset, a reload): ids are numbered
+   * afresh, so one the webview kept may name a different block now.
+   */
+  replaced?: true;
 }
 
 export type WebviewToHost =
@@ -103,7 +110,7 @@ export type WebviewToHost =
       /** The user typed it, so the conversation shows it as theirs; a button's message is not echoed. */
       typed?: boolean;
     }
-  | { type: 'sendSystemCommand'; command: SystemCommand; taskId?: string }
+  | { type: 'sendSystemCommand'; command: SystemCommand; taskId?: string; requestId?: number }
   | { type: 'editTask'; taskId: string; edit: TaskEdit }
   /** Asks the host to remove a task; the host confirms first, naming what depends on it. */
   | { type: 'removeTask'; taskId: string }
@@ -120,10 +127,6 @@ export type WebviewToHost =
   | { type: 'sendQueuedTaskMessageNow'; taskId: string; id: string }
   /** Stop a structured task's running turn; the task then waits for input. */
   | { type: 'interruptTask'; taskId: string }
-  /** The planner merges these tasks into one (issue #18). */
-  | { type: 'mergeTasks'; taskIds: string[] }
-  /** The planner splits this task into smaller ones (issue #18). */
-  | { type: 'splitTask'; taskId: string }
   /**
    * The user answered an in-chat approval card. The id is the request's, so the
    * host resolves the same prompt any other surface would.
@@ -153,8 +156,17 @@ export type WebviewToHost =
   | { type: 'addNote'; text: string }
   /** Open (or focus) the on-demand task-log tab for a structured task (ADR-0018, V1). */
   | { type: 'openTaskLog'; taskId: string }
+  /** Open a workspace-relative file Ordewell kept, such as a handoff's saved patch (ADR-0050). */
+  | { type: 'openFile'; path: string }
   /** The plan dock's dragged height in px, saved on release so every later session opens at it. */
   | { type: 'setPlanDockHeight'; height: number }
+  /**
+   * A Runners pill clicked: save the runner on or off in the settings file every
+   * surface shares (ADR-0043), then re-send the runner list. It names the state
+   * wanted, so a repeated or stale click can never flip a newer choice back;
+   * `requestId` is what the host's `runnerChoiceSaved` answers.
+   */
+  | { type: 'setRunnerEnabled'; runnerId: RunnerId; enabled: boolean; requestId: string }
   /** Who plans (ADR-0009) — a vendor provider id or one of the harness planners. */
   | { type: 'setPlanner'; provider: string }
   /** The planner's own model and thinking effort, a pair so neither can outlive the other. */
@@ -170,7 +182,12 @@ export type WebviewToHost =
    * handoff card. Reviewing, merging, discarding and cleaning up are all
    * asymmetric operations the host alone can confirm and perform.
    */
-  | { type: 'isolationAction'; action: IsolationActionKind; taskId?: string };
+  | { type: 'isolationAction'; action: IsolationActionKind; taskId?: string }
+  /**
+   * Sign a coding agent in with its own login, in a real terminal: the flows
+   * are interactive. A runner names that agent; absent means the active planner.
+   */
+  | { type: 'loginPlanner'; runner?: string };
 
 /** One change from the Settings panel's Run block: Full/Guarded, run settings (ADR-0030) or the parallel limit. */
 export interface SettingsChange {
@@ -187,6 +204,12 @@ export type HostToWebview =
   | { type: 'plannerTurn'; active: boolean }
   /** The planner is working without producing anything visible; keeps the webview's watchdog quiet. */
   | { type: 'plannerLiveness' }
+  /**
+   * The open turn itself produced something: an event carrying its turn id.
+   * Unlike liveness, which names no turn, this says the turn is still out, so
+   * a webview whose watchdog gave up on it locks the composer again.
+   */
+  | { type: 'plannerTurnAlive' }
   | { type: 'planUpdated'; plan: SurfacePlan }
   /**
    * The run as the host folded every session event: each task's plan fields and
@@ -196,6 +219,13 @@ export type HostToWebview =
    * same message.
    */
   | { type: 'runView'; view: RunView }
+  /**
+   * What the scheduler is doing after an Execute settled: the authoritative
+   * word that ends the webview's own "Starting…" and starts the run's real
+   * state. `requestId` is the Execute that asked, so a reply that outlives the
+   * session it belonged to is dropped.
+   */
+  | { type: 'runActivity'; activity: RunActivity; requestId?: number }
   | { type: 'taskOutput'; taskId: string; text: string }
   /** The queued prompts the host is holding for the next planner turn, oldest first. */
   | { type: 'heldPrompts'; prompts: PromptHold }
@@ -204,6 +234,13 @@ export type HostToWebview =
   | { type: 'showError'; error: string }
   | { type: 'setModels'; models: DiscoveredModel[] }
   | { type: 'setRunners'; runners: RunnerMeta[] }
+  /**
+   * The answer to one `setRunnerEnabled`, saved, refused or failed: `enabled`
+   * is what the shared list holds for that runner now. Only this settles a
+   * pill click; a runner list names no request, so one that discovery began
+   * before the save can neither settle the click nor undo it.
+   */
+  | { type: 'runnerChoiceSaved'; requestId: string; runnerId: RunnerId; enabled: boolean }
   /** The remembered plan dock height in px; absent until the user first drags it. */
   | { type: 'planDockHeight'; height?: number }
   /** The user's autonomy level, run settings (ADR-0030) and parallel limit, sent on ready and after each change. */
@@ -219,6 +256,13 @@ export type HostToWebview =
   /** The per-runner model allowlist, sent on ready and after each change: what a task card flags a model against. */
   | { type: 'setModelAllowlist'; allowlist: Record<string, string[]> }
   | { type: 'setModelsByRunner'; modelsByRunner: Partial<Record<RunnerId, DiscoveredModel[]>> }
+  /**
+   * The login a `loginPlanner` asked for has ended, so the webview clears its
+   * pending state. `runner` is the agent the host actually signed in — the
+   * resolved one, even when the request named none — and `message` is the short
+   * reason a sign-in did not finish, shown inline.
+   */
+  | { type: 'plannerLoginEnded'; runner?: string; ok: boolean; message?: string }
   /** `notice` is the one line the runner list shows while a runner's modes are off on this host, and the page that explains it. */
   | { type: 'setModesByRunner'; modesByRunner: Record<string, RunnerModeMeta[]>; notice?: { line: string; docs: string } | null }
   | { type: 'setModelConfig'; modelConfig: { orchestrator: string; orchestratorProvider?: string } }
@@ -230,4 +274,16 @@ export type HostToWebview =
    * arrives as a `conversationPatch`.
    */
   | { type: 'restoreChat' }
-  | { type: 'conversationBusy'; busy: boolean };
+  /**
+   * Every installed runner's account limits as the host's monitor last read
+   * them, sent on each change and on ready. Live account data: it outlives a
+   * restored or new session, and is never part of the planner's usage.
+   */
+  | { type: 'accountLimits'; limits: readonly AccountLimitSnapshot[] }
+  /**
+   * What the workspace's repositories and branches say about isolated worktrees,
+   * read now. `null` is "being read": sent when the answer shown belongs to a
+   * workspace or a webview that is gone, so an old branch is never shown as
+   * current. A read that failed arrives as a `failed` preview, never as null.
+   */
+  | { type: 'isolationPreview'; preview: IsolationPreview | null };

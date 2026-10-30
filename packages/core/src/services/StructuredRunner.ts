@@ -13,11 +13,12 @@ import type {
 import type { ApprovalDecision } from '../interfaces/IApproval';
 import type { RunnerCommand } from '../models/RunnerCommand';
 import type { RunnerSessionCost } from '../models/Usage';
-import { checkpointReply, commandReply, type CheckpointAnswer, type McpToolReply, type ReadTaskArgs, type TaskCompleteArgs } from './mcp/tools';
+import { checkpointReply, commandReply, type CheckpointAnswer, type ApplyPatchArgs, type McpToolReply, type ReadTaskArgs, type TaskCompleteArgs } from './mcp/tools';
 import { sharedMcpServer, type OrdewellMcpServer, type TaskTokenScope } from './mcp/OrdewellMcpServer';
 import { mcpClientConfig } from './mcp/clientConfig';
 import type { ResearchToolType } from '../models/Task';
 import type { TaskShell } from '../interfaces/IFileSystem';
+import type { TaskWebReads } from './taskWebReads';
 import { resolveTaskRunnerFlags } from '../plugins/resolveArgs';
 import { AbstractRunner, AbstractRunnerSession, type RunnerSpawnOptions } from './AbstractRunner';
 import type { AgentEvent, AgentProcessDeps, TaskModeAgentAdapter, TaskStartOptions } from './harness/AgentAdapter';
@@ -223,11 +224,13 @@ interface SessionLaunch {
   createAdapter: (runner: string, deps: AgentProcessDeps) => TaskModeAgentAdapter;
   startOptions: TaskStartOptions;
   interruptGraceMs: number;
-  /** Where this attempt's task tools are served (ADR-0022), and a read-only attempt's shell (ADR-0046). */
-  tools: { server: OrdewellMcpServer; scope: TaskTokenScope; shell?: TaskShell };
+  /** Where this attempt's task tools are served (ADR-0022), and a read-only attempt's shell and web reads (ADR-0046) and patch (ADR-0050). */
+  tools: { server: OrdewellMcpServer; scope: TaskTokenScope; shell?: TaskShell; savePatch?: (signal: AbortSignal) => Promise<McpToolReply>; webReads?: TaskWebReads };
   checkHandoff: (completion: TaskCompleteArgs) => HandoffCheck<TaskCompleteArgs>;
   readTask?: (args: ReadTaskArgs) => McpToolReply;
+  applyPatch?: (args: ApplyPatchArgs) => Promise<McpToolReply>;
   onNotice?: (message: string) => void;
+  onAttaching?: (spawn: 1 | 2) => void;
 }
 
 /**
@@ -325,7 +328,8 @@ export class StructuredSession extends AbstractRunnerSession {
    * at all throws instead: spawning it again would fail the same way.
    */
   private async startAttached(opts: TaskStartOptions): Promise<void> {
-    const { server, scope, shell } = this.launch.tools;
+    const { server, scope, shell, savePatch, webReads } = this.launch.tools;
+    this.launch.onAttaching?.(1);
     const spawned = await spawnAttached({
       runner: this.launch.runner,
       create: () => this.launch.createAdapter(this.launch.runner, this.launch.deps),
@@ -338,6 +342,8 @@ export class StructuredSession extends AbstractRunnerSession {
           // its report published at the same grace; the verdict then stops it.
           if (this.completionTimer) clearTimeout(this.completionTimer);
           this.completionTimer = setTimeout(() => this.flushCompletion(), this.launch.interruptGraceMs);
+          // Said at once, so the task shows the report arrived while the turn winds down.
+          this.emitEvent({ type: 'completion_received', status: checked.handoff.status });
           return { text: 'Recorded. End your turn now.' };
         },
         checkpoint: async ({ question }, { signal }) => {
@@ -345,8 +351,12 @@ export class StructuredSession extends AbstractRunnerSession {
           return checkpointReply(await this.checkpointHandler(question, signal));
         },
         ...(this.launch.readTask ? { readTask: async (args) => this.launch.readTask!(args) } : {}),
+        ...(this.launch.applyPatch ? { applyPatch: async (args) => this.launch.applyPatch!(args) } : {}),
         // The call's signal aborts when the token is revoked, so a command still running ends with the attempt.
         ...(shell ? { runCommand: async ({ command }, { signal }) => commandReply(await shell.run(command, signal)) } : {}),
+        ...(savePatch ? { savePatch: async (_args, { signal }) => savePatch(signal) } : {}),
+        // The attempt's, not the token's: a respawn on a fresh token keeps its web-read count.
+        ...(webReads ? { fetch: async ({ url }, { signal }) => webReads.fetch(url, signal), webSearch: async ({ query }, { signal }) => webReads.search(query, signal) } : {}),
       }),
       revoke: (token) => server.revoke(token),
       start: (adapter, credential) => {
@@ -360,7 +370,10 @@ export class StructuredSession extends AbstractRunnerSession {
       },
       cancelled: this.ended.signal,
       startupExit: () => this.startupExit,
-      onRespawn: (failure) => this.launch.onNotice?.(`${this.launch.runner} started without Ordewell's tools (${failure}); respawning once.`),
+      onRespawn: (failure) => {
+        this.launch.onNotice?.(`${this.launch.runner} started without Ordewell's tools (${failure}); respawning once.`);
+        this.launch.onAttaching?.(2);
+      },
       failed: (first, second) => `Could not start ${this.launch.runner} with Ordewell's tools, so the task was not sent to it. First spawn: ${first}. Respawn: ${second}.`,
     });
     if (!spawned) return;
@@ -632,7 +645,9 @@ export class StructuredSession extends AbstractRunnerSession {
   private async interruptTurn(turn: OpenTurn, adapter: TaskModeAgentAdapter): Promise<void> {
     const grace = this.launch.interruptGraceMs;
     const ended = new Promise<void>((resolve) => this.structuredEmitter.once('turnEnd', () => resolve()));
-    if (await adapter.interrupt(grace)) {
+    // An adapter whose request never answers is one that ignored the interrupt, so the grace bounds the ask too.
+    const acknowledged = await settleWithin(adapter.interrupt(grace).catch(() => false), { timeoutMs: grace, onTimeout: () => false });
+    if (acknowledged) {
       // Acknowledged, but the turn only ends with its result line.
       const settled = await settleWithin(ended.then(() => true), { timeoutMs: grace, onTimeout: () => false });
       if (settled) return;
@@ -973,6 +988,7 @@ export class StructuredRunner extends AbstractRunner<StructuredSession> {
     const unavailable = unavailableTaskModeMessage(manifest, opts.mode);
     if (unavailable) throw new Error(unavailable);
 
+    const readOnly = opts.shell !== undefined || opts.mode !== undefined && opts.mode === taggedReadOnlyMode(manifest.modes);
     this.spawnCount += 1;
     const id = `ordewell-structured-${opts.taskId.slice(0, 8)}-${this.spawnCount}`;
     const env = { ...opts.env };
@@ -996,26 +1012,38 @@ export class StructuredRunner extends AbstractRunner<StructuredSession> {
         flags: resolveTaskRunnerFlags(manifest, { mode: opts.mode ?? 'default', model: opts.modelId, thinkingEffort: opts.thinkingEffort }),
         resumeSessionId: opts.resumeSessionId,
         resumeCost: opts.resumeCost,
+        ...(opts.commits ? { commits: true } : {}),
       },
       interruptGraceMs: this.interruptGraceMs,
       tools: {
         server: this.mcp,
-        scope: { sessionId: opts.planSessionId ?? '', taskId: opts.taskId, attempt: opts.attempt ?? 1, ...(opts.shell || opts.mode !== undefined && opts.mode === taggedReadOnlyMode(manifest.modes) ? { readOnly: true } : {}) },
+        scope: { sessionId: opts.planSessionId ?? '', taskId: opts.taskId, attempt: opts.attempt ?? 1, ...(readOnly ? { readOnly: true } : {}) },
         ...(opts.shell ? { shell: opts.shell } : {}),
+        ...(opts.shell && opts.savePatch ? { savePatch: opts.savePatch } : {}),
+        ...(readOnly && opts.webReads ? { webReads: opts.webReads } : {}),
       },
       checkHandoff: opts.checkHandoff ?? ((completion) => checkHandoff(completion, opts.taskId, [])),
       ...(opts.readTask ? { readTask: opts.readTask } : {}),
+      ...(opts.applyPatch ? { applyPatch: opts.applyPatch } : {}),
       onNotice: opts.onNotice,
+      onAttaching: opts.onAttaching,
     });
 
     console.error(`[structured] Starting ${opts.runner} [${opts.mode ?? 'default'}] (${opts.modelId || 'default'}) for task ${opts.taskId.slice(0, 8)}`);
     this.registerSession(id, session);
+    // Until the start resolves the caller holds no session to stop, so its
+    // cancel is the only way to end a runner still waiting for its tools.
+    const cancel = () => void session.stop();
+    opts.cancelled?.addEventListener('abort', cancel, { once: true });
     try {
+      if (opts.cancelled?.aborted) cancel();
       await session.start(opts.prompt);
     } catch (err) {
       session.kill();
       this.sessions.delete(id);
       throw err;
+    } finally {
+      opts.cancelled?.removeEventListener('abort', cancel);
     }
     return session;
   }

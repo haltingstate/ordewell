@@ -37,11 +37,12 @@ Meanwhile paths were not confined at all. `PoolFileSystem.resolve()` was `path.i
 
 Path confinement moved into `BaseFileSystem` as template methods: every public method resolves and authorizes before delegating to an adapter `*Impl`, which therefore only ever receives an absolute, approved path. Out-of-workspace access is an `ask`, scoped to the containing directory.
 
-Both halves have to agree on what the shell will actually do with a string, or the confinement leaks. Three ways it did:
+Both halves have to agree on what the shell will actually do with a string, or the confinement leaks. Four ways it did:
 
 - **Quoting is the shell's, not ours.** Splitting on a bare `/[|;&]/` made `rg "error|warn" src` two segments — so the planner's commonest search asked for approval, scoped to the nonsense binary `warn"` — while leaving quotes on argument tokens hid `cat "/etc/passwd"` from the path check entirely (`looksLikePath('"/etc/passwd"')` is false). One lexer now owns both answers.
 - **`~` is expanded because the shell expands it.** `path.resolve(root, '~/.ssh/id_rsa')` yields `<root>/~/.ssh/id_rsa`, which reads as *inside* the workspace, so an auto-tier `cat ~/.ssh/id_rsa` passed confinement unprompted and then read the real file. `resolveWithin` expands `~` before resolving.
 - **A path is anything that climbs, not only what starts with `../`.** `looksLikePath` recognised a relative path by its first characters, so `cat src/../../etc/passwd` — which the shell resolves through a directory that exists — was a plain name to the check and read the file unprompted. An argument with a `..` segment anywhere is now a path.
+- **A glob can climb too.** bash 3.2 (macOS `/bin/sh`) and dash let a name segment that starts with a dot match `..`, so `cat .?/secret.txt` read a file above the workspace while every path the line spells resolves inside it. An unquoted glob segment that starts with a dot (`.?`, `.*`, `.[.]`) takes a command off `auto`, and it asks under the exact line, as a steered `cd` does, so one approval never covers the next file it names. Patterns are not opened and are left alone.
 
 `ApprovalPolicy` decides and remembers; `PendingApprovals` parks the promise; `Session` announces on the **existing broadcast seam** and exposes `resolveApproval(id, granted)`. Every surface answers through that one call.
 
@@ -49,7 +50,7 @@ Both halves have to agree on what the shell will actually do with a string, or t
 
 - **Grants are scoped, not per-call (T1).** Approving `/tmp/dump/a.log` grants `/tmp/dump/*`; approving `az group list` grants `az group list`, derived for known multiplexers from the binary plus the leading non-flag arguments before the first flag, capped at two. Per-call prompting would make real research unusable, and users would reflexively approve.
 
-  The scope is not the binary plus its **first** non-flag argument: that collapses distinct operations onto one grant. `npm run <script>` would scope to `npm run`, so approving the project's test script would pre-authorise every other script in the workspace manifest — attacker-authored on an untrusted repository — and `az group list`/`az group delete` and `aws s3 ls`/`aws s3 rm` would each share a grant across a read and its destructive sibling. Walking stops at the first flag so a flag's value never enters the scope, which keeps a log-style invocation one stable grant rather than a fresh prompt per limit; the cost is that a leading flag empties the lead (`mvn -q test` scopes to `mvn`), accepted deliberately.
+  The scope is not the binary plus its **first** non-flag argument: that collapses distinct operations onto one grant. `npm run <script>` would scope to `npm run`, so approving the project's test script would pre-authorise every other script in the workspace manifest — attacker-authored on an untrusted repository — and `az group list`/`az group delete` and `aws s3 ls`/`aws s3 rm` would each share a grant across a read and its destructive sibling. Walking stops at the first flag so a flag's value never enters the scope, which keeps a log-style invocation one stable grant rather than a fresh prompt per limit; the cost is that a leading flag empties the lead (`mvn -q test` scopes to `mvn`), accepted deliberately. git is the exception: every flag it may take is declared and an unknown one refuses, so its scope is read from its operands past the flags, `git -C packages/core worktree list` as `git worktree list` rather than bare `git`, and `git ls-remote` is scoped to its whole line ([ADR-0027](0027-web-reads-in-the-planner-envelope.md)).
 - **Denials are remembered too (T2).** A model that retries a blocked lookup burns one tool round instead of re-prompting the user each time.
 - **One in-flight ask per scope (T3).** Parallel tool rounds cannot raise two prompts for the same thing.
 - **Nothing in core knows which UI is listening (T4).** Requests ride the same `SessionMessage` broadcast as every other planner event. VS Code answers in-process via `INotification.confirm`; the CLI and TUI answer over `POST /api/approvals/:sessionId/:approvalId`. A prompt outlives the socket that announced it, which is why answers are HTTP rather than a socket reply.
@@ -185,7 +186,7 @@ The refusal tier rests on one premise: a destructive verb never reaches `ask`,
 because `ask` is remembered at `scope` granularity and one approval would
 cover every later use. Wrappers (`env`, `nice`, `timeout`, `command`, `builtin`, …) are unwrapped for
 that reason, and so are commands that *run* another command and the filters
-that carry a program. Before they were, the premise had four holes, each
+that carry a program. Before they were, the premise had these holes, each
 classified as `ask` with a binary-wide scope:
 
 - `xargs rm < list`, `xargs -a list rm` — `xargs` was refused only when piped
@@ -197,6 +198,21 @@ classified as `ask` with a binary-wide scope:
   `print > file`.
 - `sed '1e rm x'`, `sed 's/x/y/e'`, and the `w`/`W` commands and `w` flag that
   write a file.
+- sed's `r`/`R` commands, awk's `getline < file` and an assignment to `ARGV`,
+  which read a file the program names where path confinement, reading only
+  the arguments, never sees it; and awk's `ENVIRON`, which reads the provider
+  keys bare `env` asks before printing, and gawk's `SYMTAB`, which reaches
+  both arrays by a name the program can build as it runs.
+- `git rm`, `git mv`, `git worktree remove`, `git format-patch` and the other
+  git subcommands that write the working tree, the index, the object store or
+  a file of their own. On a host with no sandbox the classifier is the only
+  guard, and one approval of `git rm` deleted the file. A list of those
+  writers was never complete (`git symbolic-ref HEAD <ref>`,
+  `git hash-object -w`, `git commit-graph write` still asked), so git is an
+  allowlist: a subcommand not known to read is refused, and one that reads
+  under some arguments and writes under others (`worktree list`,
+  `symbolic-ref HEAD`, `hash-object` without `-w`) asks only in its reading
+  form.
 - `enable -f lib.so name`, which loads a shared object into the shell and runs
   its code, as `source` runs a script. Refused; plain `enable` still asks.
 
@@ -222,10 +238,18 @@ How they are read, under the file's rule: when unsure, refuse.
   argument that runs a program or writes a file (`grep`, `cat`, `head`, `wc`,
   `ls`, …) may run under it. Piping into `xargs` stays refused.
 - **sed and awk programs are read.** A small parser for each finds the
-  commands above, and refuses a program it cannot read — including one loaded
-  from a file (`-f`), one the shell rewrites first, and a construct GNU and BSD
-  sed, or gawk and the one-true-awk, would end in different places.
+  commands and reads above, and refuses a program it cannot read — including
+  one loaded from a file (`-f`), one the shell rewrites first, and a construct
+  GNU and BSD sed, or gawk and the one-true-awk, would end in different places.
   Substitution, regex addresses and field work stay on the prompt tier.
+- **jq and yq programs are read.** They stay `auto`, but a program can read
+  the process environment (`$ENV`, `env`, yq's `strenv` and `envsubst`), which
+  holds provider keys and is why bare `env` asks, or load a file from a
+  directory no argument names (`import … {search: "~"}`, `include`, yq's
+  `load` family). A program that names one, outside a string literal, is
+  refused, as is one read from a file (`-f`) or rewritten by the shell, and
+  yq's `eval`, which would hide the rest from the reading. A field (`.env`)
+  and an object key (`{env: …}`) are not calls.
 - **sed that prints lines by number is `auto`.** `sed -n '10,40p' f`,
   `'$p'`, `'5,+3p'` and `'100q'` read what `head` and `tail` read, and models
   reach for them to read part of a file; on the prompt tier every one was
@@ -309,8 +333,9 @@ of.
   segment that never becomes a command can still carry the `||` or `;` that
   makes the shell's directory depend on what ran. Any `;`, `||`, `&`, newline,
   subshell, substitution, state-changing builtin or `cd` it cannot read stops
-  following for the whole command. A `cd` inside a multi-stage pipeline runs in
-  a subshell and is not counted.
+  following for the whole command, and so does a `cd` re-cased for cmd.exe
+  (`CD`) or spelled `chdir`, which cmd.exe and zsh run as `cd`. A `cd` inside
+  a multi-stage pipeline runs in a subshell and is not counted.
 - **The fallback never relaxes.** When nothing is followed, paths are judged
   from the root. That is never more permissive than the truth while every `cd`
   stays inside the workspace: a path with no net climb stays inside from any
@@ -319,7 +344,7 @@ of.
   and ask under their own scopes.
 - **A `cd` that asks is granted for its line only.** Its grant is the exact
   command, not `cd`, and so is the grant of a builtin that can move the shell
-  (`pushd`, `popd`, `builtin`, the other state-changing builtins). Confinement
+  (`chdir`, `pushd`, `popd`, `builtin`, the other state-changing builtins). Confinement
   did not follow it, so the paths after it were judged from the root; under a
   binary-name grant, approving `cd "$HOME"` would have approved
   `cd "$HOME" && cat .ssh/id_rsa`.
@@ -414,3 +439,8 @@ model's refusal to write were never security evidence.
 - 2026-10-17 — the Codex planner paragraph reads `approvalPolicy: on-request`, as ADR-0026 made it on 2026-10-10; it still said `never`.
 - 2026-10-21 — where the planner's sandbox runs, a command refused without asking, by the classifier or the approval mode, runs sealed instead, and so does what a research subagent would have asked about ([ADR-0036](0036-the-planners-shell-sealed-runs-and-native-opt-in.md), #109).
 - 2026-10-21 — the planner performs an exact effect itself as a script task through `run_script`, outside this envelope, and the refusals and the `allowlist` mode's refusal point there instead of at an ops task alone ([ADR-0035](../supervision/0035-effects-are-consented-and-recorded.md)).
+- 2026-10-24 — a glob that can match `..` asks under its line; jq and yq programs are read for environment access and module or file loads.
+- 2026-10-29 — sed and awk programs that read a file they name or the environment are refused, and so are git's subcommands that write.
+- 2026-10-29 — git's subcommands are an allowlist with per-subcommand reading forms, and gawk's `SYMTAB` is refused.
+- 2026-10-29 — git is scoped by its operands past leading flags, so `git -C <dir> …` no longer scopes to bare `git`.
+- 2026-10-29 — `chdir` and a re-cased `CD` move the shell: following stops, and the grant is the line.

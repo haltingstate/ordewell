@@ -1,16 +1,17 @@
 import { execSync } from 'child_process';
 import {
-  clipboardCopyCommand, getProviderMeta, isApiProvider, isCliProvider, isUserMessage, markRequestFor, newTaskFields, TERMINAL_UI_COMMANDS, type HasBinFn, type SerializedConversationMessage, type SurfacePlan,
+  clipboardCopyCommand, getProviderMeta, isApiProvider, isCliProvider, isUserMessage, mergeOutcome, confirmedOverride, newTaskFields, taskActionCommand, TERMINAL_UI_COMMANDS, type HasBinFn, type SerializedConversationMessage, type SurfacePlan,
   type PlannerModelRecall,
+  type RunnersResponse,
 } from '@ordewell/core';
 import { describeConnectionRefused, isConnectionRefused } from '../daemon';
-import { DaemonError, WorkspaceInitNeededError, type ApiClient, type SessionFollow } from '../apiClient';
+import { DaemonError, RequestTimeoutError, UnreadableResponseError, WorkspaceInitNeededError, deliveryOf, type ApiClient, type SessionFollow } from '../apiClient';
 import { normalizeCatalog } from '../catalog';
 import { plannerSwitchRecall, uninstalledPlannerRefusal } from '../plannerModelSwitch';
 import type { Action, Effect } from './reducer';
+import type { ChatRestored } from './reducers/shared';
 import type { SessionView } from './state';
-import { mergeOutcome } from '../isolation';
-import { inboundFor } from './inbound';
+import { inboundFor, forgetInbound } from './inbound';
 
 /**
  * The slice of the daemon client the TUI needs. Derived from `ApiClient` rather
@@ -19,12 +20,12 @@ import { inboundFor } from './inbound';
  */
 export type OrdewellApi = Pick<ApiClient,
   | 'startConversation' | 'sendConversationMessage' | 'forceSendPlannerMessage' | 'executePlan' | 'stopExecution' | 'cancelPlanning'
-  | 'taskControl' | 'markTaskComplete' | 'markTaskIncomplete' | 'skipTask' | 'cancelResume' | 'resumeNow' | 'cancelPlannerResend'
+  | 'execute' | 'cancelPlannerResend' | 'retryPlannerCompaction'
   | 'getTaskLogAttempts' | 'getTaskLog'
-  | 'sendTaskMessage' | 'invokeTaskCommand' | 'removeQueuedTaskMessage' | 'forceSendTaskMessage' | 'forceSendQueuedTaskMessage'
-  | 'interruptTask' | 'approveTaskCheckpoint' | 'rejectTaskCheckpoint' | 'continueTask'
+  | 'invokeTaskCommand' | 'approveTaskCheckpoint' | 'rejectTaskCheckpoint'
   | 'addTask' | 'updateTask' | 'removeTask'
   | 'getSessions' | 'getSession' | 'adoptSession' | 'deleteSession' | 'closeSession'
+  | 'getIsolationPreview'
   | 'forkConversation' | 'rewindTargets' | 'rewindConversation' | 'compactConversation'
   | 'reviewRunDiff' | 'mergeRun' | 'discardRun' | 'cleanupRun' | 'continueWithStash' | 'continueWithoutIsolation' | 'resolveConflictAsTask'
   | 'getSettings' | 'updateSettings' | 'updateRunSettings'
@@ -62,6 +63,11 @@ export interface EffectDeps {
   hasBin?: HasBinFn;
   /** Runs `command` with `text` on its stdin. Injected for the same reason. */
   pipeToClipboard?(command: string, text: string): void;
+  /**
+   * Hands the terminal to a coding agent's own login command and resolves
+   * when the child exits. Injected so no test starts a real agent.
+   */
+  login(command: readonly string[]): Promise<{ ok: boolean; message?: string }>;
   /** Writes raw bytes to the terminal — the OSC 52 fallback's only route out. */
   writeTerminal(data: string): void;
   exit(): void;
@@ -78,10 +84,17 @@ export interface EffectDeps {
  * the daemon's first-turn registration race never comes up.
  */
 export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void> {
+  // An opening turn's session is minted before the first attempt, so its
+  // failure can name it, and a revived daemon's retry opens the same one.
+  const performed: Performed = effect.type === 'startConversation' ? { ...effect, sessionId: effect.sessionId ?? deps.newSessionId() } : effect;
+  const opening = performed.type === 'startConversation' ? performed : null;
   const turn = isPlannerTurn(effect);
-  const fail = (action: Extract<Action, { type: 'failed' }>): void => deps.dispatch(turn ? { ...action, turn } : action);
+  // The user may have loaded another session while the turn ran; its failure
+  // must not end that one's turn or drain that one's queue.
+  const turnSession = turn && 'sessionId' in performed ? { sessionId: performed.sessionId } : {};
+  const fail = (action: Extract<Action, { type: 'failed' }>): void => deps.dispatch(turn ? { ...action, turn, ...turnSession } : action);
   try {
-    await perform(effect, deps);
+    await perform(performed, deps);
   } catch (err) {
     if (!isConnectionRefused(err)) {
       fail(failedFrom(err));
@@ -90,22 +103,50 @@ export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void>
 
     // Refused at the handshake means the request never reached a server, so
     // replaying it cannot be a second execution — which is the whole reason
-    // only this one errno is retried. See `isConnectionRefused`.
+    // only this one errno is retried. See `isConnectionRefused`. An opening
+    // that carries its session is already the retry after a revive.
     let revived = false;
-    try {
-      revived = await deps.reviveDaemon();
-    } catch {
-      revived = false;
+    if (effect.type !== 'startConversation' || effect.sessionId === undefined) {
+      try {
+        revived = await deps.reviveDaemon();
+      } catch {
+        revived = false;
+      }
     }
 
     if (!revived) {
+      // A refused opening kept its session for the retry; with none coming,
+      // nothing holds it, so it is let go as any refused opening is.
+      if (opening) deps.dispatch({ type: 'sessionCleared', sessionId: opening.sessionId, unreached: true });
       fail({ type: 'failed', message: describeConnectionRefused(deps.port) });
+      // The welcome is not any session: its run settings are the file's again
+      // (ADR-0030). Read after the failure is shown, so a daemon that never
+      // answers cannot hold the welcome in planning.
+      if (opening) await reloadSettings(deps);
+      return;
+    }
+
+    if (opening) {
+      // The user may have loaded, forked or started another session while the
+      // daemon came back. Whether this opening is still the one on screen is
+      // the reducer's to say: a retry from here would take that one over.
+      deps.dispatch({ type: 'daemonReconnected' });
+      deps.dispatch({
+        type: 'openingRevived', sessionId: opening.sessionId, goal: opening.goal,
+        ...(opening.allowInit ? { allowInit: opening.allowInit } : {}),
+      });
       return;
     }
 
     deps.dispatch({ type: 'notice', message: 'The server had stopped; started a new one and retried.' });
+    // A replacement daemon may serve a different workspace configuration, so
+    // the welcome's repository read starts again instead of outliving it. A
+    // refresh or loadScope about to be retried asks for it anyway.
+    if (effect.type !== 'loadIsolationPreview' && effect.type !== 'refresh' && effect.type !== 'loadScope') {
+      deps.dispatch({ type: 'daemonReconnected' });
+    }
     try {
-      await perform(effect, deps);
+      await perform(performed, deps);
     } catch (retryErr) {
       // A fresh daemon holds no sessions, so the retry of anything
       // session-scoped legitimately 404s. Say which of the two happened.
@@ -114,10 +155,13 @@ export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void>
   }
 }
 
+/** An effect as `perform` runs it: an opening turn carries the session `runEffect` minted for it. */
+type Performed = Exclude<Effect, { type: 'startConversation' }> | (Extract<Effect, { type: 'startConversation' }> & { sessionId: string });
+
 /** The effects that are a planner turn: their failure is the turn's, and ends it. */
 function isPlannerTurn(effect: Effect): boolean {
   return effect.type === 'startConversation' || effect.type === 'sendMessage'
-    || effect.type === 'forceSendPlannerMessage' || effect.type === 'compactConversation';
+    || effect.type === 'forceSendPlannerMessage' || effect.type === 'compactConversation' || effect.type === 'retryPlannerCompaction';
 }
 
 /**
@@ -165,37 +209,61 @@ function plannerModelNotice(recall: PlannerModelRecall): string {
   }
 }
 
-async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
+async function perform(effect: Performed, deps: EffectDeps): Promise<void> {
   const { api, dispatch, workspace } = deps;
 
   switch (effect.type) {
     case 'startConversation': {
-      const sessionId = deps.newSessionId();
+      const { sessionId } = effect;
       dispatch({ type: 'sessionStarted', sessionId, goal: effect.goal });
       try {
-        await converse(deps, sessionId, () => api.startConversation(sessionId, effect.goal, undefined, workspace, effect.allowInit));
+        await converse(deps, sessionId, () => api.startConversation(sessionId, effect.goal, undefined, workspace, effect.allowInit), true);
       } catch (err) {
         // The daemon registers a session before the opening turn runs, so a
         // stopped one — by a force send, whose forced turn carries on — leaves
         // a session the next reply belongs to.
-        if (err instanceof DaemonError && err.code === 'planner_turn_stopped') throw err;
-        // Any other failure means planning never completed and the daemon
-        // dropped it, so this id points at nothing — keeping it would 404
-        // every following message.
+        if (err instanceof DaemonError && err.code === 'planner_turn_stopped') {
+          await reloadSettings(deps, sessionId);
+          throw err;
+        }
+        // Refused, it reached no server: the session stays on screen for a
+        // revived daemon's retry, so a session loaded meanwhile replaces it,
+        // and the retry can tell (`openingRevived`). `runEffect` lets it go
+        // when no retry comes.
+        if (isConnectionRefused(err)) {
+          unfollow(deps, sessionId);
+          throw err;
+        }
+        // What reaches here is a refusal the daemon answered, or a request that
+        // never went out for another reason (a lost reply is settled inside
+        // `converse`, the session kept). Neither leaves a conversation a reply
+        // could continue, so the id is let go: keeping it would 404 every
+        // following message.
         unfollow(deps, sessionId);
-        dispatch({ type: 'sessionCleared' });
+        dispatch({ type: 'sessionCleared', sessionId });
+        // The welcome is not any session: its run settings are the file's again (ADR-0030).
+        await reloadSettings(deps);
         // Offer to initialize instead of just reporting failure — but only
         // once: a rejection on the confirmed retry (allowInit already true)
         // falls through to the generic error path instead of looping the
         // prompt forever.
         if (err instanceof WorkspaceInitNeededError && !effect.allowInit) {
-          dispatch({ type: 'workspaceNeedsInit', goal: effect.goal, workspace: err.workspace });
+          dispatch({ type: 'workspaceNeedsInit', goal: effect.goal, workspace: err.workspace, sessionId });
           return;
         }
         throw err;
       }
+      // Outside the block above: a settings read that fails must not take a
+      // session that opened. The session holds its own run settings, seeded from
+      // the file as it stood when the daemon opened it (ADR-0030).
+      await reloadSettings(deps, sessionId);
       return;
     }
+
+    // The stream said a turn whose reply was lost has ended: read it back.
+    case 'reconcileTurn':
+      await readBackSession(deps, effect.sessionId, { opening: false, turnEnded: true });
+      return;
 
     case 'sendMessage':
       await converse(deps, effect.sessionId, () => api.sendConversationMessage(effect.sessionId, effect.message));
@@ -238,22 +306,9 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
 
     case 'taskAction': {
       const { sessionId, taskId, action } = effect;
-      if (action === 'cancel-resume') {
-        // A task with no resume scheduled is refused in the daemon's words.
-        await api.cancelResume(sessionId, taskId);
-        await refreshPlan(deps, sessionId);
-        return;
-      }
-      const request =
-        action === 'cancel' || action === 'retry' || action === 'force-start'
-          ? () => api.taskControl(sessionId, taskId, action)
-          : action === 'resume-now'
-            ? () => api.resumeNow(sessionId, taskId)
-            : action === 'skip'
-              ? () => api.skipTask(sessionId, taskId)
-              : markRequestFor(action) === 'uncomplete'
-                ? () => api.markTaskIncomplete(sessionId, taskId)
-                : () => api.markTaskComplete(sessionId, taskId);
+      // A refusal comes back in the seam's words, a task with no resume scheduled included.
+      const command = taskActionCommand(action, taskId);
+      const request = () => api.execute(sessionId, effect.confirmed ? confirmedOverride(command, effect.confirmed.seen) : command);
       // A spawning action (see `taskActionEffect`) reports its progress the same
       // way a whole run does, so it needs the same stream open around it.
       await (effect.watch ? withExecutionStream(deps, sessionId, request) : request());
@@ -286,7 +341,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       } catch {
         // The planner's own timeout denies an unanswered request, so a lost
         // answer degrades to a denial rather than a stuck session.
-        dispatch({ type: 'failed', message: 'Could not deliver the approval answer: the planner will treat it as denied.' });
+        dispatch({ type: 'failed', message: 'Could not deliver the approval answer: the planner will treat it as denied.', sessionId: effect.sessionId });
       }
       return;
     }
@@ -298,7 +353,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       } catch {
         // A runner's request never times out, so a lost answer leaves it
         // waiting rather than denied.
-        dispatch({ type: 'failed', message: 'Could not deliver the answer: the task is still waiting for approval.' });
+        dispatch({ type: 'failed', message: 'Could not deliver the answer: the task is still waiting for approval.', sessionId: effect.sessionId });
       }
       return;
     }
@@ -334,7 +389,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
     // The daemon queues the message (or delivers it to a waiting task) and
     // broadcasts the `task_log` event that shows it; nothing to dispatch here.
     case 'sendTaskMessage':
-      await api.sendTaskMessage(effect.sessionId, effect.taskId, effect.text);
+      await api.execute(effect.sessionId, { command: 'message_task', task: effect.taskId, text: effect.text });
       return;
     case 'invokeTaskCommand':
       await api.invokeTaskCommand(effect.sessionId, effect.taskId, effect.name, effect.args);
@@ -344,7 +399,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
     // the execution stream, which a TUI not already watching a run holds open.
     case 'continueTask': {
       const { sessionId, taskId, text } = effect;
-      const request = () => api.continueTask(sessionId, taskId, text);
+      const request = () => api.execute(sessionId, { command: 'retry_task', task: taskId, from: 'session', message: text });
       await (effect.watch ? withExecutionStream(deps, sessionId, request) : request());
       await refreshPlan(deps, sessionId);
       return;
@@ -352,21 +407,21 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
 
     // One already delivered is refused in the daemon's words.
     case 'removeTaskMessage':
-      await api.removeQueuedTaskMessage(effect.sessionId, effect.taskId, effect.messageId);
+      await api.execute(effect.sessionId, { command: 'remove_queued', task: effect.taskId, id: effect.messageId });
       return;
 
     // The task log shows the forced message at the head of the queue, then
     // the interrupt, then the turn it opens; nothing to dispatch here.
     case 'forceSendTaskMessage':
-      await api.forceSendTaskMessage(effect.sessionId, effect.taskId, effect.text);
+      await api.execute(effect.sessionId, { command: 'message_task', task: effect.taskId, text: effect.text, force: true });
       return;
 
     case 'forceSendQueuedTaskMessage':
-      await api.forceSendQueuedTaskMessage(effect.sessionId, effect.taskId, effect.messageId);
+      await api.execute(effect.sessionId, { command: 'force_send_queued', task: effect.taskId, id: effect.messageId });
       return;
 
     case 'interruptTask':
-      await api.interruptTask(effect.sessionId, effect.taskId);
+      await api.execute(effect.sessionId, { command: 'interrupt_task', task: effect.taskId });
       return;
 
     case 'setPlanner': {
@@ -389,10 +444,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       const settings = await api.updateSettings({ env });
       const recall = plannerSwitchRecall(settings);
       persistAfterDaemon(deps, { ...env, ORCHESTRATOR_MODEL: recall.model, ORDEWELL_PLANNER_EFFORT: recall.effort });
-      dispatch({
-        type: 'settingsLoaded',
-        settings: { aiProvider: effect.provider, orchestratorModel: recall.model, plannerThinkingEffort: recall.effort },
-      });
+      dispatchSettings(deps, { aiProvider: effect.provider, orchestratorModel: recall.model, plannerThinkingEffort: recall.effort });
       dispatch({
         type: 'notice',
         message: `${isCliProvider(effect.provider)
@@ -411,16 +463,13 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       const env = { AI_PROVIDER: effect.provider, ORCHESTRATOR_MODEL: effect.modelId, ORDEWELL_PLANNER_EFFORT: effect.effort };
       const settings = await api.updateSettings({ env });
       persistAfterDaemon(deps, env);
-      dispatch({
-        type: 'settingsLoaded',
-        settings: {
-          ...settings,
-          aiProvider: effect.provider,
-          orchestratorModel: effect.modelId,
-          plannerThinkingEffort: effect.effort,
-        },
+      dispatchSettings(deps, {
+        ...settings,
+        aiProvider: effect.provider,
+        orchestratorModel: effect.modelId,
+        plannerThinkingEffort: effect.effort,
       });
-      dispatch({ type: 'notice', message: effect.notice });
+      dispatch({ type: 'notice', message: effect.notice, ...(effect.noticeLevel ? { level: effect.noticeLevel } : {}) });
       return;
     }
 
@@ -440,7 +489,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       // settings.json as a lingering no-op restriction.
       const ids = effect.modelIds.length > 0 ? effect.modelIds : null;
       const settings = await api.updateSettings({ modelAllowlist: { [effect.runner]: ids } });
-      dispatch({ type: 'settingsLoaded', settings });
+      dispatchSettings(deps, settings);
       dispatch({
         type: 'notice',
         message: effect.modelIds.length
@@ -456,6 +505,40 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       dispatch({ type: 'notice', message: `${effect.runner} ${effect.enabled ? 'enabled' : 'disabled'}.` });
       return;
 
+    // The child owns the terminal for as long as it runs (`deps.login` hands it
+    // over and takes it back); the answer only reaches the transcript once the
+    // probes have been asked again, so the welcome line and picker agree.
+    case 'plannerLogin': {
+      const result = await deps.login(effect.command);
+      // The login has already run, so a reload that cannot reach the daemon must
+      // not escape to `runEffect`'s connection-refused retry: that would hand
+      // the tty to the same command a second time. Say the list is stale and
+      // leave the revival to a later /refresh.
+      let refreshed: RunnersResponse | undefined;
+      try {
+        refreshed = await loadRunners(deps);
+      } catch (err) {
+        if (!isConnectionRefused(err)) throw err;
+      }
+      // The child's exit code is not the runner's verdict: a login can print
+      // success and persist nothing, so the fresh probe decides what to claim.
+      const fresh = refreshed?.runners.find((r) => r.name === effect.label)?.auth?.state;
+      const message = fresh === 'signed-in'
+        ? `${effect.label} is signed in.`
+        : fresh === 'signed-out'
+          ? `${effect.label} still reports not logged in.${
+            result.ok ? '' : ` ${result.message ?? 'The login did not finish.'}`
+          }`
+          : result.ok
+            ? `Could not confirm that ${effect.label} is signed in.`
+            : `Could not confirm that ${effect.label} is signed in: ${result.message ?? 'the login did not finish'}`;
+      dispatch({
+        type: 'notice',
+        message: refreshed ? message : `${message} The runner list could not be refreshed: the server is not answering.`,
+      });
+      return;
+    }
+
     case 'setRunners': {
       // One at a time: each request rewrites the same stored list, so firing
       // them together would have the last write drop the others.
@@ -470,7 +553,9 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
     case 'saveSettings': {
       if (Object.keys(effect.run).length > 0) {
         const settings = await api.updateRunSettings(effect.run, effect.sessionId);
-        dispatch({ type: 'settingsLoaded', settings });
+        // Numbered when it answers: the save is newer than any read already in
+        // flight, and must not be dropped by one that started before it.
+        dispatchSettings(deps, settings, effect.sessionId);
         if (effect.sessionId) await refreshPlan(deps, effect.sessionId);
       }
       if (effect.maxParallel !== undefined) await saveMaxParallel(deps, effect.maxParallel);
@@ -531,9 +616,20 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       const { plan, goal, run } = adopted;
       dispatch({ type: 'sessionLoaded', sessionId: effect.sessionId, goal });
       dispatch(restoredChat(plan, effect.sessionId));
-      inbound.releaseSnapshot(true);
       dispatch({ type: 'planUpdated', plan, sessionId: effect.sessionId });
       if (run) dispatch({ type: 'runSnapshot', view: run, sessionId: effect.sessionId });
+      // After the turn-settling `planUpdated`, which would otherwise read the
+      // planner as free.
+      if (adopted.plannerTurnId) dispatch({ type: 'turnJoined', turnId: adopted.plannerTurnId, sessionId: effect.sessionId });
+      if (adopted.plannerCompaction) dispatch({ type: 'sessionMessage', message: adopted.plannerCompaction, sessionId: effect.sessionId });
+      // What was held is newer than what the load read, so it goes on top, in
+      // the order it was sent: a plan landed meanwhile replaces the one read,
+      // and an end heard meanwhile frees the turn or compaction just joined.
+      // All in one synchronous pass, so no key lands in between.
+      inbound.releaseSnapshot(true);
+      // The restored session has its own run settings, seeded when it opened;
+      // the file's values belong to whatever session starts next (ADR-0030).
+      await reloadSettings(deps, effect.sessionId);
       dispatch({ type: 'notice', message: `Loaded "${goal || effect.sessionId}".` });
       return;
     }
@@ -546,6 +642,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       dispatch({ type: 'sessionForked', sessionId: fork.sessionId, goal: fork.goal });
       dispatch(restoredChat(fork.plan, fork.sessionId));
       dispatch({ type: 'planUpdated', plan: fork.plan, sessionId: fork.sessionId });
+      await reloadSettings(deps, fork.sessionId);
       dispatch({ type: 'notice', message: `Forked ${effect.sessionId} into ${fork.sessionId}: you are in the fork now. /sessions to go back.` });
       return;
     }
@@ -568,28 +665,51 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       dispatch({ type: 'sessionForked', sessionId: fork.sessionId, goal: fork.goal });
       dispatch(restoredChat(fork.plan, fork.sessionId));
       dispatch({ type: 'planUpdated', plan: fork.plan, sessionId: fork.sessionId });
+      await reloadSettings(deps, fork.sessionId);
       dispatch({ type: 'inputPrefilled', text: fork.rewoundMessage, sessionId: fork.sessionId });
       dispatch({ type: 'notice', message: `Forked ${effect.sessionId} into ${fork.sessionId} from before that message: the original is kept (/sessions to go back). The message is ready to edit and resend.` });
       return;
     }
 
-    // The redrawn transcript opens with the summary entry, which is what the
-    // user gets to read — no separate notice to repeat it. The daemon also
-    // broadcast that summary; `redrawn` keeps a late socket copy of it from
-    // landing as a second, spoken turn.
+    // The paused turn opens again on the daemon and streams as any turn does;
+    // its answer is the plan it landed, or paused again on.
+    case 'retryPlannerCompaction':
+      await converse(deps, effect.sessionId, () => api.retryPlannerCompaction(effect.sessionId));
+      return;
+
     case 'cancelPlannerResend': {
       const { cancelled } = await api.cancelPlannerResend(effect.sessionId);
       dispatch({ type: 'notice', message: cancelled ? 'Resend cancelled: what waits goes with your next message.' : "Nothing waits on the planner's usage limit to be sent at a reset." });
       await refreshPlan(deps, effect.sessionId);
       return;
     }
+    // The compaction folds into the conversation on screen as its events
+    // arrive (ADR-0017), so the answer only has to carry what a lost frame
+    // would have: the plan, whose transcript holds the summary. Nothing is
+    // redrawn, which would drop the reader's place.
     case 'compactConversation': {
-      const { plan } = await api.compactConversation(effect.sessionId);
       const inbound = inboundFor(deps.api, deps.dispatch, effect.sessionId);
-      dispatch(restoredChat(plan, effect.sessionId));
-      const summary = compactionSummary(plan);
-      if (summary) inbound.redrawn(summary.content, summary.timestamp);
-      dispatch({ type: 'planUpdated', plan, sessionId: effect.sessionId });
+      const stream = api.streamPlanning(effect.sessionId, inbound.planning());
+      let plan: unknown;
+      let lost: string | null = null;
+      try {
+        await Promise.all([stream.ready, follow(deps, effect.sessionId)]);
+        const sentAt = Date.now();
+        try {
+          ({ plan } = await api.compactConversation(effect.sessionId));
+        } catch (err) {
+          if (deliveryOf(err) !== 'unknown') throw err;
+          lost = describeLoss(err, Date.now() - sentAt);
+        }
+      } finally {
+        inbound.flush();
+        stream.close();
+      }
+      if (lost !== null) {
+        await settleLostReply(deps, effect.sessionId, { opening: false, reason: lost });
+        return;
+      }
+      dispatch({ type: 'compacted', plan, sessionId: effect.sessionId });
       return;
     }
 
@@ -637,6 +757,9 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
     case 'deleteSession': {
       const { ok } = await api.deleteSession(effect.sessionId, workspace);
       await loadSessions(deps);
+      // The session is gone: a reconnect would open a socket on nothing.
+      if (ok) unfollow(deps, effect.sessionId);
+      forgetInbound(deps.api, effect.sessionId);
       if (ok) dispatch({ type: 'sessionDeleted', sessionId: effect.sessionId });
       dispatch(ok
         ? { type: 'notice', message: `Deleted ${effect.sessionId}.` }
@@ -651,6 +774,7 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
 
     case 'closeSession':
       unfollow(deps, effect.sessionId);
+      forgetInbound(deps.api, effect.sessionId);
       // Local state already moved on; a failure here must not surface as an
       // error in the new session's transcript.
       try {
@@ -658,6 +782,8 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       } catch {
         // ignore
       }
+      // Back on the welcome, which shows the file's values, not the closed session's (ADR-0030).
+      await reloadSettings(deps);
       return;
 
     case 'loadRunners':
@@ -665,12 +791,16 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       return;
 
     case 'loadScope':
-      await Promise.all([loadRunners(deps), loadSettings(deps)]);
+      await Promise.all([loadRunners(deps), loadSettings(deps, effect.sessionId), loadIsolationPreview(deps)]);
+      return;
+
+    case 'loadIsolationPreview':
+      await loadIsolationPreview(deps);
       return;
 
     case 'refresh':
-      await Promise.all([loadRunners(deps), loadSettings(deps), loadModels(deps)]);
-      if (effect.announce) dispatch({ type: 'notice', message: 'Refreshed runners, settings and models.' });
+      await Promise.all([loadRunners(deps), loadSettings(deps, effect.sessionId), loadModels(deps), loadIsolationPreview(deps)]);
+      if (effect.announce) dispatch({ type: 'notice', message: 'Refreshed runners, settings, models and repositories.' });
       return;
 
     case 'exit':
@@ -713,7 +843,7 @@ function copySelection(deps: EffectDeps, text: string): void {
   if (command) {
     try {
       (deps.pipeToClipboard ?? pipeToClipboardDefault)(command, text);
-      deps.dispatch({ type: 'notice', message: `Copied ${lines} ${lines === 1 ? 'line' : 'lines'}.` });
+      deps.dispatch({ type: 'notice', message: `Copied ${lines} ${lines === 1 ? 'line' : 'lines'}.`, holdPlace: true });
       return;
     } catch {
       // fall through to OSC 52
@@ -723,6 +853,7 @@ function copySelection(deps: EffectDeps, text: string): void {
   deps.writeTerminal(osc52(text));
   deps.dispatch({
     type: 'notice',
+    holdPlace: true,
     message: `Copied ${lines} ${lines === 1 ? 'line' : 'lines'} through the terminal: no clipboard tool here (pbcopy, xclip, xsel or wl-copy), so it only lands if your terminal supports OSC 52.`,
   });
 }
@@ -780,8 +911,30 @@ async function streamRun(
 
 // ── Following the session ────────────────────────────────────────────────────
 
-const follows = new WeakMap<object, { sessionId: string; follow: SessionFollow }>();
+const follows = new WeakMap<object, { sessionId: string; follow: SessionFollow; opened: boolean }>();
 const runStreams = new WeakMap<object, Map<string, number>>();
+/** Consecutive reconnects that failed before opening, for the backoff. */
+const followFailures = new WeakMap<object, number>();
+const followRetryTimers = new WeakMap<object, { sessionId: string; timer: ReturnType<typeof setTimeout> }>();
+/** Per client, the newest preview read it started; answers carry the number they answer. */
+const previewReads = new WeakMap<object, number>();
+/** Per client, the newest settings read it started; an older answer must not paint over a newer one (ADR-0030). */
+const settingsReads = new WeakMap<object, number>();
+
+type SettingsAnswer = Awaited<ReturnType<OrdewellApi['getSettings']>>;
+
+function nextSettingsRead(api: object): number {
+  const read = (settingsReads.get(api) ?? 0) + 1;
+  settingsReads.set(api, read);
+  return read;
+}
+
+/** One settings answer, numbered so an older read cannot replace a newer one. */
+function dispatchSettings(deps: EffectDeps, settings: Partial<SettingsAnswer>, sessionId?: string, read = nextSettingsRead(deps.api)): void {
+  deps.dispatch({ type: 'settingsLoaded', settings, read, ...(sessionId ? { sessionId } : {}) });
+}
+const FOLLOW_RETRY_MS = 500;
+const FOLLOW_RETRY_MAX_MS = 8_000;
 
 function runStreamsOf(api: object): Map<string, number> {
   let open = runStreams.get(api);
@@ -790,6 +943,35 @@ function runStreamsOf(api: object): Map<string, number> {
     runStreams.set(api, open);
   }
   return open;
+}
+
+/** Drop a pending reconnect — the api's own, or only the one for `sessionId`. Says whether one went. */
+function cancelFollowRetry(api: object, sessionId?: string): boolean {
+  const pending = followRetryTimers.get(api);
+  if (pending === undefined || (sessionId !== undefined && pending.sessionId !== sessionId)) return false;
+  clearTimeout(pending.timer);
+  followRetryTimers.delete(api);
+  return true;
+}
+
+/**
+ * Reopen a follow the daemon dropped, backing off while it stays down. The
+ * session the TUI shows must keep following it: a run started by the daemon's
+ * own timer or by another client broadcasts to sockets only, so an idle TUI
+ * that gave up would never see it. Timers are unref'd, so a pending reconnect
+ * does not hold the process open.
+ */
+function scheduleFollowRetry(deps: EffectDeps, sessionId: string, failures: number): void {
+  cancelFollowRetry(deps.api);
+  const delay = Math.min(FOLLOW_RETRY_MS * 2 ** Math.min(failures, 4), FOLLOW_RETRY_MAX_MS);
+  const timer = setTimeout(() => {
+    followRetryTimers.delete(deps.api);
+    // A send, a load or a new session reopened it meanwhile: that follow owns the session now.
+    if (follows.get(deps.api) !== undefined) return;
+    void follow(deps, sessionId, true).catch(() => {});
+  }, delay);
+  timer.unref?.();
+  followRetryTimers.set(deps.api, { sessionId, timer });
 }
 
 /**
@@ -801,26 +983,49 @@ function runStreamsOf(api: object): Map<string, number> {
  * `withExecutionStream` subscribes first; anchored to the client, like
  * `inboundFor`, so a new daemon connection starts clean.
  */
-async function follow(deps: EffectDeps, sessionId: string): Promise<void> {
+async function follow(deps: EffectDeps, sessionId: string, restored = false): Promise<void> {
   const current = follows.get(deps.api);
-  if (current?.sessionId === sessionId) return current.follow.ready;
+  if (current?.sessionId === sessionId) {
+    await current.follow.ready;
+    return;
+  }
   current?.follow.close();
+  cancelFollowRetry(deps.api);
   const inbound = inboundFor(deps.api, deps.dispatch, sessionId);
-  const entry = { sessionId, follow: deps.api.followSession(sessionId, inbound.execution()) };
+  const entry = { sessionId, follow: deps.api.followSession(sessionId, inbound.execution()), opened: false };
   follows.set(deps.api, entry);
   void entry.follow.ended.then((outcome) => {
     if (follows.get(deps.api) !== entry) return;
     follows.delete(deps.api);
-    // A run's own stream says so itself when it goes with the daemon; two notices for one loss is noise.
-    if (outcome === 'lost' && !runStreamsOf(deps.api).has(sessionId)) deps.dispatch({ type: 'followLost', sessionId });
+    if (outcome !== 'lost') return;
+    const failures = followFailures.get(deps.api) ?? 0;
+    // One notice per outage: a daemon that stays down would otherwise add a
+    // line every backoff interval. A run's own stream says so itself when it
+    // goes with the daemon; two notices for one loss is noise.
+    if (failures === 0 && !runStreamsOf(deps.api).has(sessionId)) deps.dispatch({ type: 'followLost', sessionId });
+    followFailures.set(deps.api, failures + 1);
+    scheduleFollowRetry(deps, sessionId, failures);
   });
-  await entry.follow.ready;
+  entry.opened = await entry.follow.ready;
+  if (!entry.opened) return;
+  followFailures.delete(deps.api);
+  // A turn whose reply was lost has no `planner_turn_ended` to settle it; a
+  // reconnect is the moment the session can be read back for its end.
+  if (restored) deps.dispatch({ type: 'followRestored', sessionId });
 }
 
 function unfollow(deps: EffectDeps, sessionId: string): void {
+  // A follow that was already lost leaves no entry behind, only its retry. That
+  // timer must not reopen a session the user is closing, so it is cancelled
+  // whether or not there is still a socket to close.
+  const retried = cancelFollowRetry(deps.api, sessionId);
   const current = follows.get(deps.api);
-  if (current?.sessionId !== sessionId) return;
+  if (current?.sessionId !== sessionId) {
+    if (retried) followFailures.delete(deps.api);
+    return;
+  }
   follows.delete(deps.api);
+  followFailures.delete(deps.api);
   current.follow.close();
 }
 
@@ -828,28 +1033,126 @@ function unfollow(deps: EffectDeps, sessionId: string): void {
  * One planner turn: its messages stream over the websocket while the REST call
  * is in flight, and the reply is either a question or a plan.
  */
-async function converse(deps: EffectDeps, sessionId: string, call: () => Promise<unknown>): Promise<void> {
+async function converse(deps: EffectDeps, sessionId: string, call: () => Promise<unknown>, opening = false): Promise<void> {
   const inbound = inboundFor(deps.api, deps.dispatch, sessionId);
   const stream = deps.api.streamPlanning(sessionId, inbound.planning());
+  let lost: string | null = null;
+  // A reply that arrived but could not be used or shown. The daemon took the
+  // turn and answered it, so it is its own error, not a loss: the session stays.
+  let unusable: { err: unknown; shown: boolean } | null = null;
 
   try {
     await Promise.all([stream.ready, follow(deps, sessionId)]);
-    const plan = await call();
-    inbound.flush();
-    // Speak the turn before `planUpdated` settles it: the settle is also what
-    // drains the next queued prompt, so the reply would otherwise land after
-    // the prompt that queue sent, in the wrong order. The socket usually
-    // delivered the same words; the backfill is dropped when it did.
-    for (const reply of turnReplies(plan)) inbound.backfill(reply.content, reply.timestamp, reply.runs);
-    deps.dispatch({ type: 'planUpdated', plan, sessionId });
+    const sentAt = Date.now();
+    let plan: unknown;
+    try {
+      plan = await call();
+    } catch (err) {
+      // Only a failure of the call itself can leave the turn running: one
+      // before it went out, or one the daemon answered, is the turn's own end.
+      if (err instanceof UnreadableResponseError) unusable = { err, shown: false };
+      else if (deliveryOf(err) === 'unknown') lost = describeLoss(err, Date.now() - sentAt);
+      else throw err;
+    }
+    if (lost === null && unusable === null) {
+      try {
+        inbound.flush();
+        // Speak the turn before `planUpdated` settles it: the settle is also what
+        // drains the next queued prompt, so the reply would otherwise land after
+        // the prompt that queue sent, in the wrong order. The socket usually
+        // delivered the same words; the backfill is dropped when it did.
+        for (const reply of turnReplies(plan)) inbound.backfill(reply.content, reply.timestamp, reply.runs);
+        deps.dispatch({ type: 'planUpdated', plan, sessionId });
+      } catch (err) {
+        unusable = { err, shown: true };
+      }
+    }
   } finally {
     inbound.flush();
     stream.close();
   }
+  if (unusable) {
+    const { err, shown } = unusable;
+    deps.dispatch({ ...failedFrom(shown ? new Error(`The planner's reply arrived but could not be shown: ${explain(err)}`) : err), turn: true, sessionId });
+  } else if (lost !== null) {
+    await settleLostReply(deps, sessionId, { opening, reason: lost });
+  }
+  // A turn's gate can have re-probed a signed-out planner and found it signed
+  // in outside the TUI; the welcome line and picker still hold the old verdict.
+  // A reload that fails is not the turn's failure.
+  try {
+    await loadRunners(deps);
+  } catch {
+    // The turn's own outcome stands; the next refresh asks again.
+  }
+}
+
+/**
+ * Why a request that went out got no answer, in a few words and without the
+ * request: the error's name or code, how long it waited and, for a timeout, the
+ * bound it hit — when the request had one. What the user needs to tell a
+ * configured bound from a reset, and a turn's own end from either.
+ */
+function describeLoss(err: unknown, elapsedMs: number): string {
+  const waited = `after ${formatElapsed(elapsedMs)}`;
+  if (err instanceof RequestTimeoutError) {
+    if (err.timeoutMs === undefined) return `timed out ${waited}, no bound configured`;
+    const bound = `${formatElapsed(err.timeoutMs)}${err.viaEnv ? ' from ORDEWELL_HTTP_TIMEOUT_MS' : ''}`;
+    return `timed out ${waited}, limit ${bound}`;
+  }
+  const code = (err as { code?: unknown } | null)?.code;
+  const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').slice(0, 80);
+  const named = typeof code === 'string' && !message.includes(code) ? `${code}: ${message}` : message;
+  return `${named} ${waited}`;
+}
+
+function formatElapsed(ms: number): string {
+  return ms < 10_000 ? `${Math.round(ms)} ms` : `${Math.round(ms / 1000)} s`;
+}
+
+/**
+ * The reply to a planner turn's call never came back, so whether the turn is
+ * running, finished or never arrived is the daemon's to say. The session and
+ * the queue stay as they are, nothing is sent again, and the session is read
+ * back to show what the daemon holds. Cleared only when the daemon holds none.
+ */
+async function settleLostReply(deps: EffectDeps, sessionId: string, how: { opening: boolean; reason: string }): Promise<void> {
+  deps.dispatch({ type: 'turnLost', sessionId, reason: how.reason });
+  await readBackSession(deps, sessionId, { opening: how.opening, turnEnded: false, reason: how.reason });
+}
+
+/**
+ * Adopting a live session returns the daemon's current state without
+ * disturbing it. `turnEnded` is whether the stream has already said the turn is
+ * over: only then is a failure to read back one that ends it.
+ */
+async function readBackSession(deps: EffectDeps, sessionId: string, how: { opening: boolean; turnEnded: boolean; reason?: string }): Promise<void> {
+  try {
+    const { plan, plannerTurnId, plannerCompaction } = await deps.api.adoptSession(sessionId, deps.workspace);
+    deps.dispatch({
+      type: 'turnReconciled', plan, plannerTurnId, ...(plannerCompaction ? { plannerCompaction } : {}),
+      chat: restoredChat(plan, sessionId), sessionId, ...(how.reason ? { reason: how.reason } : {}),
+    });
+    // A daemon that had dropped the session re-adopted it from the file: its
+    // run settings may be the file's now, not the copy this view held (ADR-0030).
+    await reloadSettings(deps, sessionId);
+  } catch (err) {
+    if (err instanceof DaemonError && err.code === 'session_not_found' && how.opening) {
+      unfollow(deps, sessionId);
+      deps.dispatch({ type: 'sessionCleared', sessionId });
+      deps.dispatch({ type: 'failed', message: 'The reply was lost and the server holds no session for it. Send your goal again to start over.', code: err.code, turn: true, sessionId });
+      return;
+    }
+    if (how.turnEnded || (err instanceof DaemonError && err.code === 'session_not_found')) {
+      deps.dispatch({ ...failedFrom(err), turn: true, sessionId });
+      return;
+    }
+    deps.dispatch({ type: 'notice', level: 'error', message: `Could not read the session back from the server: ${explain(err)}`, sessionId });
+  }
 }
 
 /** The conversation a saved plan reopens with: its transcript, research log and token line. */
-function restoredChat(plan: unknown, sessionId: string): Action {
+function restoredChat(plan: unknown, sessionId: string): ChatRestored {
   const saved = plan as Pick<SurfacePlan, 'conversationHistory' | 'researchLog' | 'plannerUsage' | 'pendingTurns'> | null;
   return {
     type: 'chatRestored',
@@ -882,13 +1185,6 @@ function turnReplies(plan: unknown): Array<Pick<SerializedConversationMessage, '
   return replies;
 }
 
-/** The summary a compaction just made the transcript's first entry, if this plan came from one. */
-function compactionSummary(plan: unknown): { content: string; timestamp?: string } | null {
-  const history = (plan as Pick<SurfacePlan, 'conversationHistory'> | null)?.conversationHistory ?? [];
-  const entry = history.find((message) => message.kind === 'compaction');
-  return entry ? { content: entry.content, ...(entry.timestamp ? { timestamp: entry.timestamp } : {}) } : null;
-}
-
 async function refreshPlan(deps: EffectDeps, sessionId: string): Promise<void> {
   const { plan, run } = await deps.api.getSession(sessionId, deps.workspace);
   // Not `planUpdated`: that is a turn's end, and a refresh can land in the middle of one.
@@ -913,15 +1209,52 @@ async function loadSessions(deps: EffectDeps): Promise<void> {
   deps.dispatch({ type: 'sessionsLoaded', sessions: list });
 }
 
-async function loadRunners(deps: EffectDeps): Promise<void> {
+async function loadRunners(deps: EffectDeps): Promise<RunnersResponse> {
   const state = await deps.api.getRunners();
   deps.dispatch({
     type: 'runnersLoaded',
-    runners: (state.runners ?? []).map((r) => ({ id: r.id, name: r.name, enabled: r.enabled })),
+    // The daemon's own rows, auth included: re-typing the bag here is how the
+    // login verdict used to get dropped before any surface could flag it.
+    runners: state.runners ?? [],
     orchestratorModel: state.orchestratorModel,
   });
+  return state;
 }
 
-async function loadSettings(deps: EffectDeps): Promise<void> {
-  deps.dispatch({ type: 'settingsLoaded', settings: await deps.api.getSettings() });
+async function loadSettings(deps: EffectDeps, sessionId?: string): Promise<void> {
+  const read = nextSettingsRead(deps.api);
+  const settings = await deps.api.getSettings(sessionId);
+  dispatchSettings(deps, settings, sessionId, read);
+}
+
+/**
+ * A lifecycle's own settings read. The session already opened, adopted or
+ * closed, so a read that fails must not undo that: a later refresh asks again.
+ */
+async function reloadSettings(deps: EffectDeps, sessionId?: string): Promise<void> {
+  try {
+    await loadSettings(deps, sessionId);
+  } catch {
+    // The session itself is the operation that mattered; the panel keeps what it has.
+  }
+}
+
+/**
+ * Reads what the welcome says about repositories and branches. Reads can
+ * overlap (launch, a settings change, a refresh); each gets a number the
+ * reducer compares, so a slower older answer cannot replace a newer one.
+ * A refused connection is left to the caller's revive-and-retry; any other
+ * failure is a `failed` preview, never a claim that there is no repository.
+ */
+async function loadIsolationPreview(deps: EffectDeps): Promise<void> {
+  const read = (previewReads.get(deps.api) ?? 0) + 1;
+  previewReads.set(deps.api, read);
+  deps.dispatch({ type: 'isolationPreviewLoading', read });
+  try {
+    const { preview } = await deps.api.getIsolationPreview(deps.workspace);
+    deps.dispatch({ type: 'isolationPreviewLoaded', preview, read });
+  } catch (err) {
+    if (isConnectionRefused(err)) throw err;
+    deps.dispatch({ type: 'isolationPreviewFailed', message: explain(err), read });
+  }
 }

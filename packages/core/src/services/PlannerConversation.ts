@@ -2,26 +2,30 @@ import { v4 as uuidv4 } from 'uuid';
 import type { ConversationRequest, ConversationTurn, IAiService, TurnRun } from './AiService';
 import { reEmitPlanPrompt, repairLoop, resubmitEditPrompt, resubmitPlanPrompt, taskOpsRejectedPrompt } from './PlanRepair';
 import { renderTaskQueryAnswer, taskQuerySignature, TASK_QUERY_ANSWER_OR_OPS, TASK_QUERY_REMINDER, TASK_READ_TOOLS_REMINDER, type LiveOutputLookup, type TaskQuery, type TaskQueryCatalog } from './TaskQuery';
-import { taskOpsProtocol, type ApplyTaskOpsResult, type TaskOp } from './TaskOps';
+import { taskOpsProtocol, type TaskOp } from './TaskOps';
 import { readOnlyMode, readOnlyRunners } from './ModeResolver';
 import type { PlannerTurnOutcome, SessionBroadcaster, SessionNotice } from './SessionMessage';
 import { TurnStream } from './replyStream';
 import type { ForkedDialogue } from './conversationFork';
-import { condensedNotice, extractSummary, keptTail, summaryRequest } from './conversationSummary';
-import type { ConversationMessage, LegacyPlanState, ReplyRun, ResearchLogEntry, ResearchProgress, RunnerId, SkillLoad, Task } from '../models/Task';
+import { compactionCut, condensedNotice, contextFloor, extractSummary, modelContext, summaryRequest } from './conversationSummary';
+import type { ContextCheckpoint, ConversationMessage, LegacyPlanState, PlannerCompactionOutcome, PlannerContextPause, ReplyRun, ResearchLogEntry, ResearchProgress, RunnerId, SkillLoad, Task } from '../models/Task';
 import { flattenTasksWithParents, isUserMessage } from '../models/Task';
 import type { ExecutionActor, ExecutionRecord } from '../models/Execution';
 import { plannerMessage, plannerTranscript, skillLoadLabel, type SkillInvocation } from './skillInvocation';
 import { skillLoadNotice, surfaceStep } from '../conversation/records';
-import { checkOpSkills, checkPlanSkills, type SkillLookup } from './taskSkills';
-import { heldEditTasks } from './heldEdit';
+import { planChangeErrorText, type PassedChange, type PlanChangeCheck, type PlanChangeError } from './PlanChangeCheck';
+import { PLANNER_TURN_ENDED } from './plannerTools';
 import { classifyRunnerStop, type TurnFailure } from './runnerExit';
 import type { PlannerLimit } from './PlannerResend';
 import type { AssignmentScope } from './AssignmentScope';
 import { PlannerBriefing, type TurnBriefing } from './PlannerBriefing';
+import { PromptBlocks, type PlanRow, type PlanView, type TurnBlocks } from './PromptBlocks';
 import { joinRuns, noteRun, writtenOver as writtenOverRuns } from './settleReply';
 import type { StartWait, StartWaitKind } from './readiness';
 import { SubagentRuns } from './SubagentRuns';
+import type { ConversationCompactionHost, LandedHistory } from './budgetedChat';
+import { ContextSummaryError } from './contextSummary';
+import { PlannerContextExhaustedError } from './plannerContextBudget';
 
 /**
  * Per-runner model cap for the always-on catalog block. Generous enough that
@@ -33,6 +37,18 @@ const CATALOG_MODEL_CAP = 100;
 /** Stands in for the catalog block where the planner pulls the catalog itself (ADR-0022, L3). */
 const PLANNER_TOOLS_REMINDER =
   'Runners, models and modes may have changed since you last read them: call list_runners and list_models just before submit_plan.';
+
+/**
+ * A planner message must never open with the user's text. Claude Code reads a
+ * leading `/name` as its own slash command, and before the plan has tasks a
+ * later turn carries neither the catalog nor a plan block to lead with
+ * (ADR-0012 T10), so an unknown `/clear` would run instead of being answered.
+ * The marker keeps the text intact and the command from being read as one.
+ */
+function plannerInput(parts: readonly (string | undefined)[]): string {
+  const message = parts.filter((part): part is string => Boolean(part)).join('\n\n');
+  return message.startsWith('/') ? `The user's message follows:\n\n${message}` : message;
+}
 
 /**
  * Reads a planner gets per user turn before every answer also carries an
@@ -123,15 +139,13 @@ export class PlannerTurn {
 type TurnAdmission = { refuseAs: string } | 'supersede';
 
 /**
- * A backend's turn, or the turn a submission made of it. `said` is then the
- * reply's prose, which the user reads beside the plan or edit it carried; an
- * envelope reply's text is the envelope itself, and is never shown — what it
- * said is the narration before its tool calls.
+ * A turn with every read already drained — what the settle path actually
+ * commits. An envelope reply's text is the envelope itself, and is never
+ * shown: what it said is the narration before its tool calls.
  */
-type ClaimedTurn = ConversationTurn & { said?: string };
-/** A turn with every read already drained — what the settle path actually commits. */
-type SettleableTurn = Exclude<ClaimedTurn, { kind: 'task_query' }>;
-type CommitTurn = Exclude<SettleableTurn, { kind: 'task_ops' }>;
+type SettleableTurn = Exclude<ConversationTurn, { kind: 'task_query' }>;
+/** A turn that changes nothing in the plan: what it said is all that lands. */
+type CommitTurn = Exclude<SettleableTurn, { kind: 'task_ops' | 'plan' }>;
 
 /** {@link writtenOverRuns} for a turn that reported runs; one that reported none carries none. */
 function writtenOver(runs: readonly TurnRun[] | undefined, text: string): Pick<ConversationTurn, 'runs'> {
@@ -184,15 +198,27 @@ interface UserTurn {
   wakeUp?: WakeUpTurn;
   /** What the turn tells the planner besides its inputs; told only if the turn lands an answer the planner gave. */
   briefing?: TurnBriefing;
+  /** The catalog and plan blocks it sends, held by the live context once it lands normally. */
+  blocks?: TurnBlocks;
+  /** A corrective retry was sent in it: the planner misread something, so its next turn is sent the whole plan again (ADR-0012 T10). */
+  repaired?: boolean;
   /** Its message was force sent. */
   forced?: boolean;
-  /** Handed in since the backend last answered; see {@link PlannerConversation.submit}. */
-  submitted?: PlannerSubmission;
+  /**
+   * The pause it retries, and whether it carries on the live context's held
+   * input — whose calls the chat still holds — or starts again from the
+   * transcript, which only a turn whose calls changed nothing may do.
+   */
+  recovery?: { pause: PlannerContextPause; live: boolean };
+  /** A planner tool committed a change in it (see {@link PlannerConversation.commitFromTool}): what it later says lands beside that, never over it. */
+  committed?: boolean;
+  /** What the turn told the planner counts as heard: once, by the first landing that carries an answer the planner gave. */
+  heard?: boolean;
+  /** The id each handle names that an edit committed in it gave, for a later call of the turn to name the task by (ADR-0022 P2). */
+  handles: Map<string, string>;
   writes: TurnWrites;
-  /** See {@link ReplyOptions.onCommit}. */
+  /** See {@link ReplyOptions.onCommit}; run once, by the first mutation that lands any of the turn. */
   onCommit?: () => void;
-  /** Surfaces were last told the turn holds an edit, so they are told when it no longer does. */
-  heldShown?: boolean;
   /** Its end was announced when it was abandoned; it says nothing more. */
   ended?: boolean;
   /**
@@ -238,10 +264,15 @@ interface Landed {
 /** A read made through a planner tool: refused once the turn's budget is gone, else answered, told to land when the budget asks it to. */
 export type ToolRead<T> = { status: 'refused' } | { status: 'answered'; value: T; landNow: boolean };
 
-/** A plan or task edit handed to the open turn over a channel other than its reply (ADR-0022). */
+/** A plan or task edit a planner tool hands the open turn, which commits it as the call answers (ADR-0022 P2). */
 export type PlannerSubmission =
   | { kind: 'plan'; tasks: Task[] }
   | { kind: 'task_ops'; ops: TaskOp[] };
+
+/** What a planner tool's change came to: committed, with what passed, or refused with why and nothing changed. */
+export type ToolCommit =
+  | { ok: true; passed: PassedChange; before: readonly Task[] }
+  | { ok: false; errors: PlanChangeError[]; runners?: RunnerId[] };
 
 interface SettledTurn {
   plan: LegacyPlanState;
@@ -289,15 +320,14 @@ export interface PlannerConversationHost {
   /** `turnId`: the planner turn whose commit this is, when one is. */
   broadcastPlan(turnId?: string): void;
   /**
-   * Validate a batch against live state; nothing of it is applied. A
-   * supervisor's batch that trips the oscillation guard is refused, and the
-   * user is told of the trip once, in the supervisor's voice (ADR-0029): a note
+   * The one check a plan change meets, over live state: a whole plan or a
+   * batch as it lands, from a tool call or a reply. A supervisor's batch that
+   * trips the oscillation guard is refused, and the user is told of the trip
+   * once, in the supervisor's voice (ADR-0029): a note
    * saved as it is written, like any of Ordewell's own, which a turn in flight
    * holds nothing in.
    */
-  validateOps(ops: TaskOp[]): ApplyTaskOpsResult;
-  /** The workspace's skill catalog under its repo group's layout, which the skills a plan or edit attaches are checked against. */
-  taskSkills(): SkillLookup;
+  planChanges: Pick<PlanChangeCheck, 'check'>;
   /** Tell the user something the transcript does not carry. */
   notice(level: SessionNotice['level'], message: string): void;
   /** Load planner-produced tasks: an edit keeps run state, a commit starts over. Returns how many landed. */
@@ -309,8 +339,14 @@ export interface PlannerConversationHost {
   turnClaiming?(): void;
   /** A planner turn let the conversation go, so the next one may take it. */
   turnReleased?(): void;
-  /** A turn ended on the planner's usage limit, which it reported as `said`: what is sent again, and when. */
-  usageLimit(said: TurnFailure): PlannerLimit;
+  /**
+   * A turn ended on the planner's usage limit, which it reported as `said`:
+   * what is sent again, and when. `answered`: a planner tool's change in the
+   * turn already took its inputs, so none is sent again (ADR-0022 P2).
+   */
+  usageLimit(said: TurnFailure, answered: boolean): PlannerLimit;
+  /** A turn ended with the planner paused on its context: arm the pause on the inputs it took, saved with the failure it records. */
+  contextPaused(details: Pick<PlannerContextPause, 'model' | 'reason' | 'done' | 'doneTruncated'>): PlannerContextPause;
 }
 
 /**
@@ -373,13 +409,63 @@ export class PlannerUsageLimitError extends PlannerTurnFailedError {
   readonly resendAt: Date | null;
   /** Why nothing is sent again on its own, when nothing is. */
   readonly held?: string;
+  /** A planner tool's change in the turn already answered its inputs: none waits to be sent again. */
+  readonly answered: boolean;
 
   constructor(limit: PlannerLimit) {
     super(limit.text);
     this.name = 'PlannerUsageLimitError';
     this.resendAt = limit.resendAt;
     if (limit.held) this.held = limit.held;
+    this.answered = limit.answered === true;
   }
+}
+
+/**
+ * A planner turn ended with the planner paused on its context (ADR-0002): the
+ * call it was making could not be brought inside its model's window. Nothing
+ * of it lands; the transcript keeps why, and its inputs wait for the user's
+ * Retry compaction (`pause`).
+ */
+export class PlannerContextPausedError extends PlannerTurnFailedError {
+  constructor(readonly pause: PlannerContextPause, options?: ErrorOptions) {
+    super(pause.reason);
+    this.name = 'PlannerContextPausedError';
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}
+
+/** The calls a pause keeps, to show the user what already ran: a bound, so a long turn saves no second copy of itself. */
+const PAUSE_DONE_LIMIT = 40;
+
+/** How many of the calls that ran a refused retry names, each cut to one short line. */
+const REFUSAL_LISTED = 5;
+const REFUSAL_LINE_CHARS = 120;
+
+/**
+ * Why a paused turn whose calls changed something is not started again from
+ * the transcript, and the way on. Such a turn's live context is the only
+ * record the planner has of those calls: a replay would ask a model that no
+ * longer sees them, and nothing but its compliance would keep one from running
+ * twice (ADR-0002).
+ */
+function unsafeReplay(pause: PlannerContextPause, liveContext: boolean): string {
+  const done = pause.done ?? [];
+  const more = done.length - Math.min(done.length, REFUSAL_LISTED);
+  const listed = [
+    ...done.slice(0, REFUSAL_LISTED).map((line) => (line.length > REFUSAL_LINE_CHARS ? `${line.slice(0, REFUSAL_LINE_CHARS - 1)}…` : line)),
+    ...(more > 0 || pause.doneTruncated ? [`- (${pause.doneTruncated ? 'more' : `${more} more`})`] : []),
+  ];
+  const why = liveContext ? 'it cannot be continued where it paused' : 'its live context is gone';
+  // The live context still holds the turn: a window to compact it against is what a retry on it may lack.
+  const window = liveContext
+    ? ' If the planner model is one whose window Ordewell does not know, switch it to one it knows: Retry compaction can then continue the turn where it paused.'
+    : '';
+  return [
+    `The paused turn already ran calls that changed something, and ${why}: starting it again from the conversation could make one of them twice, so Ordewell keeps the planner paused. Stop it to drop the turn, then tell the planner what already ran and where to pick up.${window}`,
+    'Already ran:',
+    ...listed,
+  ].join('\n');
 }
 
 /**
@@ -432,7 +518,7 @@ export interface RewoundDialogue {
 /** What a compaction left behind. */
 export interface ConversationCompaction {
   summary: string;
-  /** Transcript entries kept verbatim after the summary entry. */
+  /** Transcript entries the planner's context keeps verbatim after the summary. */
   keptMessages: number;
 }
 
@@ -450,6 +536,8 @@ export interface ReplyOptions {
   wakeUp?: WakeUpTurn;
   /** The user's message was force sent: the turn replaces the one it stopped (ADR-0023). */
   forced?: boolean;
+  /** The turn retries one the planner paused on its context, on the same inputs (ADR-0002). */
+  recovery?: PlannerContextPause;
 }
 
 /** Refused while tasks run: a whole plan replaces the run's, and only an edit can leave running work as it is. */
@@ -470,14 +558,27 @@ const WHOLE_PLAN_WHILE_RUNNING =
  *
  * The live model context (a vendor service's message list, a harness planner's
  * process and native session id) is disposable: {@link reset} drops it and the
- * next turn is replayed from the transcript. That is what lets the transcript
- * be replaced by a summary, or copied into a fork, without the model's memory
- * drifting from it.
+ * next turn is replayed from the transcript — as {@link modelContext} projects
+ * it past the newest compaction. That is what lets a summary stand in for the
+ * earlier messages, or the transcript be copied into a fork, without the
+ * model's memory drifting from it.
  */
 export class PlannerConversation {
   private readonly briefing: PlannerBriefing;
+  private readonly blocks: PromptBlocks;
   private live: PlannerTurn | null = null;
   private openTurn: UserTurn | null = null;
+  /**
+   * What an API planner's chat condenses its context through during a turn
+   * (ADR-0002): the open turn, the history that landed before it, and the
+   * checkpoint a summary of that history becomes.
+   */
+  private readonly compaction: ConversationCompactionHost = {
+    turnId: () => this.openTurn?.stream.turnId,
+    landed: () => this.landedHistory(),
+    checkpoint: (content, keptFrom, id) => this.commitAutoCheckpoint(content, keptFrom, id),
+    planLines: () => this.planRows()?.map(({ line }) => line) ?? null,
+  };
 
   constructor(private readonly host: PlannerConversationHost) {
     this.briefing = new PlannerBriefing({
@@ -485,6 +586,11 @@ export class PlannerConversation {
       scope: () => host.assignmentScope(),
       tasks: () => host.tasks(),
       plannerTools: () => host.aiService().plannerToolsAttached?.() ?? false,
+    });
+    this.blocks = new PromptBlocks({
+      catalog: () => this.catalogBlock(),
+      plan: () => this.planView(),
+      compactions: () => host.aiService().compactions?.() ?? 0,
     });
   }
 
@@ -525,7 +631,7 @@ export class PlannerConversation {
 
   /**
    * Let the live turn go. A user turn's end is announced now, and it says
-   * nothing after — not its stream, not its held edit, not its end again —
+   * nothing after — not its stream, not its end again —
    * since it may settle at any time later: the API services restart nothing,
    * and a hung call settles whenever it settles, while the next turn runs.
    */
@@ -537,7 +643,6 @@ export class PlannerConversation {
     const open = this.openTurn;
     if (open?.planner !== turn) return;
     this.openTurn = null;
-    this.clearHeld(open);
     open.stream.mute();
     open.ended = true;
     this.host.broadcast({ type: 'planner_turn_ended', turnId: open.stream.turnId, outcome });
@@ -618,50 +723,65 @@ export class PlannerConversation {
   }
 
   /**
-   * Hand the open turn a plan (already validated) or a task edit. The turn
-   * settles with it exactly as with the same plan or ops parsed out of its
-   * reply, and it wins over any envelope that reply carries. A later
-   * submission replaces an earlier one. False when no user turn is open.
+   * Commit a plan or task edit a planner tool made in the open turn `turnId`,
+   * now, as the call answers (ADR-0022 P2): held to the one check as it lands,
+   * then adopted, saved and broadcast in the tick that check ran in, so two
+   * calls never commit against the same plan. Each call is a batch of its
+   * own, applied whole or not at all, against the plan as it stands; the
+   * reply that ends the turn lands beside it and never over it. The first
+   * change lands the turn's inputs with it, so a turn that fails or stops
+   * after it keeps both. Refused, changing nothing, when the turn ended or
+   * moved on while the change waited on its check.
    */
-  submit(submission: PlannerSubmission): boolean {
+  async commitFromTool(change: PlannerSubmission, turnId: string | undefined): Promise<ToolCommit> {
+    const ended: ToolCommit = { ok: false, errors: [{ field: 'tasks', message: PLANNER_TURN_ENDED }] };
+    const turn = this.toolTurn(turnId);
+    if (!turn) return ended;
+    const refused = this.toolRefusal(turn, change.kind);
+    if (refused) return { ok: false, errors: [{ field: 'tasks', message: refused }] };
+    let landedIn: UserTurn | undefined;
+    let refusedAt: string | undefined;
+    let before: readonly Task[] = [];
+    const checked = await this.host.planChanges.check(change.kind === 'plan' ? { kind: 'plan', tasks: change.tasks } : { kind: 'ops', ops: change.ops }, 'land', (passed) => {
+      // The skill check waits on git, which a stop, rewind or session switch may outlast.
+      if (this.toolTurn(turnId) !== turn) return;
+      refusedAt = this.toolRefusal(turn, change.kind);
+      if (refusedAt) return;
+      landedIn = turn;
+      before = this.host.tasks();
+      turn.committed = true;
+      for (const [name, id] of passed.handles) turn.handles.set(name, id);
+      this.landChange(turn, change.kind, passed);
+    });
+    if (!landedIn && this.toolTurn(turnId) !== turn) return ended;
+    if (refusedAt) return { ok: false, errors: [{ field: 'tasks', message: refusedAt }] };
+    if (!checked.ok) return { ok: false, errors: checked.errors, runners: checked.runners };
+    return { ok: true, passed: checked, before };
+  }
+
+  /** The turn a tool call made in `turnId` may still change the plan in: open, not stopped, and on the plan it answers. */
+  private toolTurn(turnId: string | undefined): UserTurn | undefined {
     const turn = this.openTurn;
-    if (!turn) return false;
-    turn.submitted = submission;
-    this.showHeld(turn, submission);
-    return true;
+    if (!turn || turnId === undefined || turn.stream.turnId !== turnId) return undefined;
+    if (turn.signal.aborted || turn.planner.abandoned || this.host.plan() !== turn.plan) return undefined;
+    return turn;
   }
 
-  /**
-   * Tell surfaces what the turn's edit would leave, from the same applier that
-   * lands it, so an edit that would not apply shows nothing. It stays shown
-   * from the moment it is handed in until it lands, is refused, or the turn
-   * ends: the backend's reply claims it, but it has not landed by then.
-   */
-  private showHeld(turn: UserTurn, held: PlannerSubmission | null): void {
-    const result = held?.kind === 'task_ops' ? this.host.validateOps(held.ops) : undefined;
-    if (!result?.ok) {
-      this.clearHeld(turn);
-      return;
-    }
-    turn.heldShown = true;
-    this.host.broadcast({ type: 'plan_edit_held', held: { turnId: turn.stream.turnId, tasks: heldEditTasks(this.host.tasks(), result.tasks) } });
+  /** Why the turn may not make this change now: its wake-up level, or a whole plan while tasks run. Asked at the call and again as it commits. */
+  private toolRefusal(turn: UserTurn, kind: PlannerSubmission['kind']): string | undefined {
+    const level = turn.wakeUp?.refused(kind === 'plan' ? 'plan' : 'edit');
+    if (level) return level;
+    return kind === 'plan' && this.host.isExecuting() ? WHOLE_PLAN_WHILE_RUNNING : undefined;
   }
 
-  private clearHeld(turn: UserTurn): void {
-    if (!turn.heldShown) return;
-    turn.heldShown = false;
-    this.host.broadcast({ type: 'plan_edit_held', held: null });
+  /** The task an edit committed in the open turn named by this handle; undefined when none did. */
+  turnHandle(name: string): string | undefined {
+    return this.openTurn?.handles.get(name);
   }
 
-  /**
-   * The edit the open turn already holds, for a further edit in the same reply
-   * to join rather than replace. Empty when it holds nothing; null when it holds
-   * a whole plan, which an edit cannot be layered on.
-   */
-  pendingOps(): TaskOp[] | null {
-    const held = this.openTurn?.submitted;
-    if (!held) return [];
-    return held.kind === 'task_ops' ? held.ops : null;
+  /** The handles the open turn's committed edits gave, for its next edit to name their tasks by. */
+  turnHandles(): ReadonlyMap<string, string> {
+    return this.openTurn?.handles ?? new Map();
   }
 
   /**
@@ -697,12 +817,6 @@ export class PlannerConversation {
     if (plan) plan.conversationHistory = [...(plan.conversationHistory ?? []), ...entries];
   }
 
-  /** Swap the whole transcript. The live context no longer matches it, so pair with {@link reset}. */
-  replace(messages: readonly ConversationMessage[]): void {
-    const plan = this.host.plan();
-    if (plan) plan.conversationHistory = [...messages];
-  }
-
   /**
    * The plan scope this conversation served is gone: drop the live model
    * context, and what the planner was told outside the transcript in it (see
@@ -711,6 +825,7 @@ export class PlannerConversation {
    */
   reset(): void {
     this.dropContext();
+    this.blocks.restart();
     this.briefing.clear();
   }
 
@@ -722,14 +837,15 @@ export class PlannerConversation {
   /** Drop the live model context alone: the next turn replays from the transcript. */
   private dropContext(): void {
     this.host.aiService().reset();
+    this.blocks.forget();
   }
 
   /**
    * The user messages a rewind may land before. The opening message is the
    * goal: cutting it leaves a conversation about nothing, which is a new
-   * session, not a rewind. After a compaction the summary entry, always
-   * first, plays the goal's part: what it replaced is gone, so a rewind stops
-   * at it.
+   * session, not a rewind. A compaction keeps what it condensed, so a rewind
+   * reaches past it; only a legacy summary, first in the transcript, plays
+   * the goal's part, since what it replaced is gone.
    */
   rewindTargets(): RewindTarget[] {
     // An opening that hit the planner's usage limit left its failure ahead of the goal.
@@ -743,15 +859,16 @@ export class PlannerConversation {
   }
 
   /**
-   * Replace the transcript with a summary of it, keeping the last two
-   * exchanges as they were, and drop the live context so the next message
-   * replays from the shorter record.
+   * Condense the planner's context: a summary stands in for all but the last
+   * two exchanges from now on, the transcript keeping every message, and the
+   * live context is dropped so the next message replays the shorter
+   * projection ({@link modelContext}).
    *
-   * The summary is one hidden turn through whichever planner is configured —
-   * on the live context when it still matches, replayed from the transcript
-   * when not — so the compaction is the same for a vendor API and a harness
-   * agent. Whatever the turn emits besides the summary is discarded, ops
-   * included: it condenses the conversation, never the plan. Nothing is
+   * The summary is of the live context when it still matches, replayed from
+   * the transcript when not. An API planner writes it in calls that offer no
+   * tools, as its automatic compaction does; a harness planner in one hidden
+   * turn of its agent, whatever else that turn emits — ops included — being
+   * discarded: it condenses the conversation, never the plan. Nothing is
    * written until the summary is in hand, so a failed or stopped turn leaves
    * the transcript exactly as it was.
    */
@@ -759,40 +876,99 @@ export class PlannerConversation {
     this.assertIdle('condense the conversation');
     const plan = this.host.plan();
     if (!plan) throw new ConversationEditError('No planning conversation to condense');
-    if (!keptTail(this.transcript)) {
-      throw new ConversationEditError('The conversation is too short to condense: it takes more than two exchanges before a summary saves anything.');
+    const cut = compactionCut(this.transcript);
+    if (cut === null) {
+      throw new ConversationEditError('The conversation is too short to condense: it takes more than two exchanges since the last summary before a new one saves anything.');
     }
     // A planner turn, so a message sent while it runs is refused: the reply
     // would share the summary turn's live context, which the compaction resets
     // as it lands, and its message would be condensed away or left dangling.
     const { turn, release } = this.claim({ refuseAs: 'condense the conversation' }, signal);
+    // Surfaces see it run and end under the id its checkpoint will carry (ADR-0017).
+    const compaction = { id: uuidv4(), origin: 'ordewell', trigger: 'manual' } as const;
+    this.host.onProgress({ type: 'compaction', compaction: { phase: 'started', ...compaction, at: new Date().toISOString() } });
+    let outcome: PlannerCompactionOutcome = 'failed';
     try {
       const summary = await this.summarize(turn.signal);
-      const tail = keptTail(this.transcript);
-      if (this.host.plan() !== plan || !tail) throw new ConversationEditError('The conversation changed while it was being condensed: nothing was replaced.');
-      const now = new Date().toISOString();
-      const content = condensedNotice(summary);
-      this.host.mutate(() => {
-        plan.conversationHistory = [{ role: 'assistant', content, timestamp: now, kind: 'compaction' }, ...tail];
-        return true;
-      }, () => {
-        this.host.broadcast({ type: 'planner_message', content, timestamp: now });
-        this.host.broadcastPlan();
-      });
-      return { summary, keptMessages: tail.length };
+      if (this.host.plan() !== plan || compactionCut(this.transcript) !== cut) throw new ConversationEditError('The conversation changed while it was being condensed: nothing was condensed.');
+      this.commitCheckpoint(condensedNotice(summary), cut, 'manual', compaction.id);
+      outcome = 'condensed';
+      return { summary, keptMessages: modelContext(this.transcript).length - 1 };
+    } catch (err) {
+      const surfaced = interrupted(turn, err);
+      if (surfaced instanceof PlannerTurnStoppedError || surfaced instanceof PlannerTurnDiscardedError) outcome = 'stopped';
+      throw surfaced;
     } finally {
       // Success and failure alike: the live context either holds the
       // conversation this replaced or a summary exchange nobody kept. An
       // abandoned compaction's context was dropped by whatever abandoned it,
       // and a reset now would cut off the turn that has the backend since.
       if (!turn.abandoned) this.dropContext();
+      this.host.onProgress({ type: 'compaction', compaction: { phase: 'ended', ...compaction, outcome, at: new Date().toISOString() } });
       release();
     }
   }
 
+  /**
+   * Append a summary checkpoint whose context resumes verbatim at `keptFrom`,
+   * in a save of its own — so a turn that holds inputs and later fails, stops
+   * or is abandoned leaves it valid. Its cut is never before the newest
+   * checkpoint's, nor past an input the open turn holds: that lands at its
+   * held position, at or after the cut, and is replayed (ADR-0002).
+   */
+  private commitCheckpoint(content: string, keptFrom: number, trigger: ContextCheckpoint['trigger'], id: string): void {
+    const held = this.openTurn?.writes.entries.map(({ at }) => at) ?? [];
+    if (keptFrom < contextFloor(this.transcript) || keptFrom > Math.min(this.transcript.length, ...held)) {
+      throw new Error(`A compaction cannot cut the conversation at ${keptFrom}: that is behind its last summary or past an input not yet answered.`);
+    }
+    const timestamp = new Date().toISOString();
+    const entry: ConversationMessage = { role: 'assistant', content, timestamp, kind: 'compaction', checkpoint: { id, keptFrom, trigger } };
+    this.host.mutate(() => {
+      this.appendEntries([entry]);
+      return true;
+    }, () => this.host.broadcastPlan());
+  }
+
+  /**
+   * A checkpoint an API planner's chat wrote of the history that landed before
+   * the open turn, committed only while that turn is still the one open and
+   * still answering this plan: a summary that comes back after the turn was
+   * stopped, abandoned or superseded writes nothing.
+   */
+  private commitAutoCheckpoint(content: string, keptFrom: number, id: string): void {
+    const turn = this.openTurn;
+    if (!turn || turn.signal.aborted || turn.planner.abandoned || this.host.plan() !== turn.plan) {
+      throw new PlannerTurnDiscardedError();
+    }
+    this.commitCheckpoint(content, keptFrom, 'auto', id);
+  }
+
+  /**
+   * What landed before the open turn, from the last checkpoint's cut up to
+   * where the turn's inputs will land, split at each user message — where a
+   * checkpoint may cut — into what replaying it from there sends, as
+   * {@link resume} replays the model context.
+   */
+  private landedHistory(): LandedHistory | null {
+    const turn = this.openTurn;
+    if (!turn || turn.signal.aborted) return null;
+    const transcript = this.transcript;
+    const heldFrom = Math.min(transcript.length, ...turn.writes.entries.map(({ at }) => at));
+    const groups: { from: number; entries: ConversationMessage[] }[] = [];
+    for (let i = contextFloor(transcript); i < heldFrom; i++) {
+      const entry = transcript[i];
+      if (isUserMessage(entry)) groups.push({ from: i, entries: [] });
+      if (entry.kind !== 'compaction') groups.at(-1)?.entries.push(entry);
+    }
+    return {
+      heldFrom,
+      exchanges: groups.map(({ from, entries }) => ({ from, messages: plannerTranscript(entries).map(({ role, content }) => ({ role, content })) })),
+    };
+  }
+
   private async summarize(signal: AbortSignal): Promise<string> {
     const ai = this.host.aiService();
-    const request = summaryRequest(this.currentPlanLines());
+    const planLines = this.planRows()?.map(({ line }) => line) ?? null;
     // Only liveness and spend get through: streamed prose or research steps
     // from this turn would land in the chat as if the planner had said them.
     // Its calls are counted like any turn's, but the context they measure is
@@ -801,14 +977,27 @@ export class PlannerConversation {
       if (p.type === 'liveness') this.host.onProgress(p);
       else if (p.type === 'usage' && p.record) this.host.onProgress({ ...p, record: { ...p.record, aggregate: true } });
     };
+    // An API planner writes it in calls that offer no tools, as it does an
+    // automatic one; a harness planner's agent has only its own turn to give.
+    if (ai.condenseContext) {
+      const replay = this.canContinueLive() ? undefined : plannerTranscript(modelContext(this.transcript));
+      try {
+        return await ai.condenseContext({ replay, planLines, onProgress, signal });
+      } catch (err) {
+        if (err instanceof ContextSummaryError) throw new ConversationEditError(`${err.message} The conversation is unchanged.`);
+        throw err;
+      }
+    }
+    const request = summaryRequest(planLines);
     let turn: ConversationTurn;
     if (this.canContinueLive()) {
-      ai.pruneContext?.();
       turn = await ai.continueConversation(request, onProgress, signal);
     } else {
-      turn = await this.resume(await this.reopen(), request, [...this.transcript], signal, onProgress);
+      turn = await this.resume(await this.reopen(), request, modelContext(this.transcript), signal, onProgress);
     }
-    if (signal.aborted) throw new ConversationEditError('Condensing was stopped: the conversation is unchanged.');
+    // Not a ConversationEditError: the caller's catch turns an aborted turn into
+    // the stop or discard it was, which a surface answers differently from a refusal.
+    if (signal.aborted) throw new Error('Condensing was stopped: the conversation is unchanged.');
     const summary = extractSummary(turn.text);
     if (!summary) throw new ConversationEditError('The planner returned no summary, so the conversation is unchanged. Try again.');
     return summary;
@@ -888,14 +1077,16 @@ export class PlannerConversation {
       const now = new Date().toISOString();
       this.holdWrites(userTurn, this.userEntries(goal, now), [this.userPrompt(goal.text, now)]);
       this.briefing.opened(opening.autorun ?? false);
+      this.blocks.restart();
       const turn = await this.host.aiService().startConversation({
         ...opening,
         // The system prompt's goal is the text as typed; skill bodies ride the
         // first message alone, so the planner holds each one once.
         goal: goal.text,
-        initialMessage: plannerMessage(goal.text, goal.skills),
+        initialMessage: plannerInput([plannerMessage(goal.text, goal.skills)]),
         onProgress: userTurn.stream.sink(),
         signal: userTurn.signal,
+        compaction: this.compaction,
       });
       const settleable = await this.drainTaskQueries(turn, userTurn);
       this.assertNotLimited(settleable, userTurn);
@@ -916,13 +1107,13 @@ export class PlannerConversation {
     return this.userTurn({ refuseAs: 'send a message' }, sent, options.signal, (userTurn) => {
       userTurn.onCommit = options.onCommit;
       return this.replyTurn(sent, wakeUps, userTurn);
-    }, { wakeUps, wakeUp: options.wakeUp, forced: options.forced });
+    }, { wakeUps, wakeUp: options.wakeUp, forced: options.forced, recovery: options.recovery });
   }
 
   private async replyTurn(message: SkillInvocation, wakeUps: readonly string[], userTurn: UserTurn): Promise<SettledTurn> {
     const { signal } = userTurn;
     const plan = this.requirePlan();
-    const priorHistory = plan.conversationHistory ?? [];
+    const priorHistory = modelContext(plan.conversationHistory ?? []);
     const now = new Date().toISOString();
     const fromUser = wakeUps.length === 0 || message.text !== '' || message.skills.length > 0;
     // Held, not written: a save mid-turn must never land these in the
@@ -935,26 +1126,86 @@ export class PlannerConversation {
     if (fromUser) entries.push(...this.userEntries(message, now, userTurn.forced));
     this.holdWrites(userTurn, entries, fromUser ? [this.userPrompt(message.text, now)] : []);
 
-    // Decided before the briefing is built: a replay's opening states autorun
-    // and the runners itself, so the briefing says neither again.
-    const reopened = this.canContinueLive() ? null : await this.reopen(userTurn);
-    userTurn.briefing = this.briefing.brief();
-    // The persisted transcript keeps the raw user message; the model gets the
-    // live catalog (always) and the current plan (tasks, statuses, edit
-    // protocol — once tasks exist) alongside it.
-    const contextBlock = [this.catalogBlock(), this.planContextBlock(), ...userTurn.briefing.blocks].filter(Boolean).join('\n\n');
-    const said = fromUser ? plannerMessage(message.text, message.skills) : '';
-    const outgoing = [contextBlock, ...wakeUps, userTurn.wakeUp?.brief, said].filter(Boolean).join('\n\n');
-
-    const turn = reopened
-      ? await this.resume(reopened, outgoing, priorHistory, signal, userTurn.stream.sink())
-      : await this.host.aiService().continueConversation(outgoing, userTurn.stream.sink(), signal);
+    const turn = userTurn.recovery?.live
+      // The held input already carries what the paused turn was told: nothing is sent anew.
+      ? await this.host.aiService().retryHeldInput!(userTurn.stream.sink(), signal)
+      : await this.sendTurn(message, wakeUps, userTurn, priorHistory, fromUser);
 
     const settleable = await this.drainTaskQueries(turn, userTurn);
     this.assertNotLimited(settleable, userTurn);
     if (userTurn.wakeUp) this.assertWakeUpAnswered(settleable, userTurn);
     this.assertCurrent(userTurn);
     return this.settle(settleable, userTurn);
+  }
+
+  /** The turn's message to the planner, sent on the live context or a replay of the transcript. */
+  private async sendTurn(message: SkillInvocation, wakeUps: readonly string[], userTurn: UserTurn, priorHistory: ConversationMessage[], fromUser: boolean): Promise<ConversationTurn> {
+    const { signal } = userTurn;
+    // Decided before the briefing is built: a replay's opening states autorun
+    // and the runners itself, so the briefing says neither again. A paused
+    // turn taken up again from the transcript starts on a replay, whatever
+    // live context is left: its held input is not this turn's to send.
+    const reopened = this.canContinueLive() && !userTurn.recovery ? null : await this.reopen(userTurn);
+    userTurn.briefing = this.briefing.brief();
+    // The persisted transcript keeps the raw user message; the model gets the
+    // catalog and the current plan (tasks, statuses, edit protocol — once
+    // tasks exist) alongside it, whole where its live context holds no copy
+    // and as what changed where it does (ADR-0012 T10).
+    userTurn.blocks = this.blocks.next();
+    const contextBlock = [...userTurn.blocks.blocks, ...userTurn.briefing.blocks].join('\n\n');
+    const said = fromUser ? plannerMessage(message.text, message.skills) : '';
+    const outgoing = plannerInput([contextBlock, ...wakeUps, userTurn.wakeUp?.brief, said]);
+    return reopened
+      ? this.resume(reopened, outgoing, priorHistory, signal, userTurn.stream.sink())
+      : this.host.aiService().continueConversation(outgoing, userTurn.stream.sink(), signal);
+  }
+
+  /**
+   * How a paused turn can be retried now: on the live context, which still
+   * holds the input it could not send and every call the turn made; or, for a
+   * turn whose calls changed nothing, from the transcript, its reads made
+   * again. A turn whose calls changed something is never started again from
+   * the transcript, whatever the planner would be told (ADR-0002): the reason
+   * why, and the way on, for the user.
+   */
+  retryPlan(pause: PlannerContextPause): { live: boolean } | { refused: string } {
+    this.assertIdle('retry compaction');
+    return this.retryWay(pause);
+  }
+
+  private retryWay(pause: PlannerContextPause): { live: boolean } | { refused: string } {
+    const ai = this.host.aiService();
+    if (this.canContinueLive() && (ai.heldInputRetryable?.() ?? false) && ai.retryHeldInput) return { live: true };
+    if ((pause.done?.length ?? 0) > 0 || pause.doneTruncated) return { refused: unsafeReplay(pause, ai.hasActiveConversation()) };
+    return { live: false };
+  }
+
+  /**
+   * A turn whose call could not fit its model's window pauses the planner
+   * (ADR-0002): nothing it held lands, its failure is kept in its place, and
+   * the pause is armed on its inputs in the same save. The calls it lists are
+   * every one since the turn began: a retry on the live context carries the
+   * chat's whole record of them, and one from the transcript is only ever
+   * made for a turn that changed nothing.
+   */
+  private pauseOnContext(err: PlannerContextExhaustedError, userTurn: UserTurn): PlannerContextPausedError {
+    this.assertCurrent(userTurn);
+    const listed = err.done;
+    // What is too long by itself takes a larger window: a Retry on this model compacts what is beside it and pauses again.
+    const action = err.tooLong !== undefined
+      ? `The planner is paused: switch it to a model with a larger window, then Retry compaction, or stop it to drop the ${err.tooLong === 'message' ? 'message' : 'turn'}.`
+      : 'The planner is paused: Retry compaction tries to condense its context and continue the turn, or stop it to drop the turn.';
+    const pause = this.host.contextPaused({
+      model: err.model,
+      reason: `${err.message} ${action}`,
+      ...(listed.length > 0 ? { done: listed.slice(0, PAUSE_DONE_LIMIT) } : {}),
+      ...(listed.length > PAUSE_DONE_LIMIT ? { doneTruncated: true } : {}),
+    });
+    this.host.mutate(() => {
+      this.recordFailure(pause.reason);
+      return true;
+    }, () => this.host.broadcastPlan());
+    return new PlannerContextPausedError(pause, { cause: err });
   }
 
   /**
@@ -979,7 +1230,7 @@ export class PlannerConversation {
     const said: TurnFailure = { message: turn.text, usageLimit: turn.usageLimit };
     if (classifyRunnerStop(said) !== 'usage-limit') return;
     this.assertCurrent(userTurn);
-    const limit = this.host.usageLimit(said);
+    const limit = this.host.usageLimit(said, userTurn.committed === true);
     this.host.mutate(() => {
       this.recordFailure(limit.text);
       return true;
@@ -1039,7 +1290,7 @@ export class PlannerConversation {
     prompt: SkillInvocation,
     signal: AbortSignal | undefined,
     run: (turn: UserTurn) => Promise<SettledTurn>,
-    delivered: { wakeUps?: readonly string[]; wakeUp?: WakeUpTurn; forced?: boolean } = {},
+    delivered: { wakeUps?: readonly string[]; wakeUp?: WakeUpTurn; forced?: boolean; recovery?: PlannerContextPause } = {},
   ): Promise<LegacyPlanState> {
     const { turn: planner, release } = this.claim(admission, signal);
     const turnId = uuidv4();
@@ -1050,11 +1301,18 @@ export class PlannerConversation {
       subagents.observe(p);
       this.host.onProgress(p);
     });
-    const { wakeUp, forced } = delivered;
+    const { wakeUp, forced, recovery } = delivered;
+    // Read as the turn opens, which is when its first call is made.
+    const retry = recovery && this.retryWay(recovery);
+    if (retry && 'refused' in retry) {
+      release();
+      throw new ConversationEditError(retry.refused);
+    }
     const turn: UserTurn = {
-      stream, planner, signal: planner.signal, plan: this.host.plan(), reads: freshReadBudget(wakeUp), narration: [],
+      stream, planner, signal: planner.signal, plan: this.host.plan(), reads: freshReadBudget(wakeUp), narration: [], handles: new Map(),
       writes: { entries: [], research: [], subagents },
       ...(wakeUp ? { wakeUp } : {}), ...(forced ? { forced } : {}),
+      ...(recovery && retry ? { recovery: { pause: recovery, live: retry.live } } : {}),
     };
     this.openTurn = turn;
     const skills = prompt.skills.map(skillLoadNotice);
@@ -1076,10 +1334,10 @@ export class PlannerConversation {
         outcome = 'stopped';
         throw err;
       }
+      if (err instanceof PlannerContextExhaustedError && !planner.signal.aborted && !planner.abandoned) throw this.pauseOnContext(err, turn);
       throw interrupted(planner, err);
     } finally {
       if (this.openTurn === turn) this.openTurn = null;
-      this.clearHeld(turn);
       // Released before the end is announced, so a surface that sends its
       // next message on hearing it is not refused by the turn it heard end.
       release();
@@ -1118,20 +1376,22 @@ export class PlannerConversation {
   }
 
   /**
-   * The one mutation that lands a turn's outcome (ADR-0029). What the turn held
-   * goes in first — each entry where it belongs, ahead of what was written
-   * after it, then the research and the subagents — so the transcript reads in
-   * the order it happened and the inputs leave the plan's pending turns in the
-   * save that carried their answer. `outcome` makes the turn's change to the
-   * plan and returns what the turn said, which is written, then sent in that
-   * order; `announce` follows it on every surface. The turn's briefing is told
-   * unless the planner gave no answer (`unheard`): a failure, or a stop.
+   * A mutation that lands a turn's outcome (ADR-0029): the one its reply
+   * settles, and before it each change a planner tool commits in the turn.
+   * What the turn held so far goes in first — each entry where it belongs,
+   * ahead of what was written after it, then the research, and the subagents
+   * once the reply settles (`settles`) — so the transcript reads in the order
+   * it happened and the inputs leave the plan's pending turns in the save
+   * that carried the first answer to them. `outcome` makes the turn's change
+   * to the plan and returns what the turn said, which is written, then sent in
+   * that order; `announce` follows it on every surface. The turn's briefing
+   * is told unless the planner gave no answer (`unheard`): a failure, or a stop.
    */
   private land(
     userTurn: UserTurn,
     researchLog: ResearchLogEntry[],
     outcome: () => Landed[],
-    { skillWarnings = [], announce, unheard = false }: { skillWarnings?: readonly string[]; announce?: () => void; unheard?: boolean } = {},
+    { skillWarnings = [], announce, unheard = false, settles = true }: { skillWarnings?: readonly string[]; announce?: () => void; unheard?: boolean; settles?: boolean } = {},
   ): LegacyPlanState {
     const { turnId } = userTurn.stream;
     const now = new Date().toISOString();
@@ -1139,11 +1399,13 @@ export class PlannerConversation {
     const supervisor = bySupervisor(userTurn.wakeUp);
     let said: Landed[] = [];
     const plan = this.host.mutate(() => {
-      this.writeHeld(userTurn, researchLog);
+      this.writeHeld(userTurn, researchLog, settles);
       said = outcome();
       for (const { content, kind, runs } of said) this.append('assistant', content, { timestamp: now, kind: kind ?? (supervisor ? 'supervisor' : undefined), runs });
       this.recordSkillWarnings(skillWarnings, now);
-      userTurn.onCommit?.();
+      const taken = userTurn.onCommit;
+      userTurn.onCommit = undefined;
+      taken?.();
       return true;
     }, () => {
       for (const { content, kind, runs } of said) {
@@ -1151,21 +1413,30 @@ export class PlannerConversation {
       }
       announce?.();
     });
-    if (!unheard) userTurn.briefing?.heard();
+    if (!unheard && !userTurn.heard) {
+      userTurn.heard = true;
+      userTurn.briefing?.heard();
+      if (!userTurn.repaired) userTurn.blocks?.heard();
+    }
     this.warnSkills(skillWarnings);
     return plan!;
   }
 
-  private writeHeld(userTurn: UserTurn, researchLog: ResearchLogEntry[]): void {
+  /** Write what the turn holds, and let go of it: a later landing of the same turn writes only what was held since. */
+  private writeHeld(userTurn: UserTurn, researchLog: ResearchLogEntry[], settles: boolean): void {
     const plan = this.requirePlan();
     const { entries, research, subagents } = userTurn.writes;
     const history = [...(plan.conversationHistory ?? [])];
+    // A checkpoint written while the turn ran cut at or before its inputs (see commitCheckpoint), so none lands behind it.
+    if (entries.some(({ at }) => at < contextFloor(history))) throw new Error('A held input would land behind the conversation\'s last summary.');
     // Past the held entries already placed, which all belong at or before it.
     entries.forEach(({ at, entry }, placed) => history.splice(Math.min(at + placed, history.length), 0, entry));
     plan.conversationHistory = history;
     this.recordResearch([...research, ...researchLog]);
+    userTurn.writes.entries = [];
+    userTurn.writes.research = [];
     // After the turn's own research, which a harness planner logs a subagent's steps in too: they are regrouped under it.
-    plan.researchLog = subagents.foldInto(plan.researchLog ?? []);
+    if (settles) plan.researchLog = subagents.foldInto(plan.researchLog ?? []);
   }
 
   private recordResearch(entries: ResearchLogEntry[]): void {
@@ -1218,6 +1489,7 @@ export class PlannerConversation {
       signal,
       priorHistory: replayed,
       initialMessage: message,
+      compaction: this.compaction,
     });
   }
 
@@ -1238,7 +1510,7 @@ export class PlannerConversation {
     const { reads, signal, stream } = userTurn;
     const ai = this.host.aiService();
     const carried: ConversationTurn['researchLog'] = [];
-    let current = this.claimSubmission(turn, userTurn);
+    let current: ConversationTurn = turn;
     while (current.kind === 'task_query') {
       carried.push(...current.researchLog);
       userTurn.narration.push(...current.runs ?? []);
@@ -1249,11 +1521,11 @@ export class PlannerConversation {
         return { kind: 'message', text, researchLog: carried, ...(current.runs ? { runs: [noteRun(text)] } : {}) };
       }
       const answer = this.taskQueryAnswer(current.query);
-      current = this.claimSubmission(await ai.continueConversation(
+      current = await ai.continueConversation(
         spent === 'land' ? `${answer}\n\n${TASK_QUERY_ANSWER_OR_OPS}` : answer,
         stream.sink(),
         signal,
-      ), userTurn);
+      );
     }
     return this.failedIfCutOff(carried.length > 0
       ? { ...current, researchLog: [...carried, ...current.researchLog] }
@@ -1269,26 +1541,6 @@ export class PlannerConversation {
   private failedIfCutOff(turn: SettleableTurn, userTurn: UserTurn): SettleableTurn {
     if (turn.kind !== 'message' || !turn.aborted || userTurn.signal.aborted) return turn;
     return { kind: 'message', text: CUT_OFF, researchLog: turn.researchLog, failed: true, ...writtenOver(turn.runs, CUT_OFF) };
-  }
-
-  /**
-   * The backend's answer, with what was handed in while it ran standing in
-   * for whatever its reply carried. Taken once: a corrective re-send after a
-   * rejected edit must not settle on the same submission again. A stopped
-   * turn commits nothing, the same as a stopped reply with a plan in it.
-   */
-  private claimSubmission(turn: ConversationTurn, userTurn: UserTurn): ClaimedTurn {
-    const submitted = userTurn.submitted;
-    userTurn.submitted = undefined;
-    if (!submitted || userTurn.signal.aborted) return turn;
-    const { text, researchLog, runs } = turn;
-    // The backend settled its reply as a message, so the reply is shown from
-    // here, settled where its runs streamed, or not at all.
-    const said = text.trim() ? { said: text } : {};
-    const shown = runs ? { runs } : {};
-    return submitted.kind === 'plan'
-      ? { kind: 'plan', tasks: submitted.tasks, text, researchLog, ...shown, ...said }
-      : { kind: 'task_ops', ops: submitted.ops, text, researchLog, ...shown, ...said };
   }
 
   /**
@@ -1308,7 +1560,7 @@ export class PlannerConversation {
    * one path, not two.
    */
   private async settle(turn: SettleableTurn, userTurn: UserTurn): Promise<SettledTurn> {
-    type Settled = { plan: LegacyPlanState } | { turn: CommitTurn; skillWarnings?: string[] };
+    type Settled = SettledTurn | { turn: CommitTurn };
     const { signal, stream } = userTurn;
     const ai = this.host.aiService();
     // A planner with tools submits through them alone, so its correctives ask for a tool call, not JSON.
@@ -1326,16 +1578,17 @@ export class PlannerConversation {
       // plan display it streamed, never of the narration before its calls,
       // nor of the calls themselves: the turn lands with their research.
       resend: async (corrective) => {
+        userTurn.repaired = true;
         userTurn.narration.push(...(discarding.runs ?? []).filter((run) => run.narration));
         stream.retract(new Set(userTurn.narration.map((run) => run.segmentId)));
         const retry = await this.drainTaskQueries(await ai.continueConversation(corrective, stream.sink(), signal), userTurn);
         return { ...retry, researchLog: [...discarding.researchLog, ...retry.researchLog] };
       },
-      interpret: async (t) => {
+      interpret: async (reply) => {
+        const t = this.besideCommitted(reply, userTurn);
         discarding = t;
         const refused = t.kind === 'plan' || t.kind === 'task_ops' ? userTurn.wakeUp?.refused(t.kind === 'plan' ? 'plan' : 'edit') : undefined;
         if (refused) {
-          this.clearHeld(userTurn);
           const errors = [refused];
           if (!ai.hasActiveConversation() || signal.aborted) return { done: (t.kind === 'plan' ? invalidPlan : invalidOps)(errors, t) };
           return { retry: { errors, corrective: refused } };
@@ -1346,17 +1599,17 @@ export class PlannerConversation {
           return { retry: { errors, corrective: (tools ? resubmitEditPrompt : taskOpsRejectedPrompt)(errors) } };
         }
         if (t.kind === 'plan') {
-          const skills = await checkPlanSkills(t.tasks, this.host.taskSkills());
-          this.assertStillCurrent(userTurn);
-          if (skills.errors.length === 0) return { done: { turn: t, skillWarnings: skills.warnings } };
-          const errors = skills.errors.map((e) => e.message);
+          this.assertCurrent(userTurn);
+          const landed = await this.commitPlan(t, userTurn);
+          if ('plan' in landed) return { done: { plan: landed.plan, outcome: 'plan' } };
+          const { errors } = landed;
           if (!ai.hasActiveConversation() || signal.aborted) return { done: invalidPlan(errors, t) };
           return { retry: { errors, corrective: tools ? resubmitPlanPrompt(errors) : reEmitPlanPrompt(errors.join('; ')) } };
         }
         if (t.kind !== 'task_ops') return { done: { turn: t } };
         this.assertCurrent(userTurn);
         const applied = await this.applyTaskOps(t, userTurn);
-        if ('plan' in applied) return { done: { plan: applied.plan } };
+        if ('plan' in applied) return { done: { plan: applied.plan, outcome: 'task_ops' } };
         // No live conversation (or an abort) means no corrective re-send is
         // possible — surface the failure instead of retrying into the void.
         if (!ai.hasActiveConversation() || signal.aborted) {
@@ -1368,9 +1621,9 @@ export class PlannerConversation {
       onExhausted: ({ reply, errors }) => (reply.kind === 'plan' ? invalidPlan : invalidOps)(errors, reply),
     });
 
-    if ('plan' in settled) return { plan: settled.plan, outcome: 'task_ops' };
+    if ('plan' in settled) return settled;
     this.assertCurrent(userTurn);
-    return { plan: this.commit(settled.turn, userTurn, settled.skillWarnings ?? []), outcome: settled.turn.kind };
+    return { plan: this.commit(settled.turn, userTurn), outcome: settled.turn.kind };
   }
 
   /** A name not found at submit only warns: a task the attaching one depends on may create it. */
@@ -1378,55 +1631,86 @@ export class PlannerConversation {
     for (const warning of warnings) this.host.notice('warn', warning);
   }
 
-  /** Validate + commit a task_ops turn atomically. Returns the errors on rejection (plan untouched). */
+  /**
+   * A reply that lands after a planner tool committed in its turn is what the
+   * planner said beside that change: a plan or edit envelope in it was never
+   * asked for, and landing it would silently write over what the tool
+   * committed and answered.
+   */
+  private besideCommitted(turn: SettleableTurn, userTurn: UserTurn): SettleableTurn {
+    if (!userTurn.committed || (turn.kind !== 'plan' && turn.kind !== 'task_ops')) return turn;
+    return { kind: 'message', text: turn.text, researchLog: turn.researchLog, ...(turn.runs ? { runs: turn.runs } : {}) };
+  }
+
+  /**
+   * Check a task_ops reply as it lands and commit it atomically: what passed
+   * lands in the tick the check's rules ran in. Returns the errors on
+   * rejection (plan untouched).
+   */
   private async applyTaskOps(turn: Extract<SettleableTurn, { kind: 'task_ops' }>, userTurn: UserTurn): Promise<{ plan: LegacyPlanState } | { errors: string[] }> {
     this.requirePlan();
-    const skills = await checkOpSkills(turn.ops, this.host.taskSkills());
-    this.assertStillCurrent(userTurn);
-    if (skills.errors.length > 0) return this.refusedHeld(userTurn, skills.errors.map((e) => e.message));
-    const result = this.host.validateOps(turn.ops);
-    if (!result.ok) return this.refusedHeld(userTurn, result.errors);
-
-    const said = this.said(turn, userTurn);
-    const plan = this.land(userTurn, turn.researchLog, () => {
-      this.host.adoptTasks(result.tasks, 'edit');
-      return [...(said ? [said] : []), { content: `Tasks updated:\n- ${result.summary.join('\n- ')}` }];
-    }, {
-      skillWarnings: skills.warnings,
-      announce: () => {
-        this.host.broadcastPlan();
-        // After the plan that carries it, so the edit is never missing from both.
-        this.clearHeld(userTurn);
-      },
+    const landed: { plan?: LegacyPlanState } = {};
+    const checked = await this.host.planChanges.check({ kind: 'ops', ops: turn.ops }, 'land', (passed) => {
+      // The skill check waits on git, which a stop, rewind or session switch may outlast.
+      this.assertStillCurrent(userTurn);
+      landed.plan = this.landChange(userTurn, 'task_ops', passed, turn);
     });
-    return { plan };
+    this.assertStillCurrent(userTurn);
+    if (landed.plan) return { plan: landed.plan };
+    return { errors: checked.ok ? [] : checked.errors.map(planChangeErrorText) };
   }
 
-  /** The edit was refused as it landed: what it showed is not coming. */
-  private refusedHeld(userTurn: UserTurn, errors: string[]): { errors: string[] } {
-    this.clearHeld(userTurn);
-    return { errors };
+  /**
+   * Check a whole plan as it lands and commit it in the same tick, as an edit
+   * is: it waited out the rest of its reply, so the runners it was accepted
+   * against may be gone (ADR-0003 V1). Returns the errors on rejection.
+   */
+  private async commitPlan(turn: Extract<SettleableTurn, { kind: 'plan' }>, userTurn: UserTurn): Promise<{ plan: LegacyPlanState } | { errors: string[] }> {
+    const landed: { plan?: LegacyPlanState } = {};
+    const checked = await this.host.planChanges.check({ kind: 'plan', tasks: turn.tasks }, 'land', (passed) => {
+      this.assertStillCurrent(userTurn);
+      landed.plan = this.landChange(userTurn, 'plan', passed, turn);
+    });
+    this.assertStillCurrent(userTurn);
+    if (landed.plan) return { plan: landed.plan };
+    return { errors: checked.ok ? [] : checked.errors.map(planChangeErrorText) };
   }
 
-  /** Commit a settled (non-task_ops) turn: a whole plan, or what it said. */
-  private commit(turn: CommitTurn, userTurn: UserTurn, skillWarnings: readonly string[]): LegacyPlanState {
+  /**
+   * Land a change that passed its check, from a planner tool's call or from
+   * the reply that carried it (`reply`), whose prose lands with it: an edit
+   * keeps run state, a whole plan starts over.
+   */
+  private landChange(userTurn: UserTurn, kind: PlannerSubmission['kind'], passed: PassedChange, reply?: Extract<SettleableTurn, { kind: 'plan' | 'task_ops' }>): LegacyPlanState {
     this.requirePlan();
+    const said = reply ? this.said(reply, userTurn) : undefined;
+    return this.land(userTurn, reply?.researchLog ?? [], () => {
+      if (kind === 'task_ops') {
+        this.host.adoptTasks(passed.tasks, 'edit');
+        return [...(said ? [said] : []), { content: `Tasks updated:\n- ${passed.summary.join('\n- ')}` }];
+      }
+      // A cheap model may emit the PRD block and the plan JSON in one turn —
+      // capture the PRD here too so it isn't dropped with the plan preamble.
+      if (reply) this.host.capturePrd(reply.text);
+      const count = this.host.adoptTasks(passed.tasks, 'commit');
+      return [...(said ? [said] : []), { content: `Plan generated with ${count} task${count === 1 ? '' : 's'}.`, kind: 'plan_generated' }];
+    }, {
+      skillWarnings: passed.warnings,
+      settles: reply !== undefined,
+      announce: () => this.host.broadcastPlan(kind === 'plan' ? userTurn.stream.turnId : undefined),
+    });
+  }
 
-    if (turn.kind === 'plan') {
-      const said = this.said(turn, userTurn);
-      return this.land(userTurn, turn.researchLog, () => {
-        // A cheap model may emit the PRD block and the plan JSON in one turn —
-        // capture the PRD here too so it isn't dropped with the plan preamble.
-        this.host.capturePrd(turn.text);
-        const count = this.host.adoptTasks(turn.tasks, 'commit');
-        return [...(said ? [said] : []), { content: `Plan generated with ${count} task${count === 1 ? '' : 's'}.`, kind: 'plan_generated' }];
-      }, { skillWarnings, announce: () => this.host.broadcastPlan(userTurn.stream.turnId) });
-    }
+  /** Commit a settled turn that changes nothing in the plan: what it said. */
+  private commit(turn: CommitTurn, userTurn: UserTurn): LegacyPlanState {
+    this.requirePlan();
 
     // Budget models occasionally return an empty content turn after tool use —
     // surface that visibly instead of rendering a blank bubble. A stopped turn
     // is empty because it was cut short, which is not the model's fault.
     const replied = turn.text.trim() !== '';
+    // A tool's change already answered for the turn, with its own line: a reply that says nothing more adds none.
+    if (!replied && userTurn.committed) return this.land(userTurn, turn.researchLog, () => [], { unheard: turn.failed === true || userTurn.signal.aborted });
     const text = replied
       ? turn.text
       : userTurn.signal.aborted
@@ -1450,19 +1734,18 @@ export class PlannerConversation {
     return [...kept, ...(runs ?? [noteRun(content)])].map(({ segmentId, text, startedAt }) => ({ segmentId, text, startedAt }));
   }
 
-  /** What a plan or edit turn said beside what it landed: its reply, or an envelope's narration. */
+  /** What an envelope reply said beside the plan or edit it landed: the narration before its tool calls. */
   private said(turn: SettleableTurn, userTurn: UserTurn): { content: string; runs?: ReplyRun[] } | undefined {
-    if (turn.said !== undefined) return { content: turn.said, runs: this.shown(userTurn, turn.runs, turn.said) };
     const narration = this.shown(userTurn, turn.runs ?? [], '') ?? [];
     return narration.length > 0 ? { content: joinRuns(narration), runs: narration } : undefined;
   }
 
   /**
    * The catalog the planner may actually draw from — model ids and task-mode
-   * ids, per runner in the plan — emitted on EVERY turn, before any plan exists
-   * or after. The system prompt shows this once at conversation start; a long
-   * clarifying conversation outlives that single showing and the planner
-   * starts misquoting it, so this re-states it per turn instead.
+   * ids, per runner in the plan — before any plan exists or after. The system
+   * prompt shows it in another shape, which the planner starts misquoting once
+   * a long conversation has outlived it, so it is stated in a turn's message
+   * as well: once per live context, and again when it changes (ADR-0012 T10).
    *
    * The host's catalog is allowlist-filtered, so a restricted allowlist stays a
    * hard bound on every turn, and reads the plan's runners live, so a runner
@@ -1493,41 +1776,42 @@ export class PlannerConversation {
   }
 
   /**
-   * The "you are here" block for post-plan chat: current tasks with stable
-   * references, plus the read and edit protocols. Injected per turn (never
-   * persisted) so the model always sees live statuses — including which tasks
-   * are locked by a running execution.
+   * The "you are here" view for post-plan chat: current tasks with stable
+   * references, plus the read and edit protocols. Never persisted, and built
+   * fresh for every turn so the model sees live statuses — including which
+   * tasks are locked by a running execution — whether its turn sends the
+   * whole block or what changed (ADR-0012 T10).
    */
-  private planContextBlock(): string | null {
-    const tasks = this.host.tasks();
-    const lines = this.currentPlanLines();
-    if (!lines) return null;
+  private planView(): PlanView | null {
+    if (!this.host.plan()) return null;
+    const rows = this.planRows() ?? [];
     const tools = this.host.aiService().plannerToolsAttached?.() ?? false;
     // Gated on live runners, not on an armed scheduler: a paused-but-armed run
     // has nothing running to lock, and takes a whole plan as well as an edit.
-    const locked = flattenTasksWithParents(tasks).filter(({ task }) => task.status === 'in_progress');
-    const execNote = this.host.isExecuting()
-      ? `\nExecution is RUNNING${locked.length ? ` — these tasks are locked: ${locked.map(({ ref }) => ref).join(', ')}` : ''}. No new task starts until your reply ends; your task edits apply then, to tasks that have not started. An edit aimed at a running task is refused — the user can stop it first, or you can change it after it finishes. Do not submit a whole new plan while tasks run.`
+    const locked = flattenTasksWithParents(this.host.tasks()).filter(({ task }) => task.status === 'in_progress');
+    const running = this.host.isExecuting()
+      ? `Execution is RUNNING${locked.length ? ` — these tasks are locked: ${locked.map(({ ref }) => ref).join(', ')}` : ''}. No new task starts until your reply ends; ${tools ? 'each edit_plan call applies as it answers' : 'your task edits apply as it ends'}, to tasks that have not started. An edit aimed at a running task is refused — the user can stop it first, or you can change it after it finishes. Do not submit a whole new plan while tasks run.`
       : '';
-    return [
+    const full = [
       '<current_plan>',
-      ...lines,
+      ...rows.map(({ line }) => line),
       '</current_plan>',
       'The block above is the CURRENT task plan — short fields only. Choose how to respond:',
       '- To answer a question or discuss, reply in plain prose (no JSON).',
       tools ? TASK_READ_TOOLS_REMINDER : TASK_QUERY_REMINDER,
-      ...taskOpsProtocol(execNote, tools),
+      ...taskOpsProtocol(running && `\n${running}`, tools),
     ].filter(Boolean).join('\n');
+    return { rows, full, running, tools };
   }
 
   /** One line per task, subtasks indented under their parent, with stable references — null until the plan has tasks. */
-  private currentPlanLines(): string[] | null {
+  private planRows(): PlanRow[] | null {
     const tasks = this.host.tasks();
     if (!this.host.plan() || tasks.length === 0) return null;
     const rows = flattenTasksWithParents(tasks);
     const refOf = new Map(rows.map(({ task, ref }) => [task.id, ref]));
     const { modes } = this.host.catalog();
-    return rows.map(({ task: t, parent }) => {
+    const lineOf = ({ task: t, parent }: (typeof rows)[number]): string => {
       const refs = (ids: readonly string[]) => `[${ids.map((d) => refOf.get(d) ?? d).join(', ')}]`;
       // A script task runs on no runner, model or mode (ADR-0035): what it runs is its line.
       if (t.type === 'script') {
@@ -1541,8 +1825,9 @@ export class PlannerConversation {
       const runFields = isMan
         ? `steps:${t.userSteps?.length ?? 0}`
         : `${t.assignedModel ? `model:${t.assignedModel.modelId} ` : ''}${readOnly ? 'read-only ' : ''}effort:${t.assignedModel?.thinkingEffort ?? '-'}`;
-      return `${parent ? '  ' : ''}${refOf.get(t.id)} id=${t.id} "${t.title}" [${t.status}] type:${isMan ? 'MAN' : t.ops ? 'AI ops' : 'AI'} runner:${t.assignedRunner} ${runFields} autonomy:${t.autonomy ?? '-'} slice:${t.sliceType ?? '-'} deps:${refs(t.dependencies)}${t.skills?.length ? ` skills:[${t.skills.join(', ')}]` : ''}${waitNote(this.host.startWaits(t), refs)}`;
-    });
+      return `${parent ? '  ' : ''}${refOf.get(t.id)} id=${t.id} "${t.title}" [${t.status}] type:${isMan ? 'MAN' : t.ops ? 'AI ops' : 'AI'} ${isMan ? '' : `runner:${t.assignedRunner} `}${runFields} autonomy:${t.autonomy ?? '-'} slice:${t.sliceType ?? '-'} deps:${refs(t.dependencies)}${t.skills?.length ? ` skills:[${t.skills.join(', ')}]` : ''}${waitNote(this.host.startWaits(t), refs)}`;
+    };
+    return rows.map((row) => ({ id: row.task.id, ref: row.ref, title: row.task.title, line: lineOf(row) }));
   }
 }
 

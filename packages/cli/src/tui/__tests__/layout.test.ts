@@ -108,6 +108,24 @@ describe('welcome — plan approval', () => {
     expect(text).not.toContain('Autorun is on');
   });
 
+  it('does not show the outgoing session\'s Run values after a switch, until the new read lands', () => {
+    const onA = welcome(true, {
+      sessionId: 'a',
+      runSettings: { ...chatState(0).runSettings, supervisorLevel: 'act' },
+    });
+    const onB = reduce(onA, { type: 'sessionLoaded', sessionId: 'b', goal: 'other' }).state;
+
+    expect(plain(onB)).not.toContain('supervisor Act');
+    expect(plain(onB)).not.toContain('autorun on');
+    expect(plain(onB)).toContain('Run');
+    expect(plain(onB)).toContain('…');
+
+    // The status badge makes the same claim away from the welcome.
+    const inPlan = { ...onB, tasks: tasks(1) };
+    expect(plain(inPlan)).not.toContain('supervisor Act');
+    expect(plain(inPlan)).toContain('run settings …');
+  });
+
   it('wraps in a narrow pane without losing the words', () => {
     const text = plain(welcome(true, { cols: 40, rows: 40 })).replace(/\s+/g, ' ');
     expect(text).toContain('A plan starts as soon as the planner submits it');
@@ -117,6 +135,21 @@ describe('welcome — plan approval', () => {
     const lines = render(welcome(autorun, { rows: 8, cols: 32 }));
     expect(lines).toHaveLength(8);
     expect(lines.every((line) => stripAnsi(line).length <= 32)).toBe(true);
+  });
+});
+
+describe('welcome — the version check notice (ADR-0048)', () => {
+  const NOTICE = 'Ordewell checks for a new version once a day, sending its version and a random install ID that is replaced every 30 days. '
+    + 'Like any server, ordewell.ai sees your IP address. '
+    + 'Set ORDEWELL_NO_VERSION_CHECK=1 to turn this off. Details: https://ordewell.ai/docs#version-check';
+
+  it('shows the one-time notice whole, wrapped to the pane', () => {
+    const text = plain(chatState(0, { rows: 40, cols: 60, versionCheckNotice: NOTICE })).replace(/\s+/g, ' ');
+    expect(text).toContain(NOTICE);
+  });
+
+  it('says nothing about it on any other start', () => {
+    expect(plain(chatState(0, { rows: 40, cols: 100 }))).not.toContain('ORDEWELL_NO_VERSION_CHECK');
   });
 });
 
@@ -339,5 +372,19 @@ describe('the help sheet footer', () => {
       expect(lines).toHaveLength(24);
       expect(lines.every((line) => stripAnsi(line).length <= cols)).toBe(true);
     }
+  });
+});
+
+describe('an expanded task row', () => {
+  // The row used to print the store's own spelling, so the pane said "in
+  // progress" directly under a header that said "Running".
+  it('words the status as the task view and the header do', () => {
+    const out = plain(initialState({
+      sessionId: 's1', rows: 24, cols: 120, focus: 'plan', expandedTaskId: 't1',
+      tasks: [{ id: 't1', order: 1, title: 'Add the route', type: 'ai', status: 'in_progress', dependencies: [] }],
+    }));
+
+    expect(out).not.toContain('in progress');
+    expect(out).toContain('Running');
   });
 });

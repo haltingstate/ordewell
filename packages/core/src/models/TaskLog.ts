@@ -230,12 +230,28 @@ export function toTaskLogEvent(event: StructuredEvent): TaskLogEvent | null {
         type: 'script_exit', code: event.code, signal: event.signal, durationMs: event.durationMs,
         ...(event.timedOut ? { timedOut: true } : {}), ...(event.error !== undefined ? { error: event.error } : {}),
       };
+    // The call is in the log already; its receipt is the task's state, not an entry.
+    case 'completion_received':
+      return null;
     // Logged once the plan's write-back settles: see `TaskLogRecorder.note`.
     case 'model_switched':
     case 'model_drifted':
     case 'background_agent':
       return null;
   }
+}
+
+/**
+ * The model the task's own thread last ran a call on, as its usage reports it
+ * (`provider/model` for OpenCode); a subagent's calls and session totals do
+ * not say what the task runs on. Undefined when no call in `events` names one.
+ */
+export function lastServedModel(events: readonly TaskLogEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === 'usage' && event.record.model && !event.record.subagentId && !event.record.aggregate) return event.record.model;
+  }
+  return undefined;
 }
 
 /** A log as a surface is sent it, live or read back: everything but the skills' bodies. */

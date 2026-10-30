@@ -5,7 +5,7 @@ import type { ApiProvider } from '../adapters/SecretStore';
 import type { ChatViewProvider, PlannerBackend } from '../providers/ChatViewProvider';
 import type { VendorModelOption } from '../plan/PlannerModelSwitch';
 import { configureModelAllowlist } from './configureModelAllowlist';
-import { isBuiltinSlashCommand, slashHelp } from './slashCommands';
+import { isBuiltinSlashCommand, resolveSlashAlias, slashHelp } from './slashCommands';
 import { runPlannerWizard } from './plannerWizard';
 
 // A '/' text whose first word the table does not name is a discovered skill
@@ -23,6 +23,8 @@ export interface SlashDeps {
   plannerBackends(): Promise<PlannerBackend[]>;
   /** Re-push planner provider/model/effort to the webview after a change. */
   refreshPlannerState(): Promise<void>;
+  /** Hand the terminal to a runner's own login; omitted names the active planner. */
+  loginPlanner(runner?: string): Promise<void>;
   runnerRegistry: { list(): { manifest: { displayName: string; name: string } }[] };
   chatProvider: ChatViewProvider;
   settingsService: { getModelAllowlist(runner: string): string[] | undefined; setModelAllowlist(runner: string, ids: string[] | undefined): void; };
@@ -71,7 +73,10 @@ async function pickPlanner(arg: string | undefined, deps: SlashDeps): Promise<vo
 
 export async function handleSlashCommand(text: string, deps: SlashDeps): Promise<void> {
   const parts = text.trim().split(/\s+/);
-  const cmd = parts[0];
+  // Resolve a familiar alias to the command it spells before dispatch, so an
+  // alias takes the exact same branch — same picker, same empty/cancel/load
+  // behaviour — as its target, and there is only one implementation to keep.
+  const cmd = resolveSlashAlias(parts[0]);
   const args = parts.slice(1);
 
   if (cmd === '/refresh') {
@@ -84,6 +89,20 @@ export async function handleSlashCommand(text: string, deps: SlashDeps): Promise
   }
   if (cmd === '/planner') {
     await pickPlanner(args[0], deps);
+    return;
+  }
+  if (cmd === '/login') {
+    // Joined, not just `args[0]`: a display label is two words ("Claude Code").
+    const named = args.join(' ').trim();
+    const runner = named
+      ? deps.runnerRegistry.list().find(({ manifest }) => manifest.name === named
+        || manifest.displayName.toLowerCase() === named.toLowerCase())?.manifest.name
+      : undefined;
+    if (named && !runner) {
+      vscode.window.showWarningMessage(`Unknown coding agent: ${named}. Run /planner to see the coding agents.`);
+      return;
+    }
+    await deps.loginPlanner(runner);
     return;
   }
   if (cmd === '/key') {

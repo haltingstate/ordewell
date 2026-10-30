@@ -12,6 +12,7 @@ import {
   createTask,
   mintDaemonToken,
   saveSession,
+  type AccountLimitCollector,
   type ConversationRequest,
   type ConversationTurn,
   type IConfig,
@@ -81,7 +82,7 @@ export interface Tui {
   api: ApiClient;
 }
 
-export async function liveDaemon() {
+export async function liveDaemon(accountLimitCollectors: (workspace: string) => readonly AccountLimitCollector[] = () => []) {
   const dir = mkdtempSync(join(tmpdir(), 'ordewell-live-'));
   const workspace = join(dir, 'ws');
   mkdirSync(join(workspace, '.git'), { recursive: true });
@@ -108,6 +109,7 @@ export async function liveDaemon() {
   vi.spyOn(GeminiService.prototype, 'startConversation').mockImplementation(open);
 
   const pool = new OrchestratorPool({
+    accountLimitCollectors,
     modelResolver: inertResolver(),
     runner: holdingRunner(),
     // Installation must agree with the fake runner even on a host with no agents.
@@ -122,7 +124,7 @@ export async function liveDaemon() {
   const port = (server.address() as AddressInfo).port;
   const { token, file } = mintDaemonToken(port);
   const admission = { port, token, tokenFile: file };
-  server.on('request', createRequestListener(createApp(pool, admission)));
+  server.on('request', createRequestListener(createApp(pool, admission), admission));
   attachWsHandler(server, pool, admission);
   const sockets = new Set<Duplex>();
   server.on('upgrade', (_request, socket: Duplex) => {
@@ -150,6 +152,7 @@ export async function liveDaemon() {
       pipeToClipboard: () => {},
       writeTerminal: () => {},
       reviveDaemon: async () => true,
+      login: async () => ({ ok: true }),
       exit: () => {},
     };
     const act = async (action: Action): Promise<void> => {

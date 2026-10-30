@@ -1,13 +1,15 @@
 import { TaskCommandsBridge } from './components/RunnerCommands';
 import React, { useState, useEffect, useCallback, useMemo, useReducer, useRef } from 'react';
-import EmptyState from './components/EmptyState';
+import EmptyState, { type SignedOutPlannerRow } from './components/EmptyState';
+import PlannerLoginAction from './components/PlannerLogin';
 import GetStarted from './components/GetStarted';
 import { orNames } from './runnerNames';
 import ChatInput from './components/ChatInput';
 import PlannerResendBar from './components/PlannerResendBar';
+import PlannerPauseBar from './components/PlannerPauseBar';
 import DockResizeHandle from './components/DockResizeHandle';
 import { ConversationBlocks } from './components/ChatMessage';
-import { reduceHost, INITIAL_HOST_STATE, type HostState } from './hostState';
+import { reduceHost, runnersOn, INITIAL_HOST_STATE, type HostState } from './hostState';
 import ModelSelector, { API_PROVIDER_LABELS } from './components/ModelSelector';
 import PlanCardGroup from './components/PlanCardGroup';
 import UsageLine from './components/UsageLine';
@@ -16,14 +18,13 @@ import HandoffCard from './components/HandoffCard';
 import CheckpointPanel from './components/CheckpointPanel';
 import RunSettingsBlock from './components/RunSettingsBlock';
 import type { TaskDraft } from './components/NewTaskCard';
-import type { GlobalRunSettings, RunSettings, Task, TaskModelAssignment, RunnerId } from '@ordewell/core';
-import { SUPERVISOR_LEVEL_LABEL } from '@ordewell/core/plan-utils';
+import type { CompactionBlock, GlobalRunSettings, RunSettings, Task, TaskModelAssignment, RunnerId, RunnerAuth } from '@ordewell/core';
+import { accountLimitsOf, compactionText, SUPERVISOR_LEVEL_LABEL } from '@ordewell/core/plan-utils';
 import { planSummaryLabel, nextDock } from './planDock';
-import { DetailContext } from './detail';
+import { OpenPatchContext } from './openPatch';
 import { useFollowOutput } from './followOutput';
 import { isBuiltinSlashCommand, slashHelp } from '../../commands/slashCommands';
 import type { HostToWebview, SettingsChange, WebviewToHost } from '../../shared/protocol';
-import { hasHiddenDetail } from '@ordewell/core/plan-utils';
 import { patchedBlocks } from '../../shared/conversationPatch';
 
 declare function acquireVsCodeApi(): {
@@ -67,21 +68,39 @@ const DETECTING = 'Detecting coding agents…';
 export default function App() {
   const [host, dispatch] = useReducer(reduceHost, INITIAL_HOST_STATE);
   const {
-    conversation, plan, isExecuting, isResearchActive, conversationBusy, error, models, modelsByRunner,
-    runnerList, enabledRunnerIds, modelAllowlist, runners, held, unsent, modesByRunner, runnerNotice, modelConfig,
+    conversation, plan, isExecuting, isResearchActive, error, models, modelsByRunner,
+    runnerList, enabledRunnerIds, pendingRunners, modelAllowlist, held, unsent, modesByRunner, runnerNotice, modelConfig,
     modelOptions, configuredProviders, planner, plannerKnown, runnersKnown, isReady, modelDiscoveryErrors,
-    skills, taskSkills, checkpoint, taskOutput, run, dockExpanded, dockHeight, settingsRequest,
+    skills, taskSkills, checkpoint, taskOutput, run, activity, starting, dockExpanded, dockHeight, settingsRequest, accountLimits,
   } = host;
   const setPlan = useCallback((v: Updatable<HostState['plan']>) => dispatch({ type: 'patchPlan', plan: v }), []);
-  const setIsResearchActive = useCallback((v: boolean) => dispatch({ type: 'patchResearchActive', active: v }), []);
   const setError = useCallback((v: string) => dispatch({ type: 'patchError', error: v }), []);
   const setIsReady = useCallback((v: boolean) => dispatch({ type: 'patchReady', ready: v }), []);
-  const setRunners = useCallback((v: Updatable<RunnerId[]>) => dispatch({ type: 'patchRunners', runners: v }), []);
   const setDockHeight = useCallback((v: number | undefined) => dispatch({ type: 'patchDockHeight', height: v }), []);
   const setDockExpanded = useCallback((v: Updatable<boolean>) => dispatch({ type: 'patchDockExpanded', expanded: v }), []);
   const blocks = useMemo(() => patchedBlocks(conversation), [conversation]);
-  const [detailAll, setDetailAll] = useState(false);
-  const detail = useMemo(() => ({ detailAll, setDetailAll }), [detailAll]);
+  const runners = useMemo(
+    () => runnersOn({ runnerList, enabledRunnerIds, pendingRunners }),
+    [runnerList, enabledRunnerIds, pendingRunners],
+  );
+  // The planner compacting holds the conversation as a turn does: Stop stops
+  // it, a message waits for it, and the draft stays. Read from the blocks, so
+  // a webview that reconnects mid-compaction knows it from what it is sent.
+  const compaction = useMemo(() => [...blocks].reverse().find((b): b is CompactionBlock => b.type === 'compaction' && b.origin !== undefined), [blocks]);
+  const compacting = compaction?.status === 'running';
+  const plannerBusy = isResearchActive || compacting;
+  // An API key is one of two ways in (ADR-0009): an installed coding agent
+  // plans on its own subscription, so key-less is a working setup, not a
+  // first-run wall.
+  const canPlan = configuredProviders.length > 0 || planner.backends.some((b) => b.usable);
+  const hasContent = blocks.length > 0 || isResearchActive || isExecuting || !!error;
+  /** The first screen is on show, with every signed-out agent's own row. */
+  const emptyStateShown = !hasContent && isReady && canPlan;
+  // Told as news only for a compaction this view saw run: one restored with
+  // the transcript is history, already drawn where it happened.
+  const seenRunning = useRef(new Set<string>());
+  if (compaction && compacting) seenRunning.current.add(compaction.id);
+  const compactionNews = compaction && seenRunning.current.has(compaction.id) ? compactionText(compaction) : '';
   /** A first Esc during a planner turn: one more within `STOP_ARM_MS` stops it. */
   const [stopArmed, setStopArmed] = useState(false);
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
@@ -89,12 +108,23 @@ export default function App() {
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
   const [setupCollapsed, setSetupCollapsed] = useState(false);
   const [runExpanded, setRunExpanded] = useState(false);
+  /** The coding agent whose login is running, by runner id: each action waits on its own. */
+  const [pendingLogin, setPendingLogin] = useState<Record<string, true>>({});
+  /** Each login that did not finish and why, by runner id: shown inline on the row or pill that asked. */
+  const [loginFailure, setLoginFailure] = useState<Record<string, string>>({});
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const dockBodyRef = useRef<HTMLDivElement>(null);
   const runSettingsRef = useRef<HTMLElement>(null);
   const helpTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const processingRef = useRef(false);
+  /** A start is with the host; a second click is the same start, not another. */
+  const startPendingRef = useRef(false);
+  const nextStartRequest = useRef(0);
+  // Prefixed per page: a reload starts the count again, and an answer still
+  // on its way to the old page must not match a click on the new one.
+  const runnerRequestPrefix = useRef(Math.random().toString(36).slice(2));
+  const nextRunnerRequest = useRef(0);
   const lastActivityRef = useRef(Date.now());
   const planRef = useRef(plan);
   planRef.current = plan;
@@ -105,10 +135,17 @@ export default function App() {
     processingRef.current = isResearchActive || isExecuting;
   }, [isResearchActive, isExecuting]);
 
-  // The working line is drawn below the conversation blocks, and the stack of
-  // queued prompts above the composer takes height from the list: each must
-  // be followed too, or the newest output ends up past the fold.
-  const followRef = useFollowOutput<HTMLDivElement>(blocks, held, isResearchActive);
+  // What the plan's start control shows: a click's own request, or the run's
+  // authoritative admission, until the first attempt makes it a run.
+  const isStarting = !isExecuting && (starting || activity.starting);
+  useEffect(() => {
+    startPendingRef.current = isStarting;
+  }, [isStarting]);
+
+  // The pinned working line and the stack of queued prompts above the
+  // composer take height from the list: each must be followed too, or the
+  // newest output ends up past the fold.
+  const followRef = useFollowOutput<HTMLDivElement>([blocks, held, plannerBusy], { follow: hasContent });
   const messageListCallbackRef = useCallback((el: HTMLDivElement | null) => {
     messageListRef.current = el;
     followRef(el);
@@ -117,7 +154,29 @@ export default function App() {
   useEffect(() => {
     const handler = (event: MessageEvent<HostToWebview>) => {
       lastActivityRef.current = Date.now();
-      dispatch({ ...event.data, now: Date.now() });
+      const msg = event.data;
+      // The login is this surface's own state, not the session's: it ends here
+      // rather than in the reducer that mirrors the host.
+      if (msg.type === 'plannerLoginEnded') {
+        // Each agent's login is its own: one ending neither clears another's
+        // pending action nor overwrites its failure.
+        setPendingLogin((current) => {
+          if (msg.runner === undefined) return {};
+          const next = { ...current };
+          delete next[msg.runner];
+          return next;
+        });
+        setLoginFailure((current) => {
+          if (msg.ok) {
+            const next = { ...current };
+            if (msg.runner !== undefined) delete next[msg.runner];
+            return next;
+          }
+          return { ...current, [msg.runner ?? '']: msg.message ?? 'Sign-in did not finish.' };
+        });
+        return;
+      }
+      dispatch({ ...msg, now: Date.now() });
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
@@ -151,18 +210,23 @@ export default function App() {
   // unlock the input instead of leaving the chat bricked. A harness planner
   // quiet on screen still sends liveness, so only real silence trips it; the
   // window is generous — non-streaming providers can legitimately stay quiet
-  // for a minute while a model thinks.
+  // for a minute while a model thinks. A turn waiting on the user's approval
+  // card is quiet by design, and must never be called a hang.
   const WATCHDOG_MS = 120_000;
+  const approvalWaiting = useMemo(
+    () => blocks.some((b) => b.type === 'approval' && b.status === 'pending'),
+    [blocks],
+  );
   useEffect(() => {
-    if (!isResearchActive) return;
+    if (!isResearchActive || approvalWaiting) return;
     lastActivityRef.current = Date.now();
     const timer = setInterval(() => {
       if (Date.now() - lastActivityRef.current < WATCHDOG_MS) return;
-      setIsResearchActive(false);
+      dispatch({ type: 'turnLost' });
       pushSystem('The planner stopped responding, so the input was re-enabled. Your last message may not have been processed: try sending it again.');
     }, 5_000);
     return () => clearInterval(timer);
-  }, [isResearchActive, pushSystem]);
+  }, [isResearchActive, approvalWaiting, pushSystem]);
 
   const handleNewSession = useCallback(() => {
     dispatch({ type: 'resetSession', kind: 'new' });
@@ -190,11 +254,12 @@ export default function App() {
     }
 
     if (text.startsWith('/')) {
+      dispatch({ type: 'commandSent' });
       vscode.postMessage({ type: 'sendMessage', text, runners, typed: true });
       return;
     }
 
-    if (isResearchActive) {
+    if (plannerBusy) {
       vscode.postMessage({ type: 'holdPrompt', text });
       return;
     }
@@ -206,16 +271,17 @@ export default function App() {
     // moment to start it, and a second send in between would race the first.
     dispatch({ type: 'turnRequested' });
     vscode.postMessage({ type: 'sendMessage', text, runners, typed: true });
-  }, [runners, handleNewSession, showNewSessionConfirm, isResearchActive]);
+  }, [runners, handleNewSession, showNewSessionConfirm, plannerBusy]);
 
-  const handleToggleRunner = useCallback((runnerId: RunnerId) => {
-    setRunners((prev) => {
-      if (prev.includes(runnerId)) {
-        const next = prev.filter((r) => r !== runnerId);
-        return next.length > 0 ? next : prev;
-      }
-      return [...prev, runnerId];
-    });
+  // The pills are the saved choice every surface and planner turn reads
+  // (ADR-0043), so a click asks the host to save it. The request names the
+  // state wanted, which keeps a quick second click or a repeat from flipping
+  // it back; the pill shows the click until the host answers this request.
+  const handleRunnerPill = useCallback((runnerId: RunnerId, enabled: boolean) => {
+    nextRunnerRequest.current += 1;
+    const requestId = `${runnerRequestPrefix.current}-${nextRunnerRequest.current}`;
+    dispatch({ type: 'runnerChoiceRequested', runnerId, enabled, requestId });
+    vscode.postMessage({ type: 'setRunnerEnabled', runnerId, enabled, requestId });
   }, []);
 
   const handleConfigureApiKey = useCallback(() => {
@@ -316,6 +382,10 @@ export default function App() {
     pushSystem('Resend cancelled: what waits goes with your next message.');
   }, [pushSystem]);
 
+  const handleRetryCompaction = useCallback(() => {
+    vscode.postMessage({ type: 'sendSystemCommand', command: 'retryPlannerCompaction' });
+  }, []);
+
   const handleCancelResume = useCallback((taskId: string) => {
     vscode.postMessage({ type: 'sendSystemCommand', command: 'cancelResume', taskId });
   }, []);
@@ -328,13 +398,20 @@ export default function App() {
     vscode.postMessage({ type: 'sendSystemCommand', command: 'forceStart', taskId });
   }, []);
 
-  const handleExecutePlan = useCallback(() => {
-    vscode.postMessage({ type: 'sendSystemCommand', command: 'executePlan' });
+  const requestStart = useCallback(() => {
+    // Shown before the host is even asked, and only once: two clicks while
+    // the first is still with the host are one start.
+    if (startPendingRef.current) return;
+    const requestId = nextStartRequest.current + 1;
+    nextStartRequest.current = requestId;
+    startPendingRef.current = true;
+    dispatch({ type: 'startRequested', requestId });
+    vscode.postMessage({ type: 'sendSystemCommand', command: 'executePlan', requestId });
   }, []);
 
-  const handleApproveAll = useCallback(() => {
-    vscode.postMessage({ type: 'sendSystemCommand', command: 'executePlan' });
-  }, []);
+  const handleExecutePlan = requestStart;
+
+  const handleApproveAll = requestStart;
 
   const handleStopExecution = useCallback(() => {
     vscode.postMessage({ type: 'sendSystemCommand', command: 'stopExecution' });
@@ -348,6 +425,12 @@ export default function App() {
   // for it. Opening is idempotent host-side — an open tab is focused.
   const handleOpenTaskLog = useCallback((taskId: string) => {
     vscode.postMessage({ type: 'openTaskLog', taskId });
+  }, []);
+
+  // A handoff's saved patch is a workspace file beside the attempt's log
+  // (ADR-0050): the host opens it in an editor tab, as it opens a run's diff.
+  const handleOpenPatch = useCallback((path: string) => {
+    vscode.postMessage({ type: 'openFile', path });
   }, []);
 
   // A card's message box (ADR-0018, M1; ADR-0023, F1) uses the same routes the
@@ -384,13 +467,13 @@ export default function App() {
   // the host's either way — the hold never applies to commands — but a skill
   // invocation (`/name …`) is a planner prompt, so Send now stops the turn.
   const handleSendNow = useCallback((text: string) => {
-    if (!isResearchActive || isBuiltinSlashCommand(text)) {
+    if (!plannerBusy || isBuiltinSlashCommand(text)) {
       handleSend(text);
       return;
     }
     setStopArmed(false);
     vscode.postMessage({ type: 'sendMessageNow', text });
-  }, [isResearchActive, handleSend]);
+  }, [plannerBusy, handleSend]);
 
   // Prompts held for the next planner turn. Only the newest carries the ×:
   // unsend always takes the newest, as Esc does, so it never promises another.
@@ -416,7 +499,7 @@ export default function App() {
       setExpandedTaskId(null);
       return true;
     }
-    if (!isResearchActive) return false;
+    if (!plannerBusy) return false;
     if (held.length > 0) {
       setStopArmed(false);
       handleUnsend();
@@ -427,7 +510,7 @@ export default function App() {
       setStopArmed(true);
     }
     return true;
-  }, [expandedTaskId, isResearchActive, held, stopArmed, handleUnsend, stopTurn]);
+  }, [expandedTaskId, plannerBusy, held, stopArmed, handleUnsend, stopTurn]);
 
   // Esc closes an open card first, wherever focus is. Inner handlers (card
   // editors, pickers, the input) mark theirs with preventDefault, so one Esc
@@ -447,13 +530,13 @@ export default function App() {
   // lapses on its own, and never outlives the turn it was aimed at.
   useEffect(() => {
     if (!stopArmed) return;
-    if (!isResearchActive) {
+    if (!plannerBusy) {
       setStopArmed(false);
       return;
     }
     const timer = setTimeout(() => setStopArmed(false), STOP_ARM_MS);
     return () => clearTimeout(timer);
-  }, [stopArmed, isResearchActive]);
+  }, [stopArmed, plannerBusy]);
 
   const handleApproveCheckpoint = useCallback(() => {
     if (!checkpoint) return;
@@ -469,22 +552,6 @@ export default function App() {
     vscode.postMessage({ type: 'answerCheckpoint', taskId: checkpoint.taskId, approved: false, reason });
     dispatch({ type: 'checkpointAnswered' });
   }, [checkpoint]);
-
-  const handleMergeTasks = useCallback((taskIds: string[]) => {
-    const current = planRef.current;
-    if (!current) return;
-    const titles = taskIds.map((id) => current.tasks.find((t) => t.id === id)?.title ?? id);
-    pushSystem(`Requesting merge of: ${titles.join(' + ')}.`);
-    vscode.postMessage({ type: 'mergeTasks', taskIds });
-  }, [pushSystem]);
-
-  const handleSplitTask = useCallback((taskId: string) => {
-    const current = planRef.current;
-    if (!current) return;
-    const task = current.tasks.find((t) => t.id === taskId);
-    pushSystem(`Requesting split of: ${task?.title ?? taskId}.`);
-    vscode.postMessage({ type: 'splitTask', taskId });
-  }, [pushSystem]);
 
   // The host owns every isolation action: opening the diff, and the merge,
   // discard and cleanup that touch the user's real branches.
@@ -503,8 +570,10 @@ export default function App() {
   }, [handleIsolationAction]);
 
   const getPlaceholder = (): string => {
+    if (compacting) return 'Queue a message for when the context is compacted...';
     if (isResearchActive) return 'Queue a message for when the planner is done...';
     if (isExecuting) return 'AI is working...';
+    if (isStarting) return 'Starting the plan...';
     if (plan && plan.tasks.length > 0) return 'Modify the plan...';
     if (blocks.some((b) => b.type === 'message' && b.role === 'planner')) return 'Reply to the planner...';
     return 'Describe what you want to build...';
@@ -570,6 +639,8 @@ export default function App() {
   const [pendingPlanner, setPendingPlanner] = useState<string | null>(null);
   useEffect(() => { setPendingPlanner(null); }, [planner]);
   const activePlanner = pendingPlanner ?? planner.provider;
+  /** The backend behind that choice, whose own auth verdict the Settings row carries. */
+  const activeBackend = planner.backends.find((b) => b.id === activePlanner);
 
   const handlePlannerChange = useCallback((provider: string) => {
     // Already the planner, or already asked for: a repeat would run the switch twice.
@@ -583,12 +654,7 @@ export default function App() {
     () => (runnersKnown ? { enabledRunners: enabledRunnerIds, allowlist: modelAllowlist, models: modelsByRunner } : undefined),
     [runnersKnown, enabledRunnerIds, modelAllowlist, modelsByRunner],
   );
-  const visibleRunners = runnerList.filter((r) => enabledRunnerIds.includes(r.id));
 
-  // An API key is one of two ways in (ADR-0009): an installed coding agent
-  // plans on its own subscription, so key-less is a working setup, not a
-  // first-run wall.
-  const canPlan = configuredProviders.length > 0 || planner.backends.some((b) => b.usable);
   // The coding agents the host lists as planners are listed whether or not they
   // are installed, which `runnerList` (installed runners only) cannot say. That
   // full list is kept only to name what to install; the pills offer the usable
@@ -596,6 +662,47 @@ export default function App() {
   // (ADR-0009).
   const agentNames = planner.backends.filter((b) => b.kind === 'harness').map((b) => b.label);
   const offeredBackends = planner.backends.filter((b) => b.usable);
+
+  /** What each installed coding agent's own status probe said, keyed by runner id. */
+  const runnerAuth = useMemo<Record<string, RunnerAuth | undefined>>(() => {
+    const byRunner: Record<string, RunnerAuth | undefined> = {};
+    for (const backend of planner.backends) byRunner[backend.runner ?? backend.id] = backend.auth;
+    return byRunner;
+  }, [planner.backends]);
+
+  /** A pill's own action: that agent's login, without switching the planner to it. */
+  const handleRunnerLogin = useCallback((runner: string) => {
+    setLoginFailure((current) => {
+      const next = { ...current };
+      delete next[runner];
+      return next;
+    });
+    setPendingLogin((current) => ({ ...current, [runner]: true }));
+    vscode.postMessage({ type: 'loginPlanner', runner });
+  }, []);
+
+  /**
+   * Every signed-out coding agent, not only the one planning: the login is each
+   * one's own fix, and the active planner leads because its refusal is the one
+   * about to bite. The rows keep the host's list order after that.
+   */
+  const signedOutPlanners = useMemo<SignedOutPlannerRow[]>(() => {
+    const rows = planner.backends
+      .filter((b) => b.kind === 'harness' && b.auth?.state === 'signed-out')
+      .map((b) => {
+        const runner = b.runner ?? b.id;
+        return {
+          id: b.id,
+          runner,
+          label: b.label,
+          pending: Boolean(pendingLogin[runner]),
+          failure: loginFailure[runner],
+          ...(b.auth?.loginCommand?.length ? { onLogIn: () => handleRunnerLogin(runner) } : {}),
+        };
+      });
+    // Stable sort: the active planner first, everything else as the host listed it.
+    return rows.sort((a, b) => Number(b.id === activePlanner) - Number(a.id === activePlanner));
+  }, [planner.backends, activePlanner, pendingLogin, loginFailure, handleRunnerLogin]);
 
   const runnerLabelMap = useMemo<Record<string, string>>(() => {
     const m: Record<string, string> = {};
@@ -613,11 +720,8 @@ export default function App() {
     [plan],
   );
 
-  const hasContent = blocks.length > 0 || isResearchActive || isExecuting || !!error;
-  const streaming = blocks.some((b) => (b.type === 'message' || b.type === 'thinking') && b.streaming);
   /** The one usage block, drawn pinned below the conversation rather than scrolling in it. */
   const usageBlock = useMemo(() => blocks.find((b) => b.type === 'usage'), [blocks]);
-  const hasDetail = useMemo(() => hasHiddenDetail(blocks), [blocks]);
 
   /**
    * The plan, mounted once. Not a timeline entry: it is the live control surface
@@ -690,6 +794,8 @@ export default function App() {
               modelsByRunner={modelsByRunner}
               modesByRunner={modesByRunner}
               isExecuting={isExecuting}
+              isStarting={isStarting}
+              runActive={isExecuting || starting || activity.advancesOnItsOwn}
               taskOutput={taskOutput}
               runnerLabels={runnerLabelMap}
               runners={runnerList}
@@ -713,8 +819,6 @@ export default function App() {
               onForceStart={handleForceStart}
               onMarkComplete={handleMarkComplete}
               onMarkIncomplete={handleMarkIncomplete}
-              onMerge={handleMergeTasks}
-              onSplit={handleSplitTask}
               onExecutePlan={handleExecutePlan}
               onStopExecution={handleStopExecution}
               onApproveAll={handleApproveAll}
@@ -762,56 +866,94 @@ export default function App() {
   };
 
   return (
-    <DetailContext.Provider value={detail}>
-    <div className="chat-container">
+    <OpenPatchContext.Provider value={handleOpenPatch}>
+    {/* Focus targets for a mouse selection, never tab stops. VS Code 1.143+
+        answers a Cmd/Ctrl+C in a webview by refocusing the last-focused
+        element before it copies whenever focus sits on <body>, and here that
+        is the composer, whose focus wipes the selection. A drag in the
+        conversation or the footer now focuses one of these instead, so focus
+        never rests on <body>. The list is its own target so arrow keys and
+        Page Down still scroll it after a click. */}
+    <div className="chat-container" tabIndex={-1}>
       <div className="setup-panel">
         <button
           type="button"
-          className="setup-panel-toggle"
+          className={`setup-panel-toggle${setupCollapsed ? '' : ' open'}`}
+          aria-expanded={!setupCollapsed}
           onClick={() => setSetupCollapsed((v) => !v)}
-          title={setupCollapsed ? 'Expand settings' : 'Collapse settings'}
+          title={
+            activeBackend?.auth?.state === 'signed-out'
+              ? `${activeBackend.label} is not logged in — open Settings to sign in`
+              : setupCollapsed
+                ? 'Expand settings'
+                : 'Collapse settings'
+          }
         >
           <span className="setup-panel-toggle-row">
             <span className="setup-panel-toggle-label">Settings</span>
+            {activeBackend?.auth?.state === 'signed-out' && (
+              <>
+                <span className="planner-auth-dot" aria-hidden="true" />
+                <span className="visually-hidden">not logged in: {activeBackend.label}</span>
+              </>
+            )}
             <span className={`setup-panel-chevron${setupCollapsed ? ' collapsed' : ''}`}>
               <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
                 <path d="M2 4L5.5 7.5L9 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </span>
           </span>
-          {setupCollapsed && (
-            <span className="setup-panel-summary">
-              {plannerKnown
-                ? <>
-                    {planner.backends.find((b) => b.id === activePlanner)?.label || 'No planner'}
-                    {' · '}
-                    {runners.length} runner{runners.length === 1 ? '' : 's'}
-                  </>
-                : DETECTING}
-            </span>
-          )}
         </button>
         <div className={`setup-panel-body${setupCollapsed ? ' collapsed' : ''}`}>
         <section className="setup-block">
           <div className="setup-block-title">Planner</div>
           <div className="setup-block-hint">
             Researches your codebase and writes the plan. A coding agent plans on its own
-            subscription. No API key needed.
+            subscription.
           </div>
           {offeredBackends.length > 0 ? (
             <>
               <div className="planner-backends">
-                {offeredBackends.map((b) => (
-                  <button
-                    key={b.id}
-                    type="button"
-                    className={`planner-pill ${b.id === activePlanner ? 'active' : ''}${pendingPlanner === b.id ? ' pending' : ''}`}
-                    title={b.reason}
-                    onClick={() => handlePlannerChange(b.id)}
-                  >
-                    {b.label}
-                  </button>
-                ))}
+                {offeredBackends.map((b) => {
+                  const runnerId = b.runner ?? b.id;
+                  const signingIn = Boolean(pendingLogin[runnerId]);
+                  const signedOut = b.auth?.state === 'signed-out';
+                  // The login is this agent's own and never selects the planner
+                  // (ADR-0009); it stays offered here even while the empty state
+                  // carries the same action, as long as there is a command to run.
+                  const canLogIn = signedOut && (b.auth?.loginCommand?.length ?? 0) > 0;
+                  return (
+                    <span className={`planner-pill-item${canLogIn ? ' has-login' : ''}`} key={b.id} data-runner={runnerId}>
+                      <span className={`planner-pill-group${signedOut ? ' signed-out' : ''}${b.id === activePlanner ? ' active' : ''}`}>
+                        <button
+                          type="button"
+                          className={`planner-pill${b.id === activePlanner ? ' active' : ''}${signedOut ? ' signed-out' : ''}${pendingPlanner === b.id ? ' pending' : ''}`}
+                          title={signedOut ? 'Not logged in — sign in from this chat' : b.reason}
+                          onClick={() => handlePlannerChange(b.id)}
+                        >
+                          {signedOut && <span className="planner-auth-dot" aria-hidden="true" />}
+                          {b.label}
+                        </button>
+                        {canLogIn && (
+                          <PlannerLoginAction
+                            className="planner-pill-login"
+                            onLogIn={() => handleRunnerLogin(runnerId)}
+                            pending={signingIn}
+                            ariaLabel={signingIn ? `Signing in to ${b.label}` : `Log in to ${b.label}`}
+                            title={signingIn ? `Signing in to ${b.label}` : `Log in to ${b.label}`}
+                          />
+                        )}
+                      </span>
+                      {canLogIn && (
+                        <span className="planner-pill-failure-slot">
+                          {!signingIn && loginFailure[runnerId] !== undefined && (
+                            <span className="planner-pill-login-failure" role="status" title={loginFailure[runnerId]}>{loginFailure[runnerId]}</span>
+                          )}
+                        </span>
+                      )}
+                    </span>
+                  );
+                })}
               </div>
               {/* A harness planner has no API provider to filter by, and its models
                   are never in the vendor mapping — passing either would empty the
@@ -853,23 +995,59 @@ export default function App() {
         <section className="setup-block">
           <div className="setup-block-title">Runners</div>
           <div className="setup-block-hint">
-            Coding agents that execute the plan's tasks. Toggle which ones the planner may assign.
+            Coding agents that execute the plan's tasks. The planner assigns only the ones switched on.
           </div>
           <div className="runner-pills">
-            {visibleRunners.map((r) => {
-              const isToggled = runners.includes(r.id);
+            {runnerList.map((r) => {
+              const on = runners.includes(r.id);
+              // Never emptied from here: with no runner on, no surface could assign a task.
+              const last = on && runners.length === 1;
+              const auth = runnerAuth[r.id];
+              const signedOut = auth?.state === 'signed-out';
+              const signingIn = Boolean(pendingLogin[r.id]);
+              // A login never switches the runner on or off: it only signs that
+              // agent in, exactly as the planner pill beside it does.
+              const canLogIn = signedOut && (auth?.loginCommand?.length ?? 0) > 0;
+              const title = signedOut
+                ? 'Not logged in'
+                : last
+                  ? `${r.displayName} is the only runner on: switch another on first`
+                  : on
+                    ? `Stop assigning tasks to ${r.displayName}, on every surface`
+                    : `Click to enable ${r.displayName} as a runner on every surface`;
               return (
-                <button key={r.id} className={`runner-pill ${isToggled ? 'on' : 'off'}`}
-                  onClick={() => handleToggleRunner(r.id)}
-                  title={`${isToggled ? 'Stop assigning' : 'Assign'} tasks to ${r.displayName}`}>
-                  <span className="runner-dot" /> {r.displayName}
-                </button>
+                <span className={`runner-pill-item${canLogIn ? ' has-login' : ''}`} key={r.id} data-runner={r.id}>
+                  <span className={`runner-pill-group${on ? ' on' : ' disabled'}${r.id in pendingRunners ? ' pending' : ''}${signedOut ? ' signed-out' : ''}`}>
+                    <button className={`runner-pill ${on ? 'on' : 'disabled'}${r.id in pendingRunners ? ' pending' : ''}${signedOut ? ' signed-out' : ''}`}
+                      onClick={() => { if (!last) handleRunnerPill(r.id, !on); }}
+                      aria-pressed={on}
+                      title={title}>
+                      <span className={`runner-dot${signedOut ? ' planner-auth-dot' : ''}`} aria-hidden={signedOut ? true : undefined} /> {r.displayName}
+                    </button>
+                    {canLogIn && (
+                      <PlannerLoginAction
+                        className="planner-pill-login runner-pill-login"
+                        onLogIn={() => handleRunnerLogin(r.id)}
+                        pending={signingIn}
+                        ariaLabel={signingIn ? `Signing in to ${r.displayName}` : `Log in to ${r.displayName}`}
+                        title={signingIn ? `Signing in to ${r.displayName}` : `Log in to ${r.displayName}`}
+                      />
+                    )}
+                  </span>
+                  {canLogIn && (
+                    <span className="planner-pill-failure-slot runner-pill-failure-slot">
+                      {!signingIn && loginFailure[r.id] !== undefined && (
+                        <span className="planner-pill-login-failure runner-pill-login-failure" role="status" title={loginFailure[r.id]}>{loginFailure[r.id]}</span>
+                      )}
+                    </span>
+                  )}
+                </span>
               );
             })}
-            {visibleRunners.length === 0 && !runnersKnown && (
+            {runnerList.length === 0 && !runnersKnown && (
               <span className="setup-block-empty">{DETECTING}</span>
             )}
-            {visibleRunners.length === 0 && runnersKnown && (
+            {runnerList.length === 0 && runnersKnown && (
               <span className="setup-block-empty">
                 No coding agent detected: install {orNames(agentNames, 'a coding agent')}, then run <code>/refresh</code>.
               </span>
@@ -881,20 +1059,6 @@ export default function App() {
         </div>
       </div>
 
-      {hasDetail && (
-        <div className="chat-header">
-          <button
-            type="button"
-            className="detail-toggle"
-            aria-pressed={detailAll}
-            onClick={() => setDetailAll((v) => !v)}
-            title="Show or hide the full thinking, command and subagent detail for the whole conversation"
-          >
-            {detailAll ? 'Collapse all' : 'Expand all'}
-          </button>
-        </div>
-      )}
-
       {slashOutput && (
         <div className="slash-output">{slashOutput}</div>
       )}
@@ -902,7 +1066,7 @@ export default function App() {
       {showNewSessionConfirm && (
         <div className="new-session-confirm">
           <div className="new-session-confirm-text">
-            Start a new session? Current plan generation will be stopped.
+            Start a new session? The current plan and its progress are cleared: planning and any running tasks are stopped.
           </div>
           <div className="new-session-confirm-actions">
             <button className="btn-accept" onClick={() => {
@@ -914,7 +1078,7 @@ export default function App() {
         </div>
       )}
 
-      <div className="message-list" ref={messageListCallbackRef}>
+      <div className="message-list" tabIndex={-1} ref={messageListCallbackRef}>
         {!hasContent && !isReady && (
           <div className="loading-state">
             <div className="loading-pulse" />
@@ -931,11 +1095,11 @@ export default function App() {
         )}
 
         {!hasContent && isReady && !canPlan && plannerKnown && (
-          <GetStarted runnerNames={agentNames} onConfigure={handleConfigureApiKey} runSettings={host.runSettings} />
+          <GetStarted runnerNames={agentNames} onConfigure={handleConfigureApiKey} runSettings={host.runSettings} isolationPreview={host.isolationPreview} />
         )}
 
-        {!hasContent && isReady && canPlan && (
-          <EmptyState onLoadSession={handleLoadSession} runSettings={host.runSettings} />
+        {emptyStateShown && (
+          <EmptyState onLoadSession={handleLoadSession} runSettings={host.runSettings} signedOut={signedOutPlanners} isolationPreview={host.isolationPreview} />
         )}
 
         {error && (
@@ -947,26 +1111,41 @@ export default function App() {
         )}
 
         <ConversationBlocks
+          key={host.conversationEpoch}
           blocks={blocks}
-          detailAll={detailAll}
           onShowPlan={handleShowPlan}
           onResolveApproval={handleResolveApproval}
         />
-
-        {isResearchActive && !streaming && (
-          <div className="chat-msg-working">
-            <span className="chat-msg-spinner" /> Working&hellip;
-          </div>
-        )}
       </div>
 
       {renderPlanDock()}
 
-      {usageBlock && <UsageLine block={usageBlock} />}
+      <UsageLine block={usageBlock} limits={accountLimitsOf(accountLimits, planner.runner, modelConfig?.orchestrator)} />
+
+      {/* Pinned rather than the list's last row, and drawn for the whole turn:
+          a turn can go minutes with nothing new to show, its thinking block
+          still marked streaming while the model writes a tool call's input,
+          and a reader scrolled back up would not see a row in the list. */}
+      {isResearchActive && !compacting && (
+        <div className="chat-msg-working" role="status">
+          <span className="chat-msg-spinner" aria-hidden="true" /> Working&hellip;
+        </div>
+      )}
+
+      {/* Pinned for the same reason while the planner compacts, and kept as
+          the one live region that tells its start and its end. */}
+      {compaction && (
+        <div className={compacting ? 'chat-msg-working' : 'visually-hidden'} role="status">
+          {compacting && <span className="chat-msg-spinner" aria-hidden="true" />}
+          {compactionNews}
+        </div>
+      )}
 
       {stopArmed && <div className="stop-hint" role="status">Press Esc again to stop</div>}
 
       <PlannerResendBar resend={plan?.plannerResend} onCancel={handleCancelResend} />
+
+      <PlannerPauseBar pause={plan?.plannerContextPause} busy={plannerBusy} onRetry={handleRetryCompaction} onStop={stopTurn} />
 
       <PendingMessages messages={pending} />
 
@@ -975,14 +1154,13 @@ export default function App() {
         onSendNow={handleSendNow}
         onStop={stopTurn}
         onEscape={handleEscape}
-        disabled={conversationBusy}
-        disabledReason={conversationBusy ? 'Compacting the conversation...' : undefined}
+        disabled={false}
         placeholder={getPlaceholder()}
-        isTurnRunning={isResearchActive}
+        isTurnRunning={plannerBusy}
         unsent={unsent}
         skills={skills}
       />
     </div>
-    </DetailContext.Provider>
+    </OpenPatchContext.Provider>
   );
 }

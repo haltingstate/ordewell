@@ -27,7 +27,7 @@ text markers have no role.
 
 | token | bound to | tools |
 |---|---|---|
-| **Task token** | one session, one task, one attempt generation | `task_complete({status: 'done' \| 'blocked' \| 'failed', summary, findings?, artifacts?, report?, reason?})`, `checkpoint({question})`, `read_task({task, attempt?, include_report?})`; a read-only task's also `run_command({command})`, its only shell ([ADR-0046](../planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md)) |
+| **Task token** | one session, one task, one attempt generation | `task_complete({status: 'done' \| 'blocked' \| 'failed', summary, findings?, artifacts?, report?, reason?})`, `checkpoint({question})`, `read_task({task, attempt?, include_report?})`, and for a change task `apply_patch({task, attempt?})`, which merges a saved patch into its worktree ([ADR-0050](../planner-envelope/0050-a-read-only-task-can-hand-off-its-prototype-as-a-patch.md)); a read-only task's also `run_command({command})`, its only shell ([ADR-0046](../planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md)), `save_patch({})`, which keeps what that shell changed as a patch ([ADR-0050](../planner-envelope/0050-a-read-only-task-can-hand-off-its-prototype-as-a-patch.md)), and `fetch({url})` and `web_search({query})`, its only web reads, decided by the web-read policy without asking anyone ([ADR-0046](../planner-envelope/0046-a-read-only-task-reads-natively-runs-sealed-and-lands-nothing.md), [ADR-0027](../planner-envelope/0027-web-reads-in-the-planner-envelope.md)) |
 | **Planner token** | one session's planner conversation | `list_runners()`, `list_models({runner})`, `submit_plan({tasks})`, `edit_plan({ops})`, `task_query({...})`, `task_output({task, attempt?, kinds?, ...})`, `task_diff({task, repo?, path?, ...})`, `load_skill({name})` (a model-invocable planner skill's instructions; [ADR-0024](../planner/0024-unified-skills.md)) |
 
 #37's runner-facing tools (`board_post`, `report`, …) join the task side later,
@@ -46,7 +46,10 @@ on the same mechanism.
   `VerdictEngine` already tracks (`generations`, `bumpGeneration`). It is
   revoked when the attempt ends — verdict, retry, cancel, stop or process exit
   — so a late call from an earlier attempt is refused, the same rule that
-  makes a stale `onOutput` callback a no-op today.
+  makes a stale `onOutput` callback a no-op today. Revoking it aborts the
+  calls it has in flight, and so does the caller's own cancellation: each
+  request is served on its own, so the server finds the call a
+  `notifications/cancelled` names among the token's calls in flight.
 - **A planner token is one planner conversation (A3).** Issued when the
   harness planner is spawned, revoked when that process is disposed
   (`Session.reset()`, a new session, a respawn). A respawned planner gets a
@@ -110,7 +113,11 @@ on the same mechanism.
   ([ADR-0028](../planner-envelope/0028-planners-never-run-repository-config.md)).
 - **Prompts teach the connected tools (S4).** The connector checks the runner's
   own MCP attach state before sending the prompt. A failed attach receives no
-  task or planning prompt.
+  task or planning prompt. Attached means the model is offered the tools, for
+  as long as the runner lives: OpenCode 2.x, which rebuilds its services from
+  the launch configuration and so drops the runtime setting that lists them
+  outside code mode, is launched never to evict those services and has the
+  setting made again before every turn.
 
 ### Tasks: evidence, not opinion
 
@@ -163,18 +170,48 @@ planner tools are recorded here as an explicit entry against both:
   recorded starting commit. These are bounded answers, not a path into
   `.ordewell/` or an arbitrary git ref (ADR-0012).
 - **The only writes are `submit_plan` and `edit_plan` (P2).** They go through
-  the same validation and commit path as the envelopes they replace: the live
-  catalog, the assignment resolver (ADR-0003: a stray model id in a
-  submitted plan is replaced by the allowlist's, its effort carried to the
-  nearest level, and the result reports the adjustment), and `applyTaskOps`
-  with `TaskEditValidator` (ADR-0012). The same
-  tasks produce the same plan by either route, and the plan stays the source
-  of truth (ADR-0001). A structural edit during a live run applies at once to
-  tasks not yet started and is refused, with a note, for a running or
-  finished task, exactly as an envelope edit is (ADR-0029).
+  the same check and commit path as the envelopes they replace. One module,
+  `PlanChangeCheck`, holds every planner change to its rules, a whole plan or a
+  batch of task ops, as it commits — a tool call as it answers, an envelope as
+  its reply settles — and a whole plan's JSON as it is submitted too, against
+  one live scope: the runners enabled now, for a plan and an edit alike
+  (ADR-0003, V1: a task an edit leaves on a runner switched off since stands,
+  and nothing new goes there), their modes and those of the runners the plan's
+  tasks are on, the assignment resolver (ADR-0003: a stray model id
+  in a submitted plan is replaced by the allowlist's, its effort carried to
+  the nearest level, and the result reports the adjustment), `applyTaskOps`
+  with `TaskEditValidator` (ADR-0012), the attached skills (ADR-0024) and, for
+  the supervisor, its oscillation guard (ADR-0029). An envelope plan is parsed
+  against the same intake. **A successful call commits before it answers:**
+  its change is checked, adopted, saved and broadcast in one step while the
+  planner's turn is still open, so `task_query`, the next call, every surface
+  and the saved session read the changed plan, and the answer names the tasks
+  it produced by id and reference — a plan's tasks, an edit's added tasks and
+  the task each of its handles names. Each `edit_plan` call is a batch of its
+  own, applied whole or not at all, its references resolved against the plan
+  as it stands when it commits; a later call, `run_task` or `retry_task` of the
+  same turn may name a task an earlier call added by the handle it gave, and
+  no call may give that handle again. Calls commit one at a time, in the tick
+  their check passes, so none commits against a plan another has changed
+  since. A call still waiting on its check when its turn is stopped,
+  superseded or abandoned, or its plan replaced, is refused and changes
+  nothing. What committed stays: the reply that ends the turn lands beside it,
+  never over it — a plan or edit envelope in that reply is not read — and a
+  turn that later stops, fails or hits a usage limit keeps it, together with
+  the input that asked for it, which the first commit takes as answered, so it
+  is never sent again to be made twice. Committing grants nothing else: what
+  it adds is approved only as ADR-0029 and ADR-0030 say, and the turn's start
+  hold lasts until the turn ends. Refusals are structured, naming the task and
+  field or the op, and no caller reads them back out of their wording. The
+  same tasks produce the same plan by either route, and the plan stays the
+  source of truth (ADR-0001). A structural edit during a live run applies at
+  once to tasks not yet started and is refused, with a note, for a running or
+  finished task, exactly as an envelope edit is (ADR-0029); a whole plan is
+  refused while tasks run.
 - **Execution tools are a further explicit entry (P5).** `run_plan`, `run_task`,
   `stop_task`, `stop_run`, `retry_task`, `message_task`, `answer_approval` (deny
-  or escalate, never allow), `merge_all`, `skip_task` (lands nothing, never
+  or escalate, never allow), `answer_checkpoint` (the supervisor at Act's, or the
+  user's), `merge_all`, `skip_task` (lands nothing, never
   marks work complete) and `run_script` change what runs, not files
   ([ADR-0029](../supervision/0029-the-supervisor.md)). `run_script` adds a
   script task to the plan and starts it in one step, and answers with its
@@ -251,6 +288,14 @@ planner tools are recorded here as an explicit entry against both:
   `submit_plan` matching the envelope's result is what keeps the two routes
   producing the same plan. The coercion is no longer silent: the result names
   it.
+- **Hold a tool's change until the reply ends.** Previously adopted: an
+  accepted `submit_plan` or `edit_plan` was kept by the open turn, joined into
+  one batch per reply and committed as the reply settled. Rejected because
+  every reader in between saw a plan that was not the one the planner had been
+  told it changed: `task_query` and the next call read the old plan, a start
+  after an edit had to be judged against a preview and deferred until the
+  reply ended, surfaces drew a separate preview, and a reply that failed or was
+  stopped after an accepted call dropped the change the call had confirmed.
 - **Interim fix for #69 in `catalog()` only.** Reading live enabled runners in
   the catalog block alone leaves `plan.runners` gating the plan, and is a
   second path to throw away (#69).
@@ -295,3 +340,11 @@ planner tools are recorded here as an explicit entry against both:
 - 2026-10-21 — a read-only task's token serves `run_command`, and says so in the runner's configuration (ADR-0046).
 - 2026-10-22 — decided, not built: `task_complete` carries a handoff and the task token gains `read_task` ([ADR-0047](../supervision/0047-structured-task-handoffs.md), #120).
 - 2026-10-22 — implemented the handoff envelope and task-scoped `read_task` (V4; ADR-0047, #120).
+- 2026-10-24 — P2: one check (`PlanChangeCheck`) for every planner change, at submit and at landing, with structured refusals; a whole plan is re-held to the plan's rules as it lands.
+- 2026-10-24 — `answer_checkpoint` joins the execution tools, for the supervisor at Act ([ADR-0029](../supervision/0029-the-supervisor.md)).
+- 2026-10-24 — S4 holds for the runner's whole life: OpenCode 2.1.4 evicted an idle planner's services after an hour and rebuilt them with Ordewell's tools inside code mode, out of the planner's reach.
+- 2026-10-24 — a read-only task's token serves `save_patch` (ADR-0050).
+- 2026-10-24 — a change task's token serves `apply_patch` (ADR-0050).
+- 2026-10-25 — a read-only task's token serves `fetch` and `web_search` (ADR-0046); a caller's cancellation aborts the token's call it names.
+- 2026-10-26 — P2: an edit's scope is the enabled runners alone, not the plan's own as well (ADR-0003, V1).
+- 2026-10-26 — P2: a successful `submit_plan` or `edit_plan` commits, saves and broadcasts before it answers, each `edit_plan` call a batch of its own; the turn's held edit, its preview and the starts deferred behind it are gone.

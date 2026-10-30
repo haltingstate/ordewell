@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as vscode from 'vscode';
-import { ConversationEditError, PlannerNotReadyError } from '@ordewell/core';
+import { ConversationEditError, PlannerNotReadyError, PlannerTurnDiscardedError, PlannerTurnStoppedError, recordRunnerAuth, recordedRunnerAuth, resetRunnerAuth } from '@ordewell/core';
 import { forkConversation, rewindConversation, compactConversation, type ConversationDeps } from '../conversation';
 
 const showQuickPick = vscode.window.showQuickPick as unknown as ReturnType<typeof vi.fn>;
@@ -14,7 +14,11 @@ const HISTORY = [
   { role: 'assistant', content: 'a reply', timestamp: '2026-01-01T00:00:01Z' },
 ];
 
-function setup(overrides: { generating?: boolean; executing?: boolean } = {}) {
+function setup(overrides: {
+  generating?: boolean;
+  executing?: boolean;
+  runnerInstallation?: ConversationDeps['runnerInstallation'];
+} = {}) {
   const current = { status: 'draft', tasks: [], conversationHistory: HISTORY };
   const session = {
     sessionId: 'sess-original',
@@ -30,8 +34,6 @@ function setup(overrides: { generating?: boolean; executing?: boolean } = {}) {
   };
   const chatProvider = {
     showError: vi.fn(),
-    replaceConversation: vi.fn(),
-    setConversationBusy: vi.fn(),
   };
   const setCurrentPlan = vi.fn();
   const persistState = vi.fn();
@@ -41,6 +43,9 @@ function setup(overrides: { generating?: boolean; executing?: boolean } = {}) {
     setCurrentPlan,
     persistState,
     isGeneratingPlan: () => overrides.generating ?? false,
+    config: { aiProvider: 'claude-code' },
+    fsAdapter: { getWorkspaceRoot: () => '/ws' },
+    runnerInstallation: overrides.runnerInstallation,
   } as unknown as ConversationDeps;
   return { deps, session, chatProvider, setCurrentPlan, persistState };
 }
@@ -102,12 +107,11 @@ describe('rewind', () => {
 
   it('forks from just before the picked message, switches to the fork, and says the original is kept', async () => {
     showQuickPick.mockImplementation(async (items: { index: number }[]) => items.find((i) => i.index === 2));
-    const { deps, session, chatProvider } = setup();
+    const { deps, session } = setup();
     await rewindConversation(deps);
 
     expect(session.rewindConversation).toHaveBeenCalledWith(2);
     expect(executeCommand).toHaveBeenCalledWith('ordewell.loadSessionById', 'sess-rewound');
-    expect(chatProvider.replaceConversation).not.toHaveBeenCalled();
     const notice = showInformationMessage.mock.calls[0][0] as string;
     expect(notice).toContain('sess-original');
     expect(notice).toContain('sess-rewound');
@@ -178,55 +182,29 @@ describe('rewind', () => {
 });
 
 describe('compact', () => {
-  type Token = { onCancellationRequested: (cb: () => void) => void };
-  let pressCancel: () => void;
-
-  beforeEach(() => {
-    pressCancel = () => undefined;
-    withProgress.mockImplementation(async (_opts: unknown, task: (p: unknown, t: Token) => Promise<unknown>) =>
-      task({}, { onCancellationRequested: (cb) => { pressCancel = cb; } }));
-  });
-
-  it('runs cancellably under a progress notification, blocking the webview input meanwhile', async () => {
-    const { deps, session, chatProvider } = setup();
-    let busyDuringRun: unknown;
-    session.compactConversation.mockImplementation((async () => {
-      busyDuringRun = chatProvider.setConversationBusy.mock.calls.at(-1)?.[0];
-      return { summary: 's', keptMessages: 4 };
-    }) as never);
+  // The session's own events draw it: a status while it runs, a quiet marker after (ADR-0017).
+  it('runs with no notification and no popup, and persists what it condensed', async () => {
+    const { deps, session, setCurrentPlan, persistState } = setup();
     await compactConversation(deps);
 
-    expect(withProgress.mock.calls[0][0]).toMatchObject({ cancellable: true });
-    expect(busyDuringRun).toBe(true);
-    expect(chatProvider.setConversationBusy.mock.calls.map((c) => c[0])).toEqual([true, false]);
-  });
-
-  it('redraws the transcript with the summary entry and persists it', async () => {
-    const { deps, session, chatProvider, setCurrentPlan, persistState } = setup();
-    const summarised = [{ role: 'assistant', content: 'Conversation condensed…\n\nthe summary', timestamp: 't', kind: 'compaction' }];
-    session.planState = { status: 'draft', tasks: [], conversationHistory: summarised } as never;
-    await compactConversation(deps);
-
+    expect(session.compactConversation).toHaveBeenCalledTimes(1);
+    expect(withProgress).not.toHaveBeenCalled();
+    expect(showInformationMessage).not.toHaveBeenCalled();
     expect(setCurrentPlan).toHaveBeenCalledWith(session.planState);
-    expect(chatProvider.replaceConversation).toHaveBeenCalledWith(session.planState);
     expect(persistState).toHaveBeenCalledTimes(1);
-    expect(showInformationMessage.mock.calls[0][0]).toContain('4');
   });
 
-  it('wires the progress cancel button to the abort signal, and changes nothing when cancelled', async () => {
+  it.each([
+    ['stopped', new PlannerTurnStoppedError()],
+    ['dropped with its plan', new PlannerTurnDiscardedError()],
+  ])('says nothing more when %s: nothing changed, and the marker says so', async (_case, err) => {
     const { deps, session, chatProvider, persistState } = setup();
-    session.compactConversation.mockImplementation((async (signal: AbortSignal) => {
-      pressCancel();
-      expect(signal.aborted).toBe(true);
-      throw new Error('aborted');
-    }) as never);
+    session.compactConversation.mockRejectedValue(err);
     await compactConversation(deps);
 
-    expect(chatProvider.replaceConversation).not.toHaveBeenCalled();
-    expect(persistState).not.toHaveBeenCalled();
     expect(chatProvider.showError).not.toHaveBeenCalled();
-    expect(showInformationMessage.mock.calls[0][0]).toMatch(/cancel.*nothing (was )?changed/i);
-    expect(chatProvider.setConversationBusy).toHaveBeenLastCalledWith(false);
+    expect(showInformationMessage).not.toHaveBeenCalled();
+    expect(persistState).not.toHaveBeenCalled();
   });
 
   it('says nothing changed when the planner turn fails', async () => {
@@ -235,9 +213,7 @@ describe('compact', () => {
     await compactConversation(deps);
 
     expect(chatProvider.showError).toHaveBeenCalledWith(expect.stringMatching(/rate limited.*nothing was changed/i));
-    expect(chatProvider.replaceConversation).not.toHaveBeenCalled();
     expect(persistState).not.toHaveBeenCalled();
-    expect(chatProvider.setConversationBusy).toHaveBeenLastCalledWith(false);
   });
 
   it('words a planner the session refused with the chat\'s own commands', async () => {
@@ -263,6 +239,73 @@ describe('compact', () => {
     await compactConversation(deps);
 
     expect(session.compactConversation).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * A compaction is a planner turn too, and the signed-out refusal's own way
+ * back — the runner's login — runs outside the extension host. The turn must
+ * ask the workspace's account again before the session gate judges, or the
+ * user who just logged in stays refused until a runner-list refresh.
+ */
+describe('a compaction after a login done outside the extension', () => {
+  const SIGNED_OUT = { state: 'signed-out' as const, loginCommand: ['claude', 'auth', 'login'], detail: 'not logged in' };
+  const SIGNED_IN = { state: 'signed-in' as const, loginCommand: ['claude', 'auth', 'login'] };
+
+  afterEach(() => resetRunnerAuth());
+
+  function host(signsIn: boolean) {
+    const installation = {
+      refresh: vi.fn(),
+      plannerUsability: vi.fn(async () => {
+        // What the re-probe records when the account was signed in since.
+        if (signsIn) recordRunnerAuth('claude-code', SIGNED_IN, '/ws');
+        return { usable: true };
+      }),
+    };
+    const { deps, session, chatProvider, persistState } = setup({ runnerInstallation: installation });
+    const refreshPlannerState = vi.fn(async () => {});
+    deps.refreshPlannerState = refreshPlannerState;
+    // The Session's own gate, synchronous and reading the recorded verdict.
+    session.compactConversation.mockImplementation(async () => {
+      if (recordedRunnerAuth('claude-code', '/ws')?.state === 'signed-out') {
+        throw new PlannerNotReadyError({
+          code: 'signed_out', provider: 'claude-code', label: 'Claude Code', runner: 'claude-code',
+          loginCommand: ['claude', 'auth', 'login'],
+        });
+      }
+      return { summary: 'the summary', keptMessages: 4 };
+    });
+    return { deps, session, chatProvider, persistState, installation, refreshPlannerState };
+  }
+
+  it('re-probes before condensing, so a login made with the runner\'s own command starts it', async () => {
+    recordRunnerAuth('claude-code', SIGNED_OUT, '/ws');
+    const h = host(true);
+
+    await compactConversation(h.deps);
+
+    expect(h.installation.refresh).toHaveBeenCalledTimes(1);
+    expect(h.installation.plannerUsability).toHaveBeenCalledWith('claude-code');
+    expect(h.session.compactConversation).toHaveBeenCalledTimes(1);
+    expect(h.chatProvider.showError).not.toHaveBeenCalled();
+    expect(h.persistState).toHaveBeenCalledTimes(1);
+    // The pill and empty state stop offering a login the gate just accepted.
+    expect(h.refreshPlannerState).toHaveBeenCalledTimes(1);
+  });
+
+  it('still refuses to condense when the account is genuinely signed out', async () => {
+    recordRunnerAuth('claude-code', SIGNED_OUT, '/ws');
+    const h = host(false);
+
+    await compactConversation(h.deps);
+
+    expect(h.installation.refresh).toHaveBeenCalledTimes(1);
+    expect(h.installation.plannerUsability).toHaveBeenCalledWith('claude-code');
+    expect(h.session.compactConversation).toHaveBeenCalledTimes(1);
+    expect(h.chatProvider.showError).toHaveBeenCalledWith(expect.stringContaining('Claude Code not logged in'));
+    expect(h.persistState).not.toHaveBeenCalled();
+    expect(h.refreshPlannerState).not.toHaveBeenCalled();
   });
 });
 

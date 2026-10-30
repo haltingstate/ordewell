@@ -1,13 +1,17 @@
 /**
- * Reading the programs `sed` and `awk` are handed.
+ * Reading the programs `sed`, `awk`, `jq` and `yq` are handed.
  *
  * Both are text filters, and both can run a command or write a file from inside
  * their own program: sed's `e` command and the `e` flag of `s` hand text to the
  * shell, and its `w`/`W` commands and the `w` flag of `s` write a file; awk has
- * `system()`, pipes to and from commands, and `print > file`. None of that is a
- * flag, so a classifier that looks at a segment's binary and flags saw
- * `sed '1e rm -rf src'` as a plain `sed` and put it on the prompt tier — where
- * one approval of an ordinary substitution is remembered for every later `sed`.
+ * `system()`, pipes to and from commands, and `print > file`. Both can also
+ * read a file their program names — sed's `r`/`R`, awk's `getline < file` and
+ * an assignment to `ARGV` — which path confinement never sees, since it reads
+ * only the arguments, and awk reads the process environment, provider keys
+ * included, through `ENVIRON`. None of that is a flag, so a classifier that
+ * looks at a segment's binary and flags saw `sed '1e rm -rf src'` as a plain
+ * `sed` and put it on the prompt tier — where one approval of an ordinary
+ * substitution is remembered for every later `sed`.
  *
  * The parsers here are deliberately partial. They follow the grammar a planner
  * actually writes and answer "cannot read" for everything else, and "cannot
@@ -19,13 +23,15 @@
  * than read either way.
  */
 
+import { FLAG_POLICY } from './flagPolicy';
+
 export const SED_FAMILY = ['sed', 'gsed'];
 export const AWK_FAMILY = ['awk', 'gawk', 'mawk', 'nawk'];
 
 const INSPECT_OR_TASK = 'Use the read-only research tools, or describe it as a task.';
 
 /** What a program does that the planner may not, or that it cannot be read well enough to rule out. */
-type Hazard = 'exec' | 'pipe' | 'write' | 'extension' | 'unreadable';
+type Hazard = 'exec' | 'pipe' | 'write' | 'read' | 'environment' | 'symbol-table' | 'extension' | 'unreadable';
 
 // ---------------------------------------------------------------------------
 // sed
@@ -190,6 +196,8 @@ function sedRefusalFor(binary: string, scripts: string[]): string | undefined {
       return `The "${binary}" script runs a shell command (the "e" command or the "e" flag of "s"), which this classifier cannot inspect. ${INSPECT_OR_TASK}`;
     case 'write':
       return `The "${binary}" script writes a file (the "w"/"W" command or the "w" flag of "s"). You are a read-only planner — print the output instead, or describe the write as a task.`;
+    case 'read':
+      return `The "${binary}" script reads a file it names itself (the "r"/"R" command), which path confinement cannot see. Read that file directly instead.`;
     default:
       return `This classifier could not read the "${binary}" script well enough to rule out a shell command or a file write in it. Rewrite it with plain print, delete and substitute commands, or describe the work as a task.`;
   }
@@ -309,6 +317,7 @@ function sedScriptHazard(script: string): Hazard | undefined {
     if (cmd === undefined) return 'unreadable';
     if (cmd === 'e') return 'exec';
     if (cmd === 'w' || cmd === 'W') return 'write';
+    if (cmd === 'r' || cmd === 'R') return 'read';
     if (cmd === '{' || cmd === '}') continue;
     if (cmd === '#') { while (i < n && script[i] !== '\n') i++; continue; }
     if (SED_BARE_COMMANDS.includes(cmd)) {
@@ -327,9 +336,9 @@ function sedScriptHazard(script: string): Hazard | undefined {
       if (!commandEnds()) return 'unreadable';
       continue;
     }
-    // Text for `a`/`i`/`c` and the file `r`/`R` reads both run to the end of
-    // the line, `;` included, with a backslash carrying the text onto the next.
-    if ('aicrR'.includes(cmd)) {
+    // Text for `a`/`i`/`c` runs to the end of the line, `;` included, with a
+    // backslash carrying the text onto the next.
+    if ('aic'.includes(cmd)) {
       while (i < n && script[i] !== '\n') i += script[i] === '\\' ? 2 : 1;
       continue;
     }
@@ -436,6 +445,12 @@ function awkRefusalFor(binary: string, programs: string[]): string | undefined {
         return `The "${binary}" program pipes to or from a command ("|"), which runs it through a shell this classifier cannot inspect. ${INSPECT_OR_TASK}`;
       case 'write':
         return `The "${binary}" program redirects its output to a file (">"). You are a read-only planner — print to standard output instead, or describe the write as a task.`;
+      case 'read':
+        return `The "${binary}" program reads a file it names itself ("getline <" or an "ARGV" entry), which path confinement cannot see. Name the file as an operand instead.`;
+      case 'environment':
+        return `The "${binary}" program reads the environment ("ENVIRON"), which holds credentials. Run printenv for the one variable you need, which asks first.`;
+      case 'symbol-table':
+        return `The "${binary}" program uses "SYMTAB", which gawk reads as every global by name, "ENVIRON" and "ARGV" included. Name the variable you need directly.`;
       case 'extension':
         return `The "${binary}" program uses an "@" form, which loads an extension, includes a source file or calls a function by name — none of which this classifier can inspect. ${INSPECT_OR_TASK}`;
       default:
@@ -470,6 +485,11 @@ function awkProgramHazard(program: string): Hazard | undefined {
   // Set inside a print statement, at the paren depth it began at: only a `>`
   // at that depth is a redirect, `print (a > b)` compares.
   let printDepth: number | undefined;
+  // Set after `getline`, at its depth: a `<` there or deeper, before the
+  // statement or the enclosing parenthesis ends, names a file to read. A
+  // comparison caught by it, `getline > 0 && n < 3`, refuses; reading it as a
+  // comparison would let `getline line < f` through.
+  let getlineDepth: number | undefined;
   // After `,`, `&&` or `||` a newline continues the statement instead of ending it.
   let continues = false;
 
@@ -534,7 +554,7 @@ function awkProgramHazard(program: string): Hazard | undefined {
       continue;
     }
     if (c === '\n' || c === ';') {
-      if (c === ';' || !continues) printDepth = undefined;
+      if (c === ';' || !continues) { printDepth = undefined; getlineDepth = undefined; }
       slash = 'regex';
       i++;
       continue;
@@ -579,10 +599,22 @@ function awkProgramHazard(program: string): Hazard | undefined {
       slash = 'unclear';
       continue;
     }
+    if (c === '<') {
+      if (getlineDepth !== undefined && depth >= getlineDepth) return 'read';
+      i++;
+      slash = 'unclear';
+      continue;
+    }
     if (c === '(' || c === '[') { depth++; i++; slash = 'regex'; continue; }
-    if (c === ')' || c === ']') { depth--; i++; slash = 'divide'; continue; }
+    if (c === ')' || c === ']') {
+      depth--;
+      if (getlineDepth !== undefined && depth < getlineDepth) getlineDepth = undefined;
+      i++;
+      slash = 'divide';
+      continue;
+    }
     if (c === '{' || c === '}') {
-      if (c === '}') printDepth = undefined;
+      if (c === '}') { printDepth = undefined; getlineDepth = undefined; }
       i++;
       slash = 'regex';
       continue;
@@ -596,6 +628,17 @@ function awkProgramHazard(program: string): Hazard | undefined {
       // Any mention, not only a call: there is no reading of `system` in an
       // awk program that is not the built-in.
       if (word === 'system') return 'exec';
+      if (word === 'ENVIRON') return 'environment';
+      // Assigning an entry adds a file for awk to read after the operands
+      // confinement saw; reading one is rare enough to refuse with it.
+      if (word === 'ARGV') return 'read';
+      // gawk's table of every global by name reaches ENVIRON and ARGV with
+      // neither word written, under a name the program can build as it runs
+      // (`SYMTAB["EN" "VIRON"]`), so the table itself is the hazard. `awk` may
+      // be gawk. FUNCTAB only names functions; calling one through it needs
+      // the `@` form refused above.
+      if (word === 'SYMTAB') return 'symbol-table';
+      if (word === 'getline') getlineDepth = depth;
       if (word === 'print' || word === 'printf') printDepth = depth;
       slash = AWK_KEYWORDS.includes(word) ? 'unclear' : 'divide';
       continue;
@@ -603,6 +646,108 @@ function awkProgramHazard(program: string): Hazard | undefined {
     // Any other operator leaves a `/` after it ambiguous.
     i++;
     slash = 'unclear';
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// jq and yq
+// ---------------------------------------------------------------------------
+
+/**
+ * JSON and YAML filters whose programs reach past the files they are handed:
+ * jq's `$ENV` and `env` read the process environment, provider keys included,
+ * and `import`/`include` load a module from any directory a `search` key
+ * names. yq has `env`, `strenv`, `envsubst` and the `load` family, and its
+ * `eval` runs a string as a program, which hides the rest from a reading.
+ * `yq` is either that yq or the jq wrapper of the same name, so both
+ * vocabularies are read for both (ADR-0008).
+ */
+export const JQ_FAMILY = ['jq', 'yq'];
+
+const JQ_ENV_WORDS = ['env', 'strenv', 'envsubst'];
+const JQ_LOAD_WORDS = ['import', 'include', 'modulemeta', 'eval'];
+/** jq's options that take a name and a value. */
+const JQ_PAIR_FLAGS = ['--arg', '--argjson', '--slurpfile', '--rawfile'];
+/** yq's subcommands, which come before the expression. */
+const YQ_SUBCOMMANDS = ['eval', 'e', 'eval-all', 'ea'];
+
+/** Why a jq or yq invocation is refused, or `undefined` when its program only filters what it is given. */
+export function jqRefusal(binary: string, args: string[]): string | undefined {
+  const programs = jqPrograms(binary, args);
+  if (typeof programs === 'string') {
+    return `"${binary} ${programs}" reads its program from a file this classifier cannot inspect. ${INSPECT_OR_TASK}`;
+  }
+  for (const program of programs) {
+    const word = jqHazard(program);
+    if (word === undefined) continue;
+    return JQ_ENV_WORDS.includes(word) || word === '$ENV'
+      ? `The "${binary}" program reads the environment ("${word}"), which holds credentials. Run printenv for the one variable you need, which asks first.`
+      : `The "${binary}" program uses "${word}", which loads a file or runs a string as a program where this classifier cannot follow it. ${INSPECT_OR_TASK}`;
+  }
+  return undefined;
+}
+
+/**
+ * The program text of an invocation, or the flag that names a program file.
+ * jq takes options anywhere, so every token is read; the program is the first
+ * operand, or what `--expression` gave. Value widths come from the flag
+ * allowlist, which refuses any flag outside it before this reading matters.
+ */
+function jqPrograms(binary: string, args: string[]): string[] | string {
+  const values = new Set(FLAG_POLICY[binary]?.values ?? []);
+  const expressions: string[] = [];
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    if (token === '--') { operands.push(...args.slice(i + 1)); break; }
+    if (!/^-./.test(token)) { operands.push(token); continue; }
+    if (token.startsWith('--')) {
+      const eq = token.indexOf('=');
+      const name = eq > 0 ? token.slice(0, eq) : token;
+      if (name === '--from-file') return name;
+      if (name === '--expression') {
+        const value = eq > 0 ? token.slice(eq + 1) : args[++i];
+        if (value !== undefined) expressions.push(value);
+      } else if (JQ_PAIR_FLAGS.includes(name)) {
+        i += 2;
+      } else if (values.has(name) && eq < 0) {
+        i++;
+      }
+      continue;
+    }
+    for (let j = 1; j < token.length; j++) {
+      const short = `-${token[j]}`;
+      if (short === '-f') return short;
+      if (values.has(short)) { if (j === token.length - 1) i++; break; }
+    }
+  }
+  if (binary === 'yq' && YQ_SUBCOMMANDS.includes(operands[0])) operands.shift();
+  if (expressions.length > 0) return expressions;
+  return operands.length > 0 ? [operands[0]] : [];
+}
+
+/**
+ * The first word in a program that reaches the environment or another file.
+ * String literals are skipped, since `select(.name == "env")` compares text,
+ * unless the program interpolates (`"\(env.KEY)"` runs code inside a string)
+ * or has a comment (a `"` in one would pair with the wrong quote): then all of
+ * it is read. A field (`.env`) and an object key (`{env: …}`) are not calls.
+ */
+function jqHazard(program: string): string | undefined {
+  const code = program.includes('\\(') || program.includes('#')
+    ? program
+    : program.replace(/"(?:[^"\\]|\\.)*"/gs, '""');
+  for (const match of code.matchAll(/(\$?)([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    const [, dollar, name] = match;
+    const at = match.index;
+    if (dollar) {
+      if (name === 'ENV') return '$ENV';
+      continue;
+    }
+    if (code[at - 1] === '.' && code[at - 2] !== '.') continue;
+    if (/^\s*:(?!:)/.test(code.slice(at + name.length))) continue;
+    if (JQ_ENV_WORDS.includes(name) || JQ_LOAD_WORDS.includes(name) || name.startsWith('load')) return name;
   }
   return undefined;
 }

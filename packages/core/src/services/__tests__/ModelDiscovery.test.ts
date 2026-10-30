@@ -3,6 +3,32 @@ import { discoverGeminiModels, ModelDiscovery, type ExecImpl } from '../ModelDis
 import type { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
 import { OPENCODE_MANIFEST } from '../../plugins/builtin/opencode.manifest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+// Claude discovery reads its settings and credentials under HOME, or where
+// CLAUDE_CONFIG_DIR moves them, and the machine's managed settings: an empty
+// home, no config dir and no managed files keep a developer's own gateway
+// models out of the exact lists below.
+vi.mock('fs', async (importOriginal) =>
+  (await import('./claudeManagedSettings')).hidingClaudeManagedSettings(await importOriginal<typeof import('fs')>()));
+
+let home: string;
+const savedHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
+beforeEach(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'ordewell-discovery-'));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.CLAUDE_CONFIG_DIR;
+});
+afterEach(() => {
+  for (const [key, value] of Object.entries(savedHome)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+});
 
 function registryWith(...manifests: Array<{ name: string }>): RunnerRegistry {
   const byName = new Map(manifests.map((m) => [m.name, m]));
@@ -512,6 +538,16 @@ describe('ModelDiscovery — OpenCode', () => {
     expect(models.some((m) => m.modelId === 'opus' || m.modelId === 'sonnet')).toBe(false);
   });
 
+  // A workspace's environment can name another OpenCode account and config.
+  it('runs its discovery commands under the environment runners are launched with', async () => {
+    const env = { HOME: '/home/work', OPENCODE_CONFIG: '/accounts/work/opencode.json' };
+    const exec = vi.fn<ExecImpl>(async () => ({ stdout: 'opencode/gpt-5.1' }));
+    await new ModelDiscovery(registryWith(OPENCODE_MANIFEST), exec, undefined, undefined, undefined, undefined, async () => env).discover('opencode');
+
+    expect(exec).toHaveBeenCalled();
+    for (const [, options] of exec.mock.calls) expect(options?.env).toBe(env);
+  });
+
   it('returns an empty list (not hardcoded models) when every discovery command fails', async () => {
     // The reported bug: with `opencode` unavailable, users saw a phantom
     // hardcoded list (DeepSeek V4 Pro, Kimi K2.6, GPT-5.1, …) they never had.
@@ -846,6 +882,27 @@ describe('ModelDiscovery — OpenCode', () => {
     await before;
 
     expect(after.map((m) => m.modelId)).toEqual(['opencode/fresh']);
+  });
+
+  it('leaves the cache to the discovery after clear() when one begun before it ends last', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let call = 0;
+    const exec: ExecImpl = vi.fn(async (cmd: string) => {
+      if (cmd.includes('--verbose') || cmd.includes('api')) throw new Error('nope');
+      if (call++ === 0) { await gate; return { stdout: 'opencode/stale\n' }; }
+      return { stdout: 'opencode/fresh\n' };
+    });
+    const discovery = new ModelDiscovery(registryWith(OPENCODE_MANIFEST), exec);
+
+    const before = discovery.discover('opencode');
+    discovery.clear();
+    await discovery.discover('opencode');
+    release();
+
+    expect((await before).map((m) => m.modelId)).toEqual(['opencode/stale']);
+    expect(discovery.getCached('opencode')?.map((m) => m.modelId)).toEqual(['opencode/fresh']);
+    expect((await discovery.discover('opencode')).map((m) => m.modelId)).toEqual(['opencode/fresh']);
   });
 });
 

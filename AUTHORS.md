@@ -24,6 +24,13 @@ record of who built what, rather than `git log`.
   follow light themes (#20).
 - **Mayuri** ([@mayuriphad](https://github.com/mayuriphad)) — diagnosed and fixed the
   planner's duplicated usage-limit message (#79, #96).
+- [@haltingstate](https://github.com/haltingstate) — made the terminal UI's
+  stepper say what a saved step does next, instead of encoding it in a
+  sentinel index (#123), and improved tool-call errors (#124).
+- [@Logic769](https://github.com/Logic769) — made `/resume` an alias of
+  `/sessions` in the planner chat (#139).
+- Hanbin Tan ([@hskl18](https://github.com/hskl18)) — documented how
+  planners and runners get their models and credentials (#140).
 
 Thank you. Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

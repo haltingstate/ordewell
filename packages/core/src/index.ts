@@ -21,11 +21,15 @@ export {
 export type {
   ApprovalRecord,
   AwaitingReason,
+  ContextCheckpoint,
   ConversationMessage,
   DiscoveredModel,
   LegacyPlanState,
   PlanState,
   PlanStatus,
+  PlannerCompaction,
+  PlannerCompactionOutcome,
+  PlannerContextPause,
   PlannerResendState,
   ReplyRun,
   ResearchLogEntry,
@@ -43,6 +47,7 @@ export type {
 } from './models/Task';
 export * from './models/Session';
 export * from './models/Usage';
+export * from './models/AccountLimits';
 export * from './models/TaskLog';
 export * from './models/Handoff';
 export { commandLine, scriptBodyOf, scriptBodyText, scriptTaskText, timeLimitText, DEFAULT_SCRIPT_TIMEOUT_MS, type ScriptBody } from './models/ScriptTask';
@@ -67,6 +72,8 @@ export { WebResponseCache, sharedWebResponseCache } from './services/WebResponse
 export type { CachedPage, WebResponseCacheOptions } from './services/WebResponseCache';
 export { HttpWebFetcher } from './services/HttpWebFetcher';
 export type { HttpWebFetcherOptions, WebResponse, WebTransport } from './services/HttpWebFetcher';
+export { startVersionCheck, VERSION_CHECK_URL, VERSION_CHECK_NOTICE } from './services/VersionCheck';
+export type { PingFetch, VersionCheck, VersionCheckOptions } from './services/VersionCheck';
 export type { ApprovalMode, ApprovalModeSetting, ApprovalPolicyOptions, ApprovalSource } from './services/ApprovalPolicy';
 export { DEFAULT_PLANNER_ALLOWLIST, parseAllowlist, commandAllowedBy, toolAllowed, scopeAllowed } from './services/plannerAllowlist';
 export type { PlannerAllowlist, CommandWords } from './services/plannerAllowlist';
@@ -84,12 +91,15 @@ export { EnvConfig } from './interfaces/EnvConfig';
 export * from './interfaces/INotification';
 export * from './interfaces/IRunner';
 export * from './interfaces/IWorktreeIsolation';
-export { describeMergeResult } from './services/mergeResultNotice';
-export { createWorktreeIsolation } from './services/GitWorktreeIsolation';
-export { migratePlanIsolation } from './services/isolationRecord';
+export { describeMergeResult, mergeOutcome, blockNotice, blockNotices, repairedLanded, repairedNotice } from './services/mergeResultNotice';
+export { createIsolationPreview, createWorktreeIsolation } from './services/GitWorktreeIsolation';
+export { describeIsolationPreview } from './services/isolationPreviewText';
+export type { IsolationPreviewNotice } from './services/isolationPreviewText';
+export { isolationViewOfPlan, migratePlanIsolation } from './services/isolationRecord';
 export { capConflictFiles } from './services/conflictFiles';
-export { checkoutRule, isRepoGroup, mergeTarget, reposWithWork } from './services/mergeWording';
-export type { MergeWordingHandoff } from './services/mergeWording';
+export { repositoryRunnerConfigPaths } from './services/repositoryRunnerConfig';
+export { checkoutRule, handoffBaseLine, handoffBranchName, isRepoGroup, mergeTarget, repoBaseLine, repoResultLines, reposWithWork } from './services/mergeWording';
+export type { HandoffForkRepo, MergeWordingHandoff } from './services/mergeWording';
 export type { Adr0013PlanIsolation, Adr0013IsolationRun, Adr0013TaskRecord } from './services/isolationRecord';
 export type { WorktreeIsolationDeps, GitExecFn } from './services/GitWorktreeIsolation';
 export * from './interfaces/ILogger';
@@ -98,7 +108,8 @@ export type { ResearchChat, ResearchTurn, ToolCall, ToolResult } from './service
 export { GeminiService } from './services/GeminiService';
 export { OpenAiService } from './services/OpenAiService';
 export { TaskOrchestrator, TaskControlError, STOPPED_BEFORE_START } from './services/TaskOrchestrator';
-export type { AutoMergeTrigger, OrchestratorObserver, StartAdmission, TaskAttemptSnapshot, TaskOrchestratorDeps, TaskOrchestratorOptions } from './services/TaskOrchestrator';
+export type { AutoMergeTrigger, OrchestratorObserver, StartAdmission, TaskOrchestratorDeps, TaskOrchestratorOptions } from './services/TaskOrchestrator';
+export type { TaskAttemptSnapshot } from './services/Attempts';
 export { PlanStore } from './services/PlanStore';
 export { Planner } from './services/Planner';
 export type { PlanRequest } from './services/Planner';
@@ -108,6 +119,18 @@ export type { ExecImpl } from './services/ModelDiscovery';
 export { ModelResolver } from './services/ModelResolver';
 export type { ModelResolverDeps } from './services/ModelResolver';
 export { RunnerInstallation } from './services/RunnerInstallation';
+export type { RunnerInstallationOptions } from './services/RunnerInstallation';
+export { readRunnerAuth, recordRunnerAuth, recordedRunnerAuth, resetRunnerAuth } from './services/runnerAuth';
+export type { RunnerAuth, RunnerAuthExec, RunnerAuthExecOptions, RunnerAuthExecResult, ReadRunnerAuthOptions } from './services/runnerAuth';
+export { workspaceEnvOf } from './services/workspaceEnv';
+export { AccountLimitMonitor } from './services/AccountLimitMonitor';
+export type { AccountLimitCollector, AccountLimitReading, AccountLimitListener, AccountLimitMonitorOptions } from './services/AccountLimitMonitor';
+export { codexAccountLimitCollector } from './services/harness/codexAccountLimits';
+export type { CodexAccountLimitOptions } from './services/harness/codexAccountLimits';
+export { claudeAccountLimitCollector } from './services/harness/claudeAccountLimits';
+export type { ClaudeAccountLimitOptions } from './services/harness/claudeAccountLimits';
+export { openCodeGoAccountLimitCollector } from './services/harness/openCodeGoLimits';
+export type { OpenCodeGoAccountLimitOptions } from './services/harness/openCodeGoLimits';
 export { defaultEnabledRunners, detectInstalledPlanner, findInstalledPlanner, installedPlannerAnswered, installedPlannerDetected, recordInstalledPlanner, recordedInstalledPlanner, resetInstalledPlanner } from './services/InstalledPlanner';
 export { ModelCatalog } from './services/ModelCatalog';
 export type { CatalogModel } from './services/ModelCatalog';
@@ -142,8 +165,8 @@ export { nativeShellOffer } from './services/harness/nativeShell';
 export type { NativeShellOffer } from './services/harness/nativeShell';
 export { mapAgentTool, normalizeAgentArgs } from './services/harness/agentTools';
 export type { MappedTool } from './services/harness/agentTools';
-export { applyTaskOps, parseTaskOpsJson, textHasTaskOps, canMergeTasks, canSplitTask, canSetDependencies, dependencyCandidates, dependentsOf } from './services/TaskOps';
-export type { TaskOp, ApplyTaskOpsResult, TaskRef } from './services/TaskOps';
+export { applyTaskOps, opRefusalText, parseTaskOpsJson, textHasTaskOps, canMergeTasks, canSplitTask, canSetDependencies, dependencyCandidates, dependentsOf } from './services/TaskOps';
+export type { TaskOp, ApplyTaskOpsResult, OpRef, OpRefusal, TaskRef } from './services/TaskOps';
 export {
   parseTaskQueryJson, textHasTaskQuery, taskQuerySignature, renderTaskQueryAnswer,
   TASK_QUERY_FIELDS, TASK_QUERY_PROTOCOL, TASK_QUERY_REMINDER, TASK_QUERY_ANSWER_OR_OPS,
@@ -155,10 +178,13 @@ export { abbreviateHome, resolveSkillInvocation, plannerMessage, plannerTranscri
 export { PlanEditError } from './services/PlanEditError';
 export type * from './daemonContract';
 export { SessionNotFoundError, NoPlanError, AlreadyExecutingError } from './services/SessionErrors';
+export { LeaseHost, processLeaseHost, SessionHeldError, describeHeld, describeHolder, LEASE_HEARTBEAT_MS, LEASE_STALE_MS, type LeaseHostKind, type LeaseHostOptions, type SessionHeld, type SessionLease, type SessionLeaseRecord } from './services/sessionLease';
 export { plannerNotReady, plannerNotReadyFor, describePlannerNotReady, PlannerNotReadyError, TERMINAL_UI_COMMANDS, CHAT_COMMANDS, HEADLESS_CLI_COMMANDS, type PlannerNotReady, type PlannerCommandSyntax, type PlannerReadinessConfig } from './services/plannerReadiness';
 export type { SessionDeps, SessionRuntimeSettings, SessionPlanner, SaveSession, ConversationFork, ConversationRewind } from './services/createSession';
+export type { TaskEditOptions } from './services/PlanEditor';
 export { ExecutionCommands, SUPERVISOR_LEVELS } from './services/ExecutionCommands';
 export type { ExecutionCommand, CommandOutcome, CommandPayload, Consent, SupervisorPolicy, LoopGuard, ExecutionHost } from './services/ExecutionCommands';
+export { parseExecutionCommand, type ParsedCommand } from './services/executionCommandShape';
 export { DEFAULT_SUPERVISOR_RETRY_LIMIT } from './services/LoopGuards';
 export type { GuardTrip, GuardTarget } from './services/LoopGuards';
 export { ConversationEditError, ConversationBusyError, PlannerTurnDiscardedError, PlannerTurnStoppedError, PlannerUsageLimitError } from './services/PlannerConversation';
@@ -178,6 +204,7 @@ export {
 export { globalDataDir, migrateOldConfigDir } from './utils/globalDataDir';
 export { writePrivateFile, ensurePrivateDir } from './utils/privateFile';
 export type {
+  AccountLimitsMessage,
   SessionMessage,
   SessionBroadcaster,
   SessionNotice,
@@ -195,10 +222,10 @@ export type {
   RunTask,
   RunTaskStatus,
   RunView,
-  HeldEdit,
-  HeldEditMark,
+  RunActivity,
 } from './services/SessionMessage';
 export { EMPTY_RUN, reduceRun } from './services/runView';
+export { IDLE_ACTIVITY } from './services/SessionMessage';
 export { serializeTask, serializeTaskStatus, serializePlan, surfacePlan, surfacePlanState, executionSummary, truncateCheckpointSummary, CHECKPOINT_TRUNCATE_LENGTH, type ExecutionSummary } from './services/SessionMessage';
 export { blockingFailures, repeatingChecks, planBlocks, type BlockingSubject, type PlanBlocks } from './services/blocking';
 export { summarizeToolCall, classifyOutcome, ranSealed, withoutSealedMark } from './services/researchStepSummary';
@@ -208,7 +235,7 @@ export { VerdictEngine } from './services/VerdictEngine';
 export type { VerdictListener, CheckpointListener } from './services/VerdictEngine';
 export * from './interfaces/TaskOutputSource';
 export { BufferedTaskOutputSource } from './services/BufferedTaskOutputSource';
-export { autonomyLevelLabel, parseAutonomyLevel, runnerModesFrom } from './services/ModeResolver';
+export { autonomyLevelLabel, parseAutonomyFlag, parseAutonomyLevel, runnerModesFrom } from './services/ModeResolver';
 export type { RunnerModeInfo } from './services/ModeResolver';
 export { AbstractRunnerSession, AbstractRunner } from './services/AbstractRunner';
 export type { RunnerSpawnOptions } from './services/AbstractRunner';
@@ -226,6 +253,7 @@ export {
   windowsCommandLine,
   CommandLineTooLongError,
   EmbeddedNewlineError,
+  BatchQuoteError,
   ExecutableNotFoundError,
   isExecutableResolved,
   CMD_EXE_MAX_COMMAND_LINE,
@@ -269,7 +297,7 @@ export { removedPluginNotice } from './plugins/removedPluginNotice';
 export { resolveTaskRunnerFlags } from './plugins/resolveArgs';
 export { CLAUDE_CODE_MANIFEST } from './plugins/builtin/claude-code.manifest';
 export { OPENCODE_MANIFEST } from './plugins/builtin/opencode.manifest';
-export type { RunnerManifest, RunnerEntry, RunnerFeatures, RunnerModelDiscovery, RunnerMode, DiscoveryCommand } from './plugins/types';
+export type { RunnerManifest, RunnerEntry, RunnerAuthSpec, RunnerAuthStatus, RunnerFeatures, RunnerModelDiscovery, RunnerMode, DiscoveryCommand } from './plugins/types';
 export * from './utils/fsHelpers';
 export * from './utils/stateStore';
 export * from './utils/sessionStore';
@@ -277,7 +305,7 @@ export * from './utils/taskLogStore';
 export { mintSessionId } from './utils/sessionId';
 export { extractPrdBlock, savePrdMarkdown, sanitizeSlug } from './utils/prdStore';
 export type { PrdBlock } from './utils/prdStore';
-export { ACT_RISK, AUTORUN_RISK, SUPERVISOR_LEVEL_LABEL, automergeSummary, autorunSummary, parseCount, parseSwitch, supervisorSummary } from './services/runSettingsText';
+export { ACT_RISK, AUTORUN_RISK, PLANNED_WITH_LABEL, SUPERVISOR_LEVEL_LABEL, automergeSummary, autorunSummary, parseCount, parseSwitch, supervisorSummary, trailerSummary } from './services/runSettingsText';
 export { SettingsService, getSettingsPath, runSettingsOf, RUN_SETTINGS_DEFAULTS, RunSettingsError, type GlobalRunSettings, type UserSettings } from './services/SettingsService';
 export {
   PlannerModelMemory,

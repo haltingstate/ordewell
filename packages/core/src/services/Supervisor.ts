@@ -3,7 +3,7 @@ import type { TurnAuthority } from '../models/Task';
 import { createWakePolicy, REPORT_LEAD, type RunEvent, type WakeBatch, type WakePolicy, type WakePolicySnapshot } from './WakePolicy';
 import { classifyRunnerStop } from './runnerExit';
 import { WAKE_UP_RATE, wakeUpRateTripped, type WakeUpRate } from './LoopGuards';
-import { PlannerTurnDiscardedError, PlannerTurnFailedError, PlannerTurnStoppedError, PlannerUsageLimitError, type PlanChange, type WakeUpTurn } from './PlannerConversation';
+import { PlannerContextPausedError, PlannerTurnDiscardedError, PlannerTurnFailedError, PlannerTurnStoppedError, PlannerUsageLimitError, type PlanChange, type WakeUpTurn } from './PlannerConversation';
 
 /** How long the first attention event waits for others to join its wake-up. */
 export const WAKE_DEBOUNCE_MS = 5_000;
@@ -331,6 +331,10 @@ export class Supervisor {
       if (err.resendAt === null) this.giveUp(`the planner hit its usage limit and ${err.held ?? 'did not say when it resets'}`);
       return;
     }
+    // Nor is a planner paused on its context: its wake-ups wait with the
+    // pause for the user's Retry compaction, and a restart would drop the
+    // input the retry sends.
+    if (err instanceof PlannerContextPausedError) return;
     const reason = err instanceof Error ? err.message : String(err);
     // A backend that throws its limit rather than saying it gives no reset to read.
     // A turn that said its failure was classified as it settled, by the runner's
@@ -470,17 +474,18 @@ function watchBrief(readBudget: number): string {
     'You are this plan\'s supervisor, woken by the run update above; the user did not write to you.',
     'Tell the user, in a few lines, what needs their attention and what you suggest, so they can answer.',
     readsLine(readBudget),
-    'At Watch you only suggest. Running, stopping, retrying, skipping or messaging tasks, answering approvals and editing the plan are refused in this turn: the user\'s reply is how a suggestion is applied.',
+    'At Watch you only suggest. Running, stopping, retrying, skipping or messaging tasks, answering approvals or checkpoints and editing the plan are refused in this turn: the user\'s reply is how a suggestion is applied.',
   ].join('\n');
 }
 
 function actBrief(readBudget: number, retryLimit: number): string {
   return [
     'You are this plan\'s supervisor, woken by the run update above; the user did not write to you.',
-    'At Act you may act on it yourself: run, stop and retry tasks, message their runners, deny or escalate approvals, change tasks with edit_plan, and merge_all. Nobody is asked first. A task you add is approved to run, an ops task included.',
+    'At Act you may act on it yourself: run, stop and retry tasks, message their runners, deny or escalate approvals, approve or reject checkpoints, change tasks with edit_plan, and merge_all. Nobody is asked first. A task you add is approved to run, an ops task included.',
     'When a task that failed, is blocked or waits for input should not hold up the rest, skip_task it with your reason: none of its work lands, and its dependents go ahead once the work it waited on is done, told why. You never mark work complete; only the user vouches for it.',
+    'A task waiting at a checkpoint is answered with answer_checkpoint: approve and it goes on, or reject with a reason, which the runner reads and acts on. A checkpoint that asks for the user\'s judgement on an irreversible or outward effect (a deletion, a push, a payment, a message to someone) is theirs: escalate it to the user rather than approving it. Leave it waiting and tell them what it asks and why you did not answer. When you reject, give the reason the runner should act on.',
     readsLine(readBudget),
-    'To change a task and run it again, call edit_plan and then retry_task in the same reply: the retry waits for the edit to land, so it runs as edited.',
+    'To change a task and run it again, call edit_plan and then retry_task in the same reply: the edit is in the plan as edit_plan answers, so the retry runs it as edited.',
     'A task paused on a usage limit can be resumed early with from "session" once the user says the limit has been reset.',
     `Loop guards hold you: you may retry one task up to ${retryLimit} times this run, and a skip of a task you retried counts as one more; a retry after a failure must change its prompt or model; you may not re-add a task you removed or undo an edit of your own. A refused call says why and what would be accepted. When a guard stops you, escalate to the user rather than trying again.`,
     'Then tell the user, in a few lines, what happened, what you did and why, and what needs them.',

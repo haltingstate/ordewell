@@ -1,5 +1,5 @@
 import type { AgentEvent } from '../services/harness/AgentAdapter';
-import type { CheckpointAnswer, McpToolReply, ReadTaskArgs, TaskCompleteArgs } from '../services/mcp/tools';
+import type { ApplyPatchArgs, CheckpointAnswer, McpToolReply, ReadTaskArgs, TaskCompleteArgs } from '../services/mcp/tools';
 import type { ApprovalDecision } from './IApproval';
 import type { TaskSkillSnapshot } from '../models/Task';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
@@ -8,6 +8,7 @@ import type { RunnerSessionCost } from '../models/Usage';
 import type { ScriptBody } from '../models/ScriptTask';
 import type { TaskShell } from './IFileSystem';
 import type { HandoffCheck } from '../models/Handoff';
+import type { TaskWebReads } from '../services/taskWebReads';
 /** How a structured turn ended. `failed` carries the agent's own words in the preceding `error` event. */
 export type StructuredTurnEnd = 'completed' | 'interrupted' | 'failed';
 /**
@@ -49,6 +50,13 @@ export type StructuredEvent =
   | { type: 'permission_decided'; id: string; decision: ApprovalDecision }
   /** An open `permission_request` can no longer be answered: the runner withdrew it, or its process is gone. */
   | { type: 'permission_withdrawn'; id: string }
+  /**
+   * The runner's `task_complete` call was accepted on the attempt's token, with
+   * the status it reported (ADR-0018, L1). A receipt, not evidence: the report
+   * reaches {@link IRunnerSession.onTaskComplete} once its turn closes or the
+   * interrupt grace runs out, and a turn or message the runner reads first voids it.
+   */
+  | { type: 'completion_received'; status: TaskCompleteArgs['status'] }
   /** A script task's command as it starts (ADR-0035): its argument vector, or its script, once. */
   | ({ type: 'script_run' } & ScriptRun)
   /**
@@ -75,13 +83,21 @@ export interface ScriptStatus {
  * `VerdictEngine`, as a runner's `task_complete` call is handed to it.
  * `command` names the command of `commands` it ended on, as a reader would
  * type it; a `script` body is one step and names none. `errorTail` is the end
- * of what that step wrote to stderr.
+ * of what that step wrote to stderr. `fullOutput` is the file that holds all
+ * of the attempt's output, since the task log keeps only its ends.
  */
-export type ScriptExit =
+export type ScriptExit = (
   | { outcome: 'passed' }
   | { outcome: 'failed'; command?: string; status: ScriptStatus; errorTail: string }
   | { outcome: 'timed-out'; command?: string; timeoutMs: number; errorTail: string }
-  | { outcome: 'stopped'; command?: string };
+  | { outcome: 'stopped'; command?: string }
+) & { fullOutput?: ScriptFullOutput };
+
+/** Where a script task attempt's whole output was saved, and how much of it a hard cap did not keep. */
+export interface ScriptFullOutput {
+  file: string;
+  droppedChars: number;
+}
 
 /** A runner command a user invoked, with its arguments as typed. */
 export interface InvokedCommand {
@@ -244,6 +260,21 @@ export interface IRunner {
     skills?: readonly TaskSkillSnapshot[];
     /** Something the user should know about how the spawn went that did not stop it — a respawn, most often. */
     onNotice?: (message: string) => void;
+    /**
+     * The runner is being started and has not yet reported Ordewell's tools
+     * connected (ADR-0025): on its first spawn, then on its one respawn.
+     * Nothing has been sent to it, and the spawn resolves only once they
+     * connect or the wait ends.
+     */
+    onAttaching?: (spawn: 1 | 2) => void;
+    /**
+     * Aborted once nobody wants the runner any more: a spawn still in flight
+     * is taken back at once instead of finishing its start for nobody. Once
+     * the spawn has resolved, the session's own stop is what ends it.
+     */
+    cancelled?: AbortSignal;
+    /** The attempt's work lands as a commit (ADR-0047): its runner is told to write the message in `task_complete`. */
+    commits?: true;
     /** A script task's body (ADR-0035): only the script runner reads it, and it runs nothing else. */
     script?: ScriptBody;
     /**
@@ -262,6 +293,25 @@ export interface IRunner {
      * and the session's task logs. Without one the call says it is not available.
      */
     readTask?: (args: ReadTaskArgs) => McpToolReply;
+    /**
+     * Answers a read-only attempt's `save_patch` calls (ADR-0050): its shell
+     * captures the worktree's changes and the attempt keeps them. Without one
+     * the call says it is not available.
+     */
+    savePatch?: (signal: AbortSignal) => Promise<McpToolReply>;
+    /**
+     * Answers a change attempt's `apply_patch` calls (ADR-0050): a saved patch
+     * of a task it may read, applied into its worktree. Without one the call
+     * says it is not available.
+     */
+    applyPatch?: (args: ApplyPatchArgs) => Promise<McpToolReply>;
+    /**
+     * Answers a read-only attempt's `fetch` and `web_search` calls (ADR-0046)
+     * through the session's web-read policy, apart from its shell. Only a
+     * read-only attempt's token lists them; without one they say they are
+     * not available.
+     */
+    webReads?: TaskWebReads;
   }): Promise<IRunnerSession>;
 
   /** Wind one session down ({@link IRunnerSession.stop}); resolves once its process is gone. */

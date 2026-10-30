@@ -117,8 +117,8 @@ turn-scoped and never touches the run's tasks.**
   queue, so there is nothing to send now; force sending one already forced
   changes nothing. The surfaces: `ctrl-s` in the TUI task view (the composer
   text, or the selected queued message when the composer is empty), *Send now* and
-  `Ctrl+Enter` in the VS Code task log, and `POST …/tasks/:task/messages/now`
-  and `…/messages/:id/now` on the daemon. The planner chat's force send is
+  `Ctrl+Enter` in the VS Code task log, and the daemon's `execute-command` route
+  carrying `message_task` with `force` or `force_send_queued`. The planner chat's force send is
   F5.
 - **The forced message goes first; the rest keep their order (F2).** Messages
   still in Ordewell's queue follow the forced one in the order they were sent.
@@ -145,9 +145,9 @@ turn-scoped and never touches the run's tasks.**
   while the planner answers waits for the turn's end, held by the surface.
   Force send (`Session.forceSendPrompt`, `POST …/converse/message/now`)
   stops the planner turn in flight through the same path a stop takes — the
-  harness planner's tool call in flight is stopped, and what the turn
-  deferred behind its edit is reported not done, since that edit never
-  lands — and answers the forced prompt alone in the turn that replaces it.
+  harness planner's tool call in flight is stopped, and a plan change it had
+  already committed stays (ADR-0022, P2) — and answers the forced prompt alone
+  in the turn that replaces it.
   The forced prompt waits before the stop, ahead of every input waiting but
   an earlier forced one, and behind the inputs the stopped turn took, so
   nothing starts in between and the rest keep their order (F2). A force
@@ -355,3 +355,5 @@ interrupt (D4 covers it either way).
 - 2026-10-13 — F5: a force send keeps the run update of a wake-up turn it stops.
 - 2026-10-14 — F1: a handed-over message can be force sent, and is never sent twice; probed on Claude Code 2.1.299. F2 corrected for OpenCode 1.x, whose adapter lets go of an unread message at the abort. Removal of a handed-over message stays refused.
 - 2026-10-18 — F2: turn-end delivery waits for every message the runner still holds, including one behind a newly forced message.
+- 2026-10-24 — the daemon's force send routes are replaced by the one `execute-command` route (ADR-0006 S3).
+- 2026-10-26 — F5: a force send keeps what the stopped turn's tool calls already committed; nothing is deferred behind an edit (ADR-0022, P2).

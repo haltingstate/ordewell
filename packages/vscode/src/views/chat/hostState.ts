@@ -1,6 +1,6 @@
-import type { GlobalRunSettings } from '@ordewell/core';
-import { type SurfacePlan, type DiscoveredModel, type RunnerId, type RunView, type RunTask, type AiProvider } from '@ordewell/core';
-import { DEFAULT_RUNNERS, EMPTY_HOLD, EMPTY_RUN, type PromptHold } from '@ordewell/core/plan-utils';
+import type { AccountLimitSnapshot, GlobalRunSettings, IsolationPreview } from '@ordewell/core';
+import type { SurfacePlan, DiscoveredModel, RunnerId, RunActivity, RunView, RunTask, AiProvider } from '@ordewell/core';
+import { DEFAULT_RUNNERS, EMPTY_HOLD, EMPTY_RUN, IDLE_ACTIVITY, type PromptHold } from '@ordewell/core/plan-utils';
 import type { HostToWebview, PlannerBackend, RunnerMeta } from '../../shared/protocol';
 import { applyConversationPatch, EMPTY_PATCHED_VIEW, type PatchedView } from '../../shared/conversationPatch';
 import { appendTaskOutput, type TaskOutputMap } from './taskOutput';
@@ -25,17 +25,27 @@ export interface ModelOption {
 export interface HostState {
   /** The planner conversation, held by the host and patched in here (#53). */
   conversation: PatchedView;
+  /**
+   * Which conversation that is: it moves on when the host replaces one, whose
+   * block ids a new one reuses, so what a reader opened in it stays with it.
+   */
+  conversationEpoch: number;
   plan: SurfacePlan | null;
   isExecuting: boolean;
   isResearchActive: boolean;
-  conversationBusy: boolean;
   error: string;
   models: DiscoveredModel[];
   modelsByRunner: Partial<Record<string, DiscoveredModel[]>>;
   modelAllowlist: Record<string, string[]>;
   runnerList: RunnerInfo[];
+  /** The runners the settings file every surface shares holds on (ADR-0043), as the host last reported them. */
   enabledRunnerIds: string[];
-  runners: RunnerId[];
+  /**
+   * A Runners pill clicked, on or off, until the host's `runnerChoiceSaved`
+   * for that request answers it, saved or not. A runner list is never the
+   * answer: discovery that began before the save would revive the old state.
+   */
+  pendingRunners: Partial<Record<RunnerId, { enabled: boolean; requestId: string }>>;
   /** Queued prompts: what the host is holding for the next planner turn. */
   held: PromptHold;
   /** The last queued text the host gave back; `seq` makes a repeat of the same words land again. */
@@ -79,29 +89,61 @@ export interface HostState {
    * Merge all result. The per-task badges and the isolation cards read here.
    */
   run: RunView;
+  /**
+   * The run's own state, as a `runView` or an Execute's answer last said:
+   * starting, running, scheduled or resumable. The plan's status is the
+   * execution flag; this is the start's.
+   */
+  activity: RunActivity;
+  /**
+   * The user pressed Execute (or Approve all) and the host has not answered
+   * yet: the button shows "Starting…" at once. Cleared by the matching
+   * `runActivity`, a refusal, or a session change — never by a run's own ticks.
+   */
+  starting: boolean;
+  /** The Execute request `starting` belongs to; a reply for another is stale. */
+  startRequestId: number | null;
   /** Is the plan dock open? See planDock.ts for when this flips. */
   dockExpanded: boolean;
   /** The dock's dragged cap in px, remembered by the host; undefined keeps the stylesheet's default. */
   dockHeight: number | undefined;
   /** The user stopped the turn: plan updates are dropped until the host closes it. */
   stopped: boolean;
-  /** The user started a new session: errors from the old one's turn are dropped. */
+  /**
+   * The watchdog unlocked the input on a turn the host never closed. The host
+   * saying that turn is still producing (`plannerTurnAlive`) locks it again;
+   * any word from the host on the turn, or the user's own, ends the wait.
+   */
+  turnLost: boolean;
+  /**
+   * The user started a new session: errors from the old one's turn are
+   * dropped, until the user sends anything, a typed command included.
+   */
   sessionCleared: boolean;
+  /** Every installed runner's account limits: live account data, kept across a session reset. */
+  accountLimits: readonly AccountLimitSnapshot[];
+  /**
+   * The workspace's repositories and branches, as the host last read them.
+   * `undefined` until the host says anything; `null` while it re-reads, after
+   * a workspace change or a reload, so an old answer is never shown as current.
+   * Not part of a session: a new or restored one keeps it.
+   */
+  isolationPreview: IsolationPreview | null | undefined;
 }
 
 export const INITIAL_HOST_STATE: HostState = {
   conversation: EMPTY_PATCHED_VIEW,
+  conversationEpoch: 0,
   plan: null,
   isExecuting: false,
   isResearchActive: false,
-  conversationBusy: false,
   error: '',
   models: [],
   modelsByRunner: {},
   modelAllowlist: {},
   runnerList: [],
   enabledRunnerIds: [...DEFAULT_RUNNERS],
-  runners: [...DEFAULT_RUNNERS],
+  pendingRunners: {},
   held: EMPTY_HOLD,
   unsent: null,
   modesByRunner: {},
@@ -122,10 +164,16 @@ export const INITIAL_HOST_STATE: HostState = {
   answeredCheckpoint: null,
   taskOutput: {},
   run: EMPTY_RUN,
+  activity: IDLE_ACTIVITY,
+  starting: false,
+  startRequestId: null,
   dockExpanded: false,
   dockHeight: undefined,
   stopped: false,
+  turnLost: false,
   sessionCleared: false,
+  accountLimits: [],
+  isolationPreview: undefined,
 };
 
 export type SessionResetKind = 'empty' | 'restore' | 'new';
@@ -140,11 +188,13 @@ export type HostAction =
   | { type: 'resetSession'; kind: SessionResetKind }
   | { type: 'turnStopped' }
   | { type: 'turnRequested' }
+  | { type: 'commandSent' }
+  | { type: 'startRequested'; requestId: number }
   | { type: 'patchPlan'; plan: Updatable<SurfacePlan | null> }
-  | { type: 'patchResearchActive'; active: boolean }
+  | { type: 'turnLost' }
   | { type: 'patchError'; error: string }
   | { type: 'patchReady'; ready: boolean }
-  | { type: 'patchRunners'; runners: Updatable<RunnerId[]> }
+  | { type: 'runnerChoiceRequested'; runnerId: RunnerId; enabled: boolean; requestId: string }
   | { type: 'checkpointAnswered' }
   | { type: 'patchDockHeight'; height: number | undefined }
   | { type: 'patchDockExpanded'; expanded: Updatable<boolean> };
@@ -172,15 +222,26 @@ export function resetSession(state: HostState, kind: SessionResetKind): HostStat
     answeredCheckpoint: null,
     taskOutput: {},
     run: EMPTY_RUN,
+    activity: IDLE_ACTIVITY,
+    starting: false,
+    startRequestId: null,
     dockExpanded: nextDock(state.dockExpanded, 'session-reset'),
   };
   if (kind === 'empty') return next;
   next.isResearchActive = false;
+  next.turnLost = false;
   next.isExecuting = false;
   next.held = EMPTY_HOLD;
   next.stopped = kind === 'new';
   next.sessionCleared = kind === 'new';
   return next;
+}
+
+/** The runners shown on: the saved list, with any pill click the host has not answered yet. */
+export function runnersOn(state: Pick<HostState, 'runnerList' | 'enabledRunnerIds' | 'pendingRunners'>): RunnerId[] {
+  const on = (id: RunnerId) => state.pendingRunners[id]?.enabled ?? state.enabledRunnerIds.includes(id);
+  const listed = state.runnerList.map((r) => r.id);
+  return [...new Set([...listed, ...state.enabledRunnerIds])].filter(on);
 }
 
 function resolve<T>(value: Updatable<T>, prev: T): T {
@@ -193,16 +254,27 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
       return resetSession(state, action.kind);
 
     case 'turnStopped':
-      return { ...state, stopped: true, isResearchActive: false };
+      return { ...state, stopped: true, isResearchActive: false, turnLost: false };
 
     case 'turnRequested':
-      return { ...state, stopped: false, sessionCleared: false, error: '', isResearchActive: true };
+      return { ...state, stopped: false, sessionCleared: false, error: '', isResearchActive: true, turnLost: false };
+
+    // A command such as /fork or /compact opens no turn of the old session's,
+    // and may fail before it opens one at all: its error is the new session's.
+    case 'commandSent':
+      return state.sessionCleared ? { ...state, sessionCleared: false } : state;
+
+    case 'startRequested':
+      // A second click while the first is still with the host is the same
+      // start, not another: the host and core coalesce it too.
+      if (state.starting || state.activity.starting) return state;
+      return { ...state, starting: true, startRequestId: action.requestId, error: '' };
 
     case 'patchPlan':
       return { ...state, plan: resolve(action.plan, state.plan) };
 
-    case 'patchResearchActive':
-      return { ...state, isResearchActive: action.active };
+    case 'turnLost':
+      return { ...state, isResearchActive: false, turnLost: true };
 
     case 'patchError':
       return { ...state, error: action.error };
@@ -210,8 +282,23 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
     case 'patchReady':
       return { ...state, isReady: action.ready };
 
-    case 'patchRunners':
-      return { ...state, runners: resolve(action.runners, state.runners) };
+    case 'runnerChoiceRequested': {
+      const { runnerId, enabled, requestId } = action;
+      return { ...state, pendingRunners: { ...state.pendingRunners, [runnerId]: { enabled, requestId } } };
+    }
+
+    case 'runnerChoiceSaved': {
+      // An answer to an older or repeated request, or to the page before a
+      // reload, leaves the newer click it would otherwise clear.
+      if (state.pendingRunners[action.runnerId]?.requestId !== action.requestId) return state;
+      const pendingRunners = { ...state.pendingRunners };
+      delete pendingRunners[action.runnerId];
+      const saved = state.enabledRunnerIds.includes(action.runnerId);
+      let enabledRunnerIds = state.enabledRunnerIds;
+      if (action.enabled && !saved) enabledRunnerIds = [...enabledRunnerIds, action.runnerId];
+      if (!action.enabled && saved) enabledRunnerIds = enabledRunnerIds.filter((id) => id !== action.runnerId);
+      return { ...state, enabledRunnerIds, pendingRunners };
+    }
 
     case 'checkpointAnswered':
       // The question is answered here, before the run says so: remember it so
@@ -232,7 +319,10 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
 
     case 'setState': {
       const base = action.state === 'empty' ? resetSession(state, 'empty') : state;
-      return { ...base, isExecuting: action.state === 'approved' };
+      // `approved` is the plan's approval, not a run: a task's own status is
+      // what says work is executing. The click's own "Starting…" covers the
+      // gap, so forcing `isExecuting` here made a start read as a run.
+      return { ...base, isExecuting: action.state === 'empty' ? false : base.isExecuting };
     }
 
     case 'planUpdated': {
@@ -241,7 +331,12 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
       let next: HostState = { ...state, plan: incoming };
       // Not a turn's end: a run's status tick arrives mid-turn too, and the
       // host's `plannerTurn` is what says a turn is over.
-      if (incoming) next.isExecuting = incoming.status === 'running';
+      if (incoming) {
+        next.isExecuting = incoming.status === 'running';
+        // A run is executing now: the click's start has arrived, and its
+        // button must be the run's Stop, not a spinner for a finished start.
+        if (next.isExecuting) next.starting = false;
+      }
       if (incoming && incoming.tasks && incoming.tasks.length > 0) {
         // One `planUpdated` carries two different events. A revision opens
         // the dock; a status tick during execution must not, or a running
@@ -256,22 +351,31 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
     }
 
     case 'restoreChat':
-      return resetSession(state, 'restore');
+      return { ...resetSession(state, 'restore'), conversationEpoch: state.conversationEpoch + 1 };
 
+    // A new session or a cleared plan empties the conversation first; a reload
+    // replaces it with blocks renumbered from the start. A compaction does
+    // neither: it folds in where it happened (ADR-0017).
     case 'conversationPatch':
-      return { ...state, conversation: applyConversationPatch(state.conversation, action) };
+      return {
+        ...state,
+        conversation: applyConversationPatch(state.conversation, action),
+        ...((action.order.length === 0 && state.conversation.order.length > 0) || action.replaced
+          ? { conversationEpoch: state.conversationEpoch + 1 } : {}),
+      };
 
     // The stop gate lasts until the host has closed the stopped turn; a new
     // turn is never gated.
     case 'plannerTurn':
-      return { ...state, stopped: false, isResearchActive: action.active };
+      return { ...state, stopped: false, isResearchActive: action.active, turnLost: false };
 
-    case 'conversationBusy':
-      return { ...state, conversationBusy: !!action.busy };
+    case 'plannerTurnAlive':
+      if (!state.turnLost || state.stopped) return state;
+      return { ...state, isResearchActive: true, turnLost: false };
 
     case 'showError':
       if (state.sessionCleared) return state;
-      return { ...state, error: action.error, isResearchActive: false };
+      return { ...state, error: action.error, isResearchActive: false, turnLost: false, starting: false, startRequestId: null };
 
     case 'taskOutput':
       return { ...state, taskOutput: appendTaskOutput(state.taskOutput, action.taskId, action.text ?? '') };
@@ -291,7 +395,29 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
           ? { ...question, pausedAt: state.checkpoint.pausedAt }
           : { ...question, pausedAt: action.now }
         : null;
-      return { ...state, run: action.view, checkpoint, answeredCheckpoint: answered ? state.answeredCheckpoint : null };
+      const activity = action.view.activity ?? state.activity;
+      return {
+        ...state,
+        run: action.view,
+        activity,
+        checkpoint,
+        answeredCheckpoint: answered ? state.answeredCheckpoint : null,
+        // Work is live: whatever start was waiting is over, and Stop is the
+        // control now. A view that only says "starting" leaves the spinner be.
+        starting: activity.running ? false : state.starting,
+      };
+    }
+
+    case 'runActivity': {
+      // A reply for an Execute this webview is no longer waiting on is another
+      // session's (or an already-settled one): it must not light a spinner.
+      if (action.requestId !== undefined && action.requestId !== state.startRequestId) return state;
+      return {
+        ...state,
+        activity: action.activity,
+        starting: false,
+        startRequestId: action.requestId !== undefined ? null : state.startRequestId,
+      };
     }
 
     case 'setModels':
@@ -332,19 +458,10 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
 
     case 'setRunners': {
       const list = action.runners ?? [];
-      const ids = list.filter((r: RunnerMeta) => r.enabled).map((r: RunnerMeta) => r.id);
-      let runners: RunnerId[];
-      if (ids.length === 1) runners = ids;
-      else if (ids.length === 0) runners = [...DEFAULT_RUNNERS];
-      else {
-        const valid = state.runners.filter((r) => ids.includes(r));
-        runners = valid.length > 0 ? valid : ids;
-      }
       return {
         ...state,
         runnerList: list.map((r: RunnerMeta) => ({ id: r.id, displayName: r.displayName })),
-        enabledRunnerIds: ids,
-        runners,
+        enabledRunnerIds: list.filter((r: RunnerMeta) => r.enabled).map((r: RunnerMeta) => r.id),
         runnersKnown: true,
       };
     }
@@ -363,6 +480,12 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
 
     case 'planDockHeight':
       return { ...state, dockHeight: action.height };
+
+    case 'accountLimits':
+      return { ...state, accountLimits: action.limits };
+
+    case 'isolationPreview':
+      return { ...state, isolationPreview: action.preview };
 
     case 'setRunSettings':
       return { ...state, runSettings: { autonomous: action.autonomous, run: action.run, maxParallel: action.maxParallel } };

@@ -76,6 +76,7 @@ function harness(aiService: Partial<IAiService> = { hasActiveConversation: () =>
     isGeneratingPlan: () => session.isPlannerBusy,
     persistState: vi.fn(),
     saveCurrentSession: vi.fn(),
+    sendRunSettings: vi.fn(),
     log: () => {},
     extension: {
       ready: vi.fn(),
@@ -84,8 +85,11 @@ function harness(aiService: Partial<IAiService> = { hasActiveConversation: () =>
       setPlanner: vi.fn(async () => {}),
       setPlannerModel: vi.fn(async () => {}),
       openTaskLog: vi.fn(),
+      openFile: vi.fn(),
       setPlanDockHeight: vi.fn(),
       changeSettings: vi.fn(async () => {}),
+      setRunnerEnabled: vi.fn(async () => {}),
+      loginPlanner: vi.fn(async () => {}),
     },
     getPendingRunners: () => pending,
     setPendingRunners: (r) => { pending = r; },
@@ -179,13 +183,28 @@ describe('webview messages reach the session through one entry point each', () =
     it.each([
       ['resumeNow', { command: 'retry_task', task: 't1', from: 'session' }],
       ['cancelResume', { command: 'cancel_resume', task: 't1' }],
-      ['markComplete', { command: 'mark_complete', task: 't1' }],
-      ['markIncomplete', { command: 'mark_not_done', task: 't1' }],
       ['forceStart', { command: 'force_start', task: 't1' }],
     ] as const)('%s reaches the command seam as the user', async (command, expected) => {
       const execute = vi.spyOn(h.session, 'execute').mockResolvedValue({ ok: true, message: 'done' });
       await h.route({ type: 'sendSystemCommand', command, taskId: 't1' });
 
+      expect(execute).toHaveBeenCalledWith(expected, { kind: 'user' });
+    });
+
+    it.each([
+      ['markComplete', 'Mark complete', { command: 'mark_complete', task: 't1', confirmed: true, seen: 'pending' }],
+      ['markIncomplete', 'Mark not done', { command: 'mark_not_done', task: 't1', confirmed: true, seen: 'pending' }],
+    ] as const)('%s reaches the command seam as the user only once the modal is answered %s', async (command, yes, expected) => {
+      const execute = vi.spyOn(h.session, 'execute').mockResolvedValue({ ok: true, message: 'done' });
+      showWarningMessage.mockClear();
+      showWarningMessage.mockResolvedValueOnce(undefined);
+      await h.route({ type: 'sendSystemCommand', command, taskId: 't1' });
+      expect(execute).not.toHaveBeenCalled();
+
+      showWarningMessage.mockResolvedValueOnce(yes);
+      await h.route({ type: 'sendSystemCommand', command, taskId: 't1' });
+
+      expect(showWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining('?'), { modal: true }, yes);
       expect(execute).toHaveBeenCalledWith(expected, { kind: 'user' });
     });
 
@@ -395,6 +414,37 @@ describe('webview messages reach the session through one entry point each', () =
     });
   });
 
+  // The context-pause bar's Retry is a planner turn the chat did not send, so
+  // nothing in sendChat drains the prompt typed while it ran.
+  describe('a prompt held during a Retry compaction', () => {
+    it.each([
+      ['it lands', () => Promise.resolve(h.session.planState!)],
+      ['it fails', () => Promise.reject(new Error('rate limited'))],
+    ])('is sent once when %s', async (_case, retry) => {
+      vi.spyOn(h.session, 'retryPlannerCompaction').mockImplementation(retry);
+      const converse = vi.spyOn(h.session, 'continueConversation').mockResolvedValue(h.session.planState!);
+      h.deps.chatProvider.conversation.holdPrompt('typed during the retry');
+
+      await h.route({ type: 'sendSystemCommand', command: 'retryPlannerCompaction' });
+
+      expect(converse).toHaveBeenCalledTimes(1);
+      expect(converse).toHaveBeenCalledWith('typed during the retry');
+    });
+
+    it('stays held while the planner is still busy', async () => {
+      vi.spyOn(h.session, 'retryPlannerCompaction').mockResolvedValue(h.session.planState!);
+      const converse = vi.spyOn(h.session, 'continueConversation').mockResolvedValue(h.session.planState!);
+      h.deps.isGeneratingPlan = () => true;
+      h.deps.chatProvider.conversation.holdPrompt('typed during the retry');
+
+      await h.route({ type: 'sendSystemCommand', command: 'retryPlannerCompaction' });
+
+      expect(converse).not.toHaveBeenCalled();
+      const holds = h.posts.filter((m): m is Extract<HostToWebview, { type: 'heldPrompts' }> => m.type === 'heldPrompts');
+      expect(holds.at(-1)?.prompts).toEqual(['typed during the retry']);
+    });
+  });
+
   describe('chat', () => {
     it('sends a known slash command to the extension, and anything else to the planner', async () => {
       const converse = vi.spyOn(h.session, 'continueConversation').mockResolvedValue(h.session.planState!);
@@ -497,8 +547,13 @@ describe('webview messages reach the session through one entry point each', () =
     [{ type: 'setPlanner', provider: 'codex' }, 'setPlanner', ['codex']],
     [{ type: 'setPlannerModel', modelId: 'gpt-5', effort: 'high' }, 'setPlannerModel', ['gpt-5', 'high']],
     [{ type: 'openTaskLog', taskId: 't1' }, 'openTaskLog', ['t1']],
+    [{ type: 'openFile', path: '.ordewell/sessions/s1/tasks/t1/1.patch' }, 'openFile', ['.ordewell/sessions/s1/tasks/t1/1.patch']],
     [{ type: 'setPlanDockHeight', height: 320 }, 'setPlanDockHeight', [320]],
     [{ type: 'changeSettings', change: { run: { autorun: true } } }, 'changeSettings', [{ run: { autorun: true } }]],
+    [{ type: 'setRunnerEnabled', runnerId: 'codex', enabled: false, requestId: 'req-1' }, 'setRunnerEnabled', ['codex', false, 'req-1']],
+    [{ type: 'loginPlanner', runner: 'codex' }, 'loginPlanner', ['codex']],
+    // No runner is the active planner's login, which the host resolves.
+    [{ type: 'loginPlanner' }, 'loginPlanner', [undefined]],
   ] as const)('hands %o to the extension', async (msg, handler, args) => {
     await h.route(msg as WebviewToHost);
 

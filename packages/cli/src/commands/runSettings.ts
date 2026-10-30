@@ -2,18 +2,19 @@ import type { GlobalRunSettings } from '@ordewell/core';
 import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import {
-  ACT_RISK, AUTORUN_RISK, SUPERVISOR_LEVEL_LABEL, automergeSummary, autorunSummary, parseCount, parseSwitch, supervisorSummary,
+  ACT_RISK, AUTORUN_RISK, SUPERVISOR_LEVEL_LABEL, PLANNED_WITH_LABEL, automergeSummary, autorunSummary, parseCount, parseSwitch, supervisorSummary, trailerSummary,
 } from '@ordewell/core';
 import { connect, fail } from './shared';
 
 /**
- * The run settings (ADR-0030), saved for every session from its next run. A
- * session's run under way takes a change at once only when it is made in
- * that session, in the TUI.
+ * The run settings (ADR-0030), saved as the default for new sessions. A
+ * session already open keeps its own copy; only a change made in that session,
+ * in the TUI, moves the run under way.
  */
 
 const SUPERVISOR_USAGE = 'Usage: ordewell supervisor [off|watch|act] · ordewell supervisor retries <n> · ordewell supervisor reads <n>';
 const AUTOMERGE_USAGE = 'Usage: ordewell automerge [on|off]';
+const TRAILER_USAGE = 'Usage: ordewell trailer [on|off]';
 const AUTORUN_USAGE = 'Usage: ordewell autorun [on|off]';
 
 async function save(api: ApiClient, changes: Partial<GlobalRunSettings>): Promise<void> {
@@ -35,7 +36,7 @@ export async function handleSupervisor(subArgs: string[], injectedApi?: ApiClien
     return;
   }
   await save(api, changes);
-  if (changes.supervisorLevel) console.log(`Supervisor: ${SUPERVISOR_LEVEL_LABEL[changes.supervisorLevel]}, from each session's next run.`);
+  if (changes.supervisorLevel) console.log(`Supervisor: ${SUPERVISOR_LEVEL_LABEL[changes.supervisorLevel]}, for new sessions.`);
   if (changes.supervisorLevel === 'act') console.log(ACT_RISK);
   if (changes.supervisorRetryLimit !== undefined) console.log(`Supervisor retry limit: ${changes.supervisorRetryLimit} per task.`);
   if (changes.wakeUpReadBudget !== undefined) console.log(`Wake-up read budget: ${changes.wakeUpReadBudget} reads.`);
@@ -53,7 +54,22 @@ export async function handleAutomerge(subArgs: string[], injectedApi?: ApiClient
     return;
   }
   await save(api, { mergeAtGatesAutomatically: enabled });
-  console.log(`Merge automatically (gates, end of run): ${enabled ? 'on' : 'off'}, from each session's next run.`);
+  console.log(`Merge automatically (gates, end of run): ${enabled ? 'on' : 'off'}, for new sessions.`);
+}
+
+export async function handleTrailer(subArgs: string[], injectedApi?: ApiClient): Promise<void> {
+  const [arg] = positionals(subArgs);
+  const enabled = arg === undefined ? null : parseSwitch(arg);
+  if (arg !== undefined && enabled === null) fail(TRAILER_USAGE);
+
+  const api = await connect(subArgs, injectedApi);
+  if (enabled === null) {
+    console.log(trailerSummary((await api.getSettings()).run));
+    console.log(`  ${TRAILER_USAGE}`);
+    return;
+  }
+  await save(api, { plannedWithTrailer: enabled });
+  console.log(`${PLANNED_WITH_LABEL}: ${enabled ? 'on' : 'off'}, from each session's next commit.`);
 }
 
 export async function handleAutorun(subArgs: string[], injectedApi?: ApiClient): Promise<void> {

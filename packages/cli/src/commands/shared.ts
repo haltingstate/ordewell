@@ -1,6 +1,6 @@
 import { createInterface } from 'readline';
 import { ensureDaemon, resolvePort } from '../daemon';
-import { ApiClient, DaemonError } from '../apiClient';
+import { ApiClient, DaemonError, deliveryOf } from '../apiClient';
 import { normalizeCatalog, type Catalog } from '../catalog';
 import { findEnvFile, writeEnvVar } from '../utils/env';
 import { allTasksOf } from '../utils/tasks';
@@ -23,12 +23,35 @@ export function fail(...lines: string[]): never {
 }
 
 /**
+ * A failed turn's terminal-UI guidance said in the shell's own commands. The
+ * daemon cannot know which surface is asking, so it words a signed-out turn
+ * with `/login`; a shell has no such command ([ADR-0052](../../../../docs/adr/routing/0052-a-signed-out-coding-agent-is-flagged-and-signs-in-from-the-chat.md)).
+ */
+export function headlessSignedOut(message: string): string {
+  return message.replace(
+    /^(.+?) not logged in\. Sign in with \/login, or run (.+?) and try again\.$/m,
+    '$1 not logged in. Run $2 to sign in, then try again.',
+  );
+}
+
+/**
  * A planner refusal said in the shell's own commands, or null for any other
  * error. The daemon words it for the terminal UI, whose slash commands a shell
  * does not have, and sends the reason as data so a client can re-word it.
  */
 export function headlessPlannerRefusal(err: unknown): string | null {
   return err instanceof DaemonError && err.plannerNotReady ? describePlannerNotReady(err.plannerNotReady, HEADLESS_CLI_COMMANDS) : null;
+}
+
+/**
+ * What to tell a user whose planner call died after the request went out, or
+ * null when the daemon answered (or never got it). The daemon runs a turn to
+ * its end whether or not anyone waits, so what the call did is the session's to
+ * say, and doing it again could do it twice.
+ */
+export function lostReplyHint(err: unknown, sessionId: string): string | null {
+  if (deliveryOf(err) !== 'unknown') return null;
+  return `The connection dropped before the planner answered: it may still be running or may have finished. Session ${sessionId} is kept: \`ordewell sessions load ${sessionId}\` shows where it got to, and sending the request again could run it twice.`;
 }
 
 /** A yes/no question on the terminal; no terminal to ask on is a no. */

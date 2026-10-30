@@ -1,7 +1,7 @@
 import {
-  diffRows, diffSummary, formatTokenCount, handoffReferenceText, loadedSkillTokens, outputPreview, severityLabel, usageText, wakeUpItems, worstSeverity, REPORT_PREVIEW_LINES,
+  accountLimitsText, contextMeterText, type AccountLimitSnapshot, approvalKindText, approvalStatusText, compactionText, diffRows, diffSummary, handoffFindingsText, handoffReferenceText, loadedSkillTokens, outputPreview, planMarkerParts, savedPatchViews, severityLabel, usageText, wakeUpItems, worstSeverity, REPORT_PREVIEW_LINES,
   type DiffRow, type DiffStat,
-  type ApprovalBlock, type ApprovalKind, type ApprovalSource, type DisplayBlock, type MessageBlock, type MessageRole, type PlanBlock,
+  type ApprovalBlock, type DisplayBlock, type MessageBlock, type MessageRole, type PlanBlock,
   type CommandBlock, type CommandStatus, type CompactionBlock, type RunnerLoadedBlock,
   type FindingSeverity, type HandoffBlock, type HandoffFinding,
   type SkillLoadBlock, type SubagentBlock, type SubagentStatus, type ThinkingDisplayBlock, type ToolBlock,
@@ -495,42 +495,17 @@ function subagentLines(block: SubagentBlock, cols: number, detailAll: boolean): 
 
 // ── One-line markers ─────────────────────────────────────────────────────────
 
-const APPROVAL_KIND: Record<ApprovalKind, string> = {
-  shell_command: 'Run a command',
-  url_fetch: 'Fetch a URL',
-  web_search: 'Search the web',
-  external_path: 'Read outside the workspace',
-  mcp_tool: 'Use an MCP tool',
-  mcp_server: 'Start a project MCP server',
-  runner_tool: 'Use a tool',
-  task_start: 'Start work',
-};
-
-// A request the user answered reads "Approved": naming `asked` would state the obvious.
-const DECIDED_BY: Record<Exclude<ApprovalSource, 'asked'>, string> = {
-  'pre-approved': 'pre-approved',
-  remembered: 'remembered',
-  mode: 'policy',
-  'no-channel': 'no approval channel',
-  excluded: 'excluded',
-  guard: 'blocked address',
-  secret: 'secret check',
-  budget: 'web-read budget',
-  unsupported: 'not usable on this runner version',
-};
-
 /** Status first, so a long subject is what the pane cuts. */
 function approvalLine(block: ApprovalBlock, cols: number): string {
-  const policy = block.decidedBy && block.decidedBy !== 'asked' ? DECIDED_BY[block.decidedBy] : undefined;
-  const [mark, status, paint] = block.status === 'pending'
-    ? ['?', 'Waiting for you', style.yellow]
+  const [mark, paint] = block.status === 'pending'
+    ? ['?', style.yellow]
     : block.status === 'granted'
-      ? ['✓', policy ? `Auto-approved (${policy})` : block.forTask ? 'Approved for this task' : 'Approved', style.green]
+      ? ['✓', style.green]
       : block.status === 'withdrawn'
-        ? ['·', 'Withdrawn', style.grey]
-        : ['⊘', policy ? `Auto-denied (${policy})` : 'Denied', style.yellow];
+        ? ['·', style.grey]
+        : ['⊘', style.yellow];
   const note = block.note ? `: “${firstLine(block.note)}”` : '';
-  const line = `${mark} ${status} · ${APPROVAL_KIND[block.kind]}: ${firstLine(block.subject)}${note}`;
+  const line = `${mark} ${approvalStatusText(block)} · ${approvalKindText(block.kind)}: ${firstLine(block.subject)}${note}`;
   return `${paint(mark)}${truncate(line, cols).slice(mark.length)}`;
 }
 
@@ -614,12 +589,17 @@ function runnerCommandLines(block: CommandBlock, cols: number, detailAll: boolea
   return [head, ...underHeader([...shown.map(style.grey), ...more])];
 }
 
-function compactionLine(block: CompactionBlock, cols: number): string {
-  const sizes = block.preTokens !== undefined && block.postTokens !== undefined
-    ? ` · ${formatTokenCount(block.preTokens)} → ${formatTokenCount(block.postTokens)} tokens`
-    : '';
-  const text = block.trigger === 'auto' && !sizes ? '≡ Context compacted by the runner on its own' : `≡ Context compacted${sizes}`;
-  return style.grey(truncate(text, cols));
+/**
+ * One quiet line (ADR-0017), worded by core so every surface says the same.
+ * A planner's condensed compaction keeps its summary behind full detail: it is
+ * model-written, so it is painted as text and wrapped, never read as styling.
+ */
+function compactionLines(block: CompactionBlock, cols: number, detailAll: boolean): string[] {
+  const hint = block.summary && !detailAll ? ' (ctrl+o for the summary)' : '';
+  const head = style.grey(truncate(`≡ ${compactionText(block)}${hint}`, cols));
+  if (!block.summary || !detailAll) return [head];
+  const room = Math.max(1, cols - OUTPUT_INDENT.length);
+  return [head, ...underHeader(block.summary.trim().split('\n').flatMap((line) => wrap(sanitize(line), room)).map(style.grey))];
 }
 
 /** One line unless the pane shows detail: what a user's own setup brought into the task is there to look up, not to read every time. */
@@ -679,16 +659,32 @@ function findingLines(f: HandoffFinding, cols: number): string[] {
   return [...findingHeadLines(f, cols), ...detail, ...evidence];
 }
 
-/** Each artifact as its own path or URL, so a reader can copy one without the others. */
+/** Each artifact as its own path or URL, so a reader can copy one without the others. A patch gets the expanded block below. */
 function handoffArtifactLines(block: HandoffBlock, cols: number): string[] {
-  if (!block.handoff.artifacts?.length) return [];
+  const artifacts = block.handoff.artifacts?.filter((a) => a.kind !== 'patch') ?? [];
+  if (artifacts.length === 0) return [];
   const room = Math.max(1, cols - FINDING_INDENT.length - 2);
   const rows = [`${HANDOFF_INDENT}${style.grey('Artifacts:')}`];
-  for (const artifact of block.handoff.artifacts) {
+  for (const artifact of artifacts) {
     const [first, ...rest] = wrap(sanitize(handoffReferenceText(artifact)), room);
     rows.push(`${FINDING_INDENT}- ${first}`, ...rest.map((line) => `${FINDING_INDENT}  ${line}`));
   }
   return rows;
+}
+
+/**
+ * A saved prototype in full (ADR-0050): what it changes, the commit it applies
+ * to, the file to open, and every path it left out. The one-line artifact form
+ * stays in the compact surfaces; this block is for the attempt's log.
+ */
+function handoffPatchLines(block: HandoffBlock, cols: number): string[] {
+  const room = Math.max(1, cols - FINDING_INDENT.length);
+  return savedPatchViews(block.handoff).flatMap((patch) => [
+    ...wrap(`Patch: ${patch.changes}, ${patch.base}`, Math.max(1, cols - HANDOFF_INDENT.length))
+      .map((line, i) => `${HANDOFF_INDENT}${i === 0 ? style.grey(line) : line}`),
+    ...wrap(patch.saved, room).map((line) => `${FINDING_INDENT}${style.grey(line)}`),
+    ...patch.flags.flatMap((flag) => wrap(flag, room).map((line) => `${FINDING_INDENT}${style.grey(line)}`)),
+  ]);
 }
 
 /**
@@ -714,9 +710,15 @@ function handoffLines(block: HandoffBlock, cols: number, detailAll: boolean): st
   const { handoff } = block;
   const severity = worstSeverity(handoff.findings);
   const summary = handoff.findingCount > 0
-    ? `${countOf(handoff.findingCount, 'finding')}${severity ? ` · ${severityLabel(severity).toLowerCase()}` : ''}`
+    ? `${handoffFindingsText(handoff.findingCount)}${severity ? ` · ${severityLabel(severity).toLowerCase()}` : ''}`
     : null;
   const rows = [`${style.brand('◆')} ${style.bold('Handoff')}${summary ? style.grey(` · ${summary}`) : ''}`];
+  if (handoff.commit) {
+    const room = Math.max(1, cols - HANDOFF_INDENT.length);
+    const body = handoff.commit.body ? sanitize(handoff.commit.body).trim() : '';
+    rows.push(...wrap(`Commit: ${sanitize(handoff.commit.subject).trim()}`, room).map((line) => `${HANDOFF_INDENT}${style.bold(line)}`));
+    if (body) rows.push(...body.split('\n').flatMap((line) => wrap(line, room)).map((line) => `${HANDOFF_INDENT}${line}`));
+  }
   const said = sanitize(handoff.summary).trim();
   if (said) rows.push(...wrap(said, Math.max(1, cols - HANDOFF_INDENT.length)).map((line) => `${HANDOFF_INDENT}${line}`));
   if (handoff.findings.length > 0) {
@@ -725,13 +727,13 @@ function handoffLines(block: HandoffBlock, cols: number, detailAll: boolean): st
   const more = handoff.findingCount - handoff.findings.length;
   if (more > 0) rows.push(style.grey(`${HANDOFF_INDENT}+${more} more finding${more === 1 ? '' : 's'}, in the attempt's log`));
   rows.push(...handoffArtifactLines(block, cols));
+  rows.push(...handoffPatchLines(block, cols));
   if (handoff.report) rows.push(...handoffReportLines(handoff.report, cols, detailAll));
   return rows;
 }
 
 function planLine(block: PlanBlock, cols: number): string {
-  const count = block.taskCount === undefined ? '' : ` (${countOf(block.taskCount, 'task')})`;
-  const text = block.status === 'building' ? 'Building plan…' : `Plan ${block.status}${count}`;
+  const text = planMarkerParts(block).join(' · ');
   return `${style.brand('◇')}${truncate(`◇ ${text}`, cols).slice(1)}`;
 }
 
@@ -754,7 +756,7 @@ function blockLines(block: DisplayBlock, cols: number, detailAll: boolean): stri
     case 'command':
       return runnerCommandLines(block, cols, detailAll);
     case 'compaction':
-      return [compactionLine(block, cols)];
+      return compactionLines(block, cols, detailAll);
     case 'runner_loaded':
       return runnerLoadedLines(block, cols, detailAll);
     case 'handoff':
@@ -800,14 +802,16 @@ export function conversationLines(blocks: readonly DisplayBlock[], cols: number,
 }
 
 /**
- * The planner's usage as one row — `ctx 61k (6%) · $0.42` — or null when
- * neither the context nor a cost is known. Core words it, so every surface
+ * The planner's context, live limits and reported cost as one compact row.
+ * Nothing is drawn until one of them is known. Core words it, so every surface
  * agrees; the totals already count every subagent.
  */
-export function tokenLine(blocks: readonly DisplayBlock[], cols: number): string | null {
+export function tokenLine(blocks: readonly DisplayBlock[], cols: number, limits: readonly AccountLimitSnapshot[] = []): string | null {
   const usage = blocks[blocks.length - 1];
-  const text = usage?.type === 'usage' ? usageText(usage) : null;
-  return text ? style.grey(truncate(text, cols)) : null;
+  const context = usage?.type === 'usage' ? contextMeterText(usage.contextFill) : null;
+  const cost = usage?.type === 'usage' ? usageText({ totals: usage.totals }) : null;
+  const text = [context ? `Planner ${context}` : null, ...limits.map(accountLimitsText), cost].filter(Boolean).join(' · ');
+  return text ? style.grey(truncate(sanitize(text).replace(/\n/g, ' '), cols)) : null;
 }
 
 /** A flagged assignment and what it means for the task as it stands (core words it, so every surface agrees). */

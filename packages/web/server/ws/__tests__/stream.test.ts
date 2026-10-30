@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import type { AddressInfo } from 'net';
 import { mkdtempSync, mkdirSync, rmSync } from 'fs';
@@ -22,21 +22,65 @@ function savedPlan(): LegacyPlanState {
   };
 }
 
-/** The first `count` frames a new socket on the session receives. */
-function firstFrames(port: number, sessionId: string, count: number): Promise<unknown[]> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/${sessionId}`, [DAEMON_SUBPROTOCOL]);
-    const frames: unknown[] = [];
-    const timer = setTimeout(() => { socket.terminate(); reject(new Error(`got ${frames.length} of ${count} frames`)); }, 5000);
-    socket.on('message', (data) => {
-      frames.push(JSON.parse(data.toString()));
-      if (frames.length < count) return;
-      clearTimeout(timer);
-      socket.close();
-      resolve(frames);
-    });
-    socket.on('error', reject);
+interface JoinedSocket {
+  /** The first `count` frames it has received, resolving as soon as it has that many. */
+  until(count: number): Promise<unknown[]>;
+  close(): void;
+}
+
+interface FrameWaiter {
+  count: number;
+  timer?: NodeJS.Timeout;
+  resolve: (frames: unknown[]) => void;
+  reject: (error: Error) => void;
+}
+
+/**
+ * A socket newly joined to the session. `until` lets a test wait for the
+ * frames the server has actually sent instead of sleeping and hoping: the
+ * handler subscribes only after its snapshot, both in one turn, so once the
+ * snapshot arrives a later broadcast is certain to reach this socket.
+ */
+function joinSocket(port: number, sessionId: string): JoinedSocket {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/${sessionId}`, [DAEMON_SUBPROTOCOL]);
+  const frames: unknown[] = [];
+  const waiters = new Set<FrameWaiter>();
+  const settle = (error?: Error) => {
+    for (const waiter of [...waiters]) {
+      if (!error && frames.length < waiter.count) continue;
+      waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      if (error) waiter.reject(error);
+      else waiter.resolve(frames);
+    }
+  };
+  socket.on('message', (data) => {
+    frames.push(JSON.parse(data.toString()));
+    settle();
   });
+  socket.on('error', (error) => settle(error));
+  return {
+    until: (count) => new Promise<unknown[]>((resolve, reject) => {
+      const waiter: FrameWaiter = { count, resolve, reject };
+      waiter.timer = setTimeout(() => {
+        waiters.delete(waiter);
+        reject(new Error(`got ${frames.length} of ${count} frames`));
+      }, 5000);
+      waiters.add(waiter);
+      settle();
+    }),
+    close: () => socket.close(),
+  };
+}
+
+/** The first `count` frames a new socket on the session receives. */
+async function firstFrames(port: number, sessionId: string, count: number): Promise<unknown[]> {
+  const socket = joinSocket(port, sessionId);
+  try {
+    return await socket.until(count);
+  } finally {
+    socket.close();
+  }
 }
 
 describe('the session socket', () => {
@@ -48,7 +92,7 @@ describe('the session socket', () => {
   beforeEach(async () => {
     workspace = mkdtempSync(join(tmpdir(), 'ordewell-stream-'));
     mkdirSync(join(workspace, '.git'));
-    pool = new OrchestratorPool();
+    pool = new OrchestratorPool({ accountLimitCollectors: () => [] });
     server = http.createServer();
     const upgrade = createWsHandler(pool);
     server.on('upgrade', upgrade);
@@ -82,13 +126,63 @@ describe('the session socket', () => {
     await pool.session(meta.id).execute({ command: 'mark_complete', task: 't2' }, { kind: 'user' });
 
     const [, snapshot] = await firstFrames(port, meta.id, 2) as [unknown, RunSnapshotFrame];
-    const later = firstFrames(port, meta.id, 3);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const later = joinSocket(port, meta.id);
+    // Await its connected and snapshot frames, which is when it is subscribed:
+    // no broadcast of the command below can fall between the two.
+    await later.until(3);
+    const broadcast = later.until(4);
     await pool.session(meta.id).execute({ command: 'mark_not_done', task: 't2' }, { kind: 'user' });
-    const [, again, next] = await later as [unknown, RunSnapshotFrame, SessionFrame];
+    const [, again, , next] = await broadcast as [unknown, RunSnapshotFrame, unknown, SessionFrame];
+    later.close();
 
     expect(snapshot.seq).toBeGreaterThan(0);
     expect(again.seq).toBe(snapshot.seq);
     expect(next).toMatchObject({ stream: snapshot.stream, seq: snapshot.seq! + 1 });
+  });
+
+  // A compaction has no turn, so a surface that joins or reconnects while one
+  // runs would otherwise show a planner that is simply silent. The replay is
+  // the start as it was announced, the same message the live frame carried.
+  it('replays the planner compaction in flight to a client that joins during it, after the snapshot', async () => {
+    const meta = saveSession(savedPlan(), 'Rate limiting', workspace, 'session-saved');
+    pool.adoptSavedSession(meta.id, workspace);
+    const started = { type: 'planner_compaction', compaction: { phase: 'started', id: 'c1', origin: 'ordewell', trigger: 'manual', at: '2026-10-25T10:00:00.000Z' } } as const;
+    vi.spyOn(pool, 'plannerCompaction').mockReturnValue(started);
+
+    const frames = await firstFrames(port, meta.id, 4);
+
+    expect(frames.map((f) => (f as { type: string }).type)).toEqual(['connected', 'run_snapshot', 'planner_compaction', 'account_limits']);
+    expect(frames[2]).toEqual(started);
+  });
+
+  // The lifecycle rides the existing stream: both phases arrive numbered in
+  // order, carrying the id a surface folds them into one block by.
+  it('streams a compaction\'s start and end to a joined client in order, under one id', async () => {
+    const meta = saveSession(savedPlan(), 'Rate limiting', workspace, 'session-saved');
+    pool.adoptSavedSession(meta.id, workspace);
+    const socket = joinSocket(port, meta.id);
+    await socket.until(3);
+    const frames = socket.until(5);
+    const broadcast = (pool as unknown as { broadcast(id: string, m: unknown): void }).broadcast.bind(pool);
+    broadcast(meta.id, { type: 'planner_compaction', compaction: { phase: 'started', id: 'c1', origin: 'ordewell', trigger: 'auto', at: '2026-10-25T10:00:00.000Z' } });
+    broadcast(meta.id, { type: 'planner_compaction', compaction: { phase: 'ended', id: 'c1', origin: 'ordewell', trigger: 'auto', outcome: 'condensed', at: '2026-10-25T10:00:05.000Z' } });
+    const [, , , first, second] = await frames as [unknown, unknown, unknown, SessionFrame, SessionFrame];
+    socket.close();
+
+    expect([first, second].map((f) => f.type === 'planner_compaction' && [f.compaction.phase, f.compaction.id])).toEqual([['started', 'c1'], ['ended', 'c1']]);
+    expect(second.seq).toBe(first.seq! + 1);
+  });
+
+  it('sends no compaction frame when none is running', async () => {
+    const meta = saveSession(savedPlan(), 'Rate limiting', workspace, 'session-saved');
+    pool.adoptSavedSession(meta.id, workspace);
+    const socket = joinSocket(port, meta.id);
+    await socket.until(3);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const frames = await socket.until(3);
+    socket.close();
+
+    expect(frames).toHaveLength(3);
+    expect(frames[2]).toMatchObject({ type: 'account_limits', limits: [] });
   });
 });

@@ -52,9 +52,9 @@ describe('OrdewellMcpServer', () => {
     const planner = await connect(await server.issuePlannerToken({ sessionId: 's1' }));
 
     const names = async (client: Client) => (await client.listTools()).tools.map((t) => t.name).sort();
-    expect(await names(task)).toEqual(['checkpoint', 'read_task', 'task_complete']);
+    expect(await names(task)).toEqual(['apply_patch', 'checkpoint', 'read_task', 'task_complete']);
     expect(await names(planner)).toEqual([
-      'answer_approval', 'edit_plan', 'fetch', 'list_models', 'list_runners', 'load_skill', 'merge_all', 'message_task', 'retry_task', 'run_command',
+      'answer_approval', 'answer_checkpoint', 'edit_plan', 'fetch', 'list_models', 'list_runners', 'load_skill', 'merge_all', 'message_task', 'retry_task', 'run_command',
       'run_plan', 'run_script', 'run_task', 'skip_task', 'stop_run', 'stop_task', 'submit_plan', 'task_diff', 'task_output', 'task_query', 'web_search',
     ]);
   });
@@ -72,14 +72,56 @@ describe('OrdewellMcpServer', () => {
     expect(writer.readOnly).toBeUndefined();
     expect(mcpClientConfig(writer).readOnly).toBeUndefined();
     const tools = (await readOnly.listTools()).tools;
-    expect(tools.map((t) => t.name).sort()).toEqual(['checkpoint', 'read_task', 'run_command', 'task_complete']);
+    expect(tools.map((t) => t.name).sort()).toEqual(['checkpoint', 'fetch', 'read_task', 'run_command', 'save_patch', 'task_complete', 'web_search']);
     // The hint names what lands, even when a command changes its disposable worktree.
     expect(tools.find((t) => t.name === 'run_command')?.annotations?.readOnlyHint).toBe(true);
-    expect((await change.listTools()).tools.map((t) => t.name).sort()).toEqual(['checkpoint', 'read_task', 'task_complete']);
+    expect((await change.listTools()).tools.map((t) => t.name).sort()).toEqual(['apply_patch', 'checkpoint', 'read_task', 'task_complete']);
 
     expect(await readOnly.callTool({ name: 'run_command', arguments: { command: 'npm test' } })).toMatchObject({ content: [{ type: 'text', text: 'ran npm test' }], isError: false });
     await expect(change.callTool({ name: 'run_command', arguments: { command: 'npm test' } })).rejects.toThrow(/'run_command' is disabled on this token: read-only tasks only/);
     expect(runCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers save_patch to a read-only task's token alone, and routes its call to that attempt with the call's signal (ADR-0050)", async () => {
+    const server = newServer();
+    const savePatch = vi.fn(async (_args: Record<string, never>, context: McpToolContext): Promise<McpToolReply> => ({ text: `saved, signal ${context.signal.aborted ? 'aborted' : 'live'}` }));
+    const readOnly = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1, readOnly: true }, { savePatch }));
+    const change = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't2', attempt: 1 }, { savePatch }));
+
+    const offered = (await readOnly.listTools()).tools.find((t) => t.name === 'save_patch');
+    expect(offered?.annotations?.readOnlyHint).toBe(true);
+    expect(offered?.inputSchema).toMatchObject({ type: 'object', properties: {} });
+    expect((await change.listTools()).tools.map((t) => t.name)).not.toContain('save_patch');
+
+    expect(await readOnly.callTool({ name: 'save_patch', arguments: {} })).toMatchObject({ content: [{ type: 'text', text: 'saved, signal live' }], isError: false });
+    await expect(change.callTool({ name: 'save_patch', arguments: {} })).rejects.toThrow(/disabled on this token/);
+    expect(savePatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers save_patch as not available where the attempt has no handler for it', async () => {
+    const server = newServer();
+    const readOnly = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1, readOnly: true }, {}));
+    expect(await readOnly.callTool({ name: 'save_patch', arguments: {} })).toMatchObject({ content: [{ type: 'text', text: 'Invocation error: save_patch is not available in this session — no handler is wired, so the call ran nothing.' }], isError: true });
+  });
+
+  it("offers apply_patch to a change task's token alone, and routes its call to that attempt (ADR-0050)", async () => {
+    const server = newServer();
+    const applyPatch = vi.fn(async (args: { task: string | number; attempt?: number }, _context: McpToolContext): Promise<McpToolReply> => ({ text: `applied ${args.task} attempt ${args.attempt ?? 'latest'}` }));
+    const change = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 }, { applyPatch }));
+    const readOnly = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't2', attempt: 1, readOnly: true }, { applyPatch }));
+
+    expect((await change.listTools()).tools.find((t) => t.name === 'apply_patch')?.inputSchema).toMatchObject({ type: 'object', required: ['task'] });
+    expect((await readOnly.listTools()).tools.map((t) => t.name)).not.toContain('apply_patch');
+
+    expect(await change.callTool({ name: 'apply_patch', arguments: { task: '#2', attempt: 2 } })).toMatchObject({ content: [{ type: 'text', text: 'applied #2 attempt 2' }], isError: false });
+    await expect(readOnly.callTool({ name: 'apply_patch', arguments: { task: '#2' } })).rejects.toThrow(/disabled on this token/);
+    expect(applyPatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers apply_patch as not available where the attempt has no handler for it', async () => {
+    const server = newServer();
+    const change = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 }, {}));
+    expect(await change.callTool({ name: 'apply_patch', arguments: { task: '#1' } })).toMatchObject({ content: [{ type: 'text', text: 'Invocation error: apply_patch is not available in this session — no handler is wired, so the call ran nothing.' }], isError: true });
   });
 
   // Claude Code in plan mode refuses any MCP tool not marked read-only, even
@@ -91,10 +133,10 @@ describe('OrdewellMcpServer', () => {
     const planner = await connect(await server.issuePlannerToken({ sessionId: 's1' }));
 
     const hints = Object.fromEntries((await planner.listTools()).tools.map((t) => [t.name, t.annotations?.readOnlyHint]));
-    const executing = ['run_plan', 'run_task', 'stop_task', 'stop_run', 'retry_task', 'skip_task', 'message_task', 'answer_approval', 'merge_all', 'run_script'];
+    const executing = ['run_plan', 'run_task', 'stop_task', 'stop_run', 'retry_task', 'skip_task', 'message_task', 'answer_approval', 'answer_checkpoint', 'merge_all', 'run_script'];
     for (const [name, hint] of Object.entries(hints)) expect(hint, name).toBe(!executing.includes(name));
-    expect(Object.keys(hints)).toHaveLength(21);
-    expect((await task.listTools()).tools.map((t) => [t.name, t.annotations?.readOnlyHint])).toEqual([['task_complete', undefined], ['checkpoint', undefined], ['read_task', true]]);
+    expect(Object.keys(hints)).toHaveLength(22);
+    expect((await task.listTools()).tools.map((t) => [t.name, t.annotations?.readOnlyHint])).toEqual([['task_complete', undefined], ['checkpoint', undefined], ['read_task', true], ['apply_patch', undefined]]);
   });
 
   it('answers an unknown or revoked token with 401, and the SDK client cannot connect with it', async () => {
@@ -108,6 +150,32 @@ describe('OrdewellMcpServer', () => {
     expect((await rawRequest(credential, {})).status).toBe(200);
     server.revoke(credential.token);
     expect((await rawRequest(credential, {})).status).toBe(401);
+  });
+
+  it('tells an unknown token, a revoked token and a wrong path apart in its refusal count, never printing the token', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const server = newServer();
+      const revoked = await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 });
+      const unknown = { url: revoked.url, token: 'not-a-token' };
+      const live = await server.issueTaskToken({ sessionId: 's1', taskId: 't2', attempt: 1 });
+
+      expect((await rawRequest(unknown, {})).status).toBe(401);
+      server.revoke(revoked.token);
+      expect((await rawRequest(revoked, {})).status).toBe(401);
+      expect((await rawRequest({ url: live.url.replace(/\/mcp$/, '/other'), token: live.token }, {})).status).toBe(404);
+
+      expect(server.refusals()).toEqual({ unknownToken: 1, revokedToken: 1, wrongPath: 1 });
+      const said = warn.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(said).toContain('unknown token');
+      expect(said).toContain('revoked token');
+      expect(said).toContain('wrong path');
+      expect(said).not.toContain(revoked.token);
+      expect(said).not.toContain(live.token);
+      expect(said).not.toContain(unknown.token);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('refuses a call to a tool outside the token\'s role', async () => {
@@ -128,7 +196,7 @@ describe('OrdewellMcpServer', () => {
     const planner = await connect(await server.issuePlannerToken({ sessionId: 's1', hidden: ['fetch', 'web_search'] }, { fetch }));
 
     expect((await planner.listTools()).tools.map((t) => t.name).sort()).toEqual([
-      'answer_approval', 'edit_plan', 'list_models', 'list_runners', 'load_skill', 'merge_all', 'message_task', 'retry_task', 'run_command',
+      'answer_approval', 'answer_checkpoint', 'edit_plan', 'list_models', 'list_runners', 'load_skill', 'merge_all', 'message_task', 'retry_task', 'run_command',
       'run_plan', 'run_script', 'run_task', 'skip_task', 'stop_run', 'stop_task', 'submit_plan', 'task_diff', 'task_output', 'task_query',
     ]);
     await expect(planner.callTool({ name: 'fetch', arguments: { url: 'https://example.com' } })).rejects.toThrow(/'fetch' is disabled on this token: your runner carries its own/);
@@ -244,6 +312,30 @@ describe('OrdewellMcpServer', () => {
     server.revoke(credential.token);
 
     expect((await call).content).toEqual([{ type: 'text', text: 'The attempt ended before the checkpoint was answered.' }]);
+  });
+
+  // Stateless: the cancellation is a request of its own, which reaches the call only through its token.
+  it('aborts a call its caller cancels, and no call of another token', async () => {
+    const server = newServer();
+    const aborted: string[] = [];
+    const entered: string[] = [];
+    const fetch = async ({ url }: { url: string }, { signal }: McpToolContext): Promise<McpToolReply> => {
+      entered.push(url);
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
+      aborted.push(url);
+      return { text: 'cancelled', isError: true };
+    };
+    const mine = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1, readOnly: true }, { fetch }));
+    const other = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't2', attempt: 1, readOnly: true }, { fetch }));
+
+    const cancel = new AbortController();
+    const call = mine.callTool({ name: 'fetch', arguments: { url: 'https://a.example/' } }, undefined, { signal: cancel.signal });
+    void other.callTool({ name: 'fetch', arguments: { url: 'https://b.example/' } }).catch(() => undefined);
+    await vi.waitFor(() => expect(entered).toHaveLength(2));
+    cancel.abort();
+
+    await expect(call).rejects.toThrow();
+    await vi.waitFor(() => expect(aborted).toEqual(['https://a.example/']));
   });
 
   // Claude Code aborts an HTTP tool call that goes silent for its idle timeout;

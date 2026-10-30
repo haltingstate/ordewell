@@ -1,5 +1,5 @@
 import type { Task, Verdict, VerificationCheck } from '../models/Task';
-import type { IRunnerSession, ScriptExit, ScriptStatus } from '../interfaces/IRunner';
+import type { IRunnerSession, ScriptExit, ScriptFullOutput, ScriptStatus } from '../interfaces/IRunner';
 import type { CheckpointAnswer, TaskCompleteArgs } from './mcp/tools';
 
 export type VerdictListener = (taskId: string, verdict: Verdict) => void;
@@ -137,6 +137,19 @@ export class VerdictEngine {
   }
 
   /**
+   * An attempt's runner is being started, with no session to watch yet. Its
+   * silence counts from here, so one whose start never resolves — stuck
+   * launching, or waiting for its tools to attach — is flagged quiet as well.
+   * {@link watch} starts the count again once the runner is up.
+   */
+  starting(taskId: string): void {
+    const gen = this.bumpGeneration(taskId);
+    this.idlePaused.delete(taskId);
+    this.openApprovals.delete(taskId);
+    this.touchIdle(taskId, gen);
+  }
+
+  /**
    * Attach to a spawned session. The runner's `task_complete` call on the
    * attempt's token is the only completion evidence (ADR-0022, V2); a session
    * that exits before one gets a failed verdict. A script task's session has
@@ -146,6 +159,14 @@ export class VerdictEngine {
    */
   watch(task: Task, session: IRunnerSession): number {
     const gen = this.bumpGeneration(task.id);
+    // Silence counts from the start, not from the first output: a runner that
+    // never prints went unflagged however long it stayed quiet (#117). Armed
+    // before any listener, so an exit or verdict a session replays on attach
+    // clears it rather than leaving it to fire. What an earlier attempt waited
+    // on is not this one's to wait on.
+    this.idlePaused.delete(task.id);
+    this.openApprovals.delete(task.id);
+    this.touchIdle(task.id, gen);
     session.onOutput(() => {
       if (this.generations.get(task.id) === gen) this.touchIdle(task.id, gen);
     });
@@ -375,9 +396,17 @@ function statusText(status: ScriptStatus): string {
   return `exited with code ${status.code ?? 'unknown'}`;
 }
 
-function withTail(reason: string, errorTail: string): string {
+/**
+ * The tail is all a verdict quotes, and a long command's failure is often
+ * above it, so a reason points at the file that holds the whole output.
+ */
+function withTail(reason: string, errorTail: string, fullOutput?: ScriptFullOutput): string {
   const tail = errorTail.trim();
-  return tail ? `${reason}\n\nThe end of its error output:\n${tail}` : reason;
+  const quoted = tail ? `${reason}\n\nThe end of its error output:\n${tail}` : reason;
+  if (!fullOutput) return quoted;
+  // No full stop after a path: it would be copied with it.
+  const cut = fullOutput.droppedChars > 0 ? `, except its last ${fullOutput.droppedChars} characters, which were not saved.` : '';
+  return `${quoted}\n\nAll of its output is in ${fullOutput.file}${cut}`;
 }
 
 /**
@@ -397,15 +426,15 @@ function scriptVerdict(exit: ScriptExit): Verdict {
       const said = `${command ?? 'it'} ${statusText(exit.status)}`;
       // A step that never started found nothing about the work (ADR-0045 L2).
       const reported = exit.status.error !== undefined ? 'blocked' : 'failed';
-      return { outcome: 'fail', reason: withTail(`The script failed: ${said}.`, exit.errorTail), checks: check(false, said), decidedAt, reported };
+      return { outcome: 'fail', reason: withTail(`The script failed: ${said}.`, exit.errorTail, exit.fullOutput), checks: check(false, said), decidedAt, reported };
     }
     case 'timed-out': {
       const said = `the time limit of ${durationText(exit.timeoutMs)} ran out${command ? ` while ${command} ran` : ''}, so it was ended`;
-      return { outcome: 'fail', reason: withTail(`The script failed: ${said}.`, exit.errorTail), checks: check(false, said), decidedAt, reported: 'failed' };
+      return { outcome: 'fail', reason: withTail(`The script failed: ${said}.`, exit.errorTail, exit.fullOutput), checks: check(false, said), decidedAt, reported: 'failed' };
     }
     case 'stopped': {
       const said = `it was stopped${command ? ` while ${command} ran` : ''}`;
-      return { outcome: 'fail', reason: `The script did not finish: ${said}.`, checks: check(false, said), decidedAt };
+      return { outcome: 'fail', reason: withTail(`The script did not finish: ${said}.`, '', exit.fullOutput), checks: check(false, said), decidedAt };
     }
   }
 }

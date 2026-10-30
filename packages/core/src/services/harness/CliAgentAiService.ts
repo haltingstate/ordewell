@@ -1,4 +1,4 @@
-import { spawnAttached } from './ordewellBinding';
+import { McpAttachError, McpAttachTimeout, spawnAttached } from './ordewellBinding';
 import { spawn as nodeSpawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -23,14 +23,19 @@ import {
   NATIVE_SHELL_GUIDE,
 } from '../PlanPrompts';
 import { repairLoop, resubmitPlanPrompt } from '../PlanRepair';
-import { validatePlanTasks } from '../PlanValidator';
-import { checkPlanSkills, type SkillLookup } from '../taskSkills';
+import { PlanChangeCheck, planChangeErrorText, requestScope } from '../PlanChangeCheck';
+import type { SkillLookup } from '../taskSkills';
 import { PLANNER_TURN_ENDED } from '../plannerTools';
 import { settleReply, type ReplyAttempt } from '../settleReply';
 import { ReplySplitter } from '../replyStream';
 import { redactSecrets } from '../../utils/redactSecrets';
 import { abortScope } from '../../utils/abortScope';
-import { runnerForProvider } from '../ProviderRegistry';
+import { providerForRunner, runnerForProvider } from '../ProviderRegistry';
+import { recordRunnerAuth, signedOutFromFailure } from '../runnerAuth';
+import { describePlannerNotReady, TERMINAL_UI_COMMANDS, type PlannerNotReady } from '../plannerReadiness';
+import { workspaceEnvOf } from '../workspaceEnv';
+import { augmentedPath, withPath } from '../../utils/shellPath';
+import { BUILTIN_MANIFESTS } from '../../plugins/builtin';
 import { collectResearchContext } from '../ContextCollector';
 import { sensitiveEnvValues } from '../outboundSecrets';
 import type { AgentAdapter, AgentEvent, AgentProcessDeps, PlannerStartOptions, UsageLimitSignal } from './AgentAdapter';
@@ -199,8 +204,8 @@ class PlannerSession {
  * which is precisely the part a coding agent replaces. What it reuses instead
  * is everything above the transport — `settleReply` (the empty-reply nudge
  * and the turn's settling), the plan validator, the `ResearchProgress` events the
- * four surfaces already render. That is why this backend reaches VS Code, the
- * web UI, the CLI and the TUI without any of them learning a coding agent is
+ * three surfaces already render. That is why this backend reaches VS Code, the
+ * CLI and the TUI without any of them learning a coding agent is
  * on the other end.
  */
 export class CliAgentAiService implements IAiService {
@@ -216,6 +221,8 @@ export class CliAgentAiService implements IAiService {
   private readonly turnBudgets: TurnBudgets | undefined;
   private readonly projectServerApprovals: ProjectServerApprovals;
   private activeAbort: AbortController | null = null;
+  /** See {@link compactions}. */
+  private compacted = 0;
 
   constructor(private config: IConfig, deps: CliAgentAiServiceDeps = {}) {
     const runner = runnerForProvider(config.aiProvider);
@@ -265,6 +272,9 @@ export class CliAgentAiService implements IAiService {
   /** The agent's own session id, a resumption hint only — Ordewell's transcript is authoritative (T4). */
   nativeSessionId(): string | null { return this.session?.adapter?.nativeSessionId() ?? null; }
 
+  /** The compactions the agents reported of their own context, never a subagent's or another thread's: their adapters drop those (ADR-0012 T10). */
+  compactions(): number { return this.compacted; }
+
   heldSecrets(): readonly string[] { return this.environmentSecrets; }
 
   restart(): void {
@@ -301,7 +311,7 @@ export class CliAgentAiService implements IAiService {
       req.modelsByRunner,
       req.runners,
       req.runnerModes,
-      { harness: true, isolatedExecution: req.isolatedExecution, skills: req.skills, execution: req.plannerTools !== undefined, autorun: req.autorun },
+      { harness: true, runner: this.runner, isolatedExecution: req.isolatedExecution, skills: req.skills, execution: req.plannerTools !== undefined, autorun: req.autorun },
     );
 
     const fetcher = req.fetcher;
@@ -409,7 +419,7 @@ export class CliAgentAiService implements IAiService {
     try {
       // No `classify`: this planner plans only through Ordewell's tools
       // (ADR-0025), so its reply is prose whatever JSON it shows, and a plan
-      // or edit lands only from a submission the conversation accepted.
+      // or edit lands only from a tool call the conversation committed.
       const turn = await settleReply({
         // The turn's own input carries the budgets, not the system prompt, which stays cacheable.
         message: withTurnBudgets(this.turnBudgets, message),
@@ -579,6 +589,23 @@ export class CliAgentAiService implements IAiService {
           backgroundAgents++;
           return;
 
+        // Adapters drop a subagent's or another thread's, so this is the
+        // planner's own. Native compaction reports only that it is done, and
+        // its sizes when it gives them: nothing here invents a start (ADR-0017).
+        case 'compaction': {
+          this.compacted++;
+          const { trigger, preTokens, postTokens } = event;
+          onProgress({
+            type: 'compaction',
+            compaction: {
+              phase: 'ended', id: uuidv4(), origin: 'native', trigger, outcome: 'condensed', at: new Date().toISOString(),
+              ...(preTokens !== undefined ? { preTokens } : {}),
+              ...(postTokens !== undefined ? { postTokens } : {}),
+            },
+          });
+          return;
+        }
+
         case 'permission_request': {
           // Announced so the user can see the planner reached for something it
           // may not have — a silently swallowed denial reads as the agent losing interest.
@@ -649,10 +676,46 @@ export class CliAgentAiService implements IAiService {
     if (error || signal?.aborted) session.stop();
 
     if (error) {
-      const failure = reply.fail(error);
+      const failure = await this.explainSignedOut(reply.fail(error));
       return { text: reply.text, runs: reply.runs(), researchLog: settledLog(), error: failure, usageLimit, aborted: signal?.aborted, backgroundAgents };
     }
     return { text: reply.text, runs: reply.runs(), researchLog: settledLog(), error, aborted: signal?.aborted, backgroundAgents };
+  }
+
+  /**
+   * A turn that failed because the runner's own account is signed out is
+   * recorded for the synchronous planner gate, and the failure opens with the
+   * same two ways back in the gate would give (ADR-0009). Only a phrase the
+   * runner's manifest declares; any other failure is returned untouched.
+   *
+   * Judged with the workspace's own environment, the same merged env the
+   * probe and the planner spawn use (ADR-0016): a custom provider's
+   * `CODEX_HOME`/`HOME` lives there, so the reader that knows the runner's
+   * "Not logged in" line is not this user's answer sees it.
+   */
+  private async explainSignedOut(failure: string): Promise<string> {
+    const manifest = BUILTIN_MANIFESTS.find((candidate) => candidate.name === this.runner);
+    if (!manifest) return failure;
+    let env: NodeJS.ProcessEnv;
+    try {
+      const workspace = await (this.processDeps.workspaceEnv ?? workspaceEnvOf)(this.workspaceRoot());
+      env = withPath(process.env, await augmentedPath(), workspace);
+    } catch {
+      // The runner's config could not be read; its words stand as they are.
+      return failure;
+    }
+    const auth = signedOutFromFailure(manifest, failure, env);
+    if (!auth) return failure;
+    recordRunnerAuth(this.runner, auth, this.workspaceRoot());
+    const reason: PlannerNotReady = {
+      code: 'signed_out',
+      provider: providerForRunner(this.runner) ?? this.config.aiProvider,
+      label: manifest.displayName,
+      runner: this.runner,
+      loginCommand: auth.loginCommand,
+    };
+    const guidance = describePlannerNotReady(reason, TERMINAL_UI_COMMANDS);
+    return failure.startsWith(guidance) ? failure : `${guidance}\n\n${failure}`;
   }
 
   // --- Process lifecycle ---
@@ -674,12 +737,23 @@ export class CliAgentAiService implements IAiService {
       nativeShell,
       systemPrompt: nativeShell ? `${opts.systemPrompt}\n\n${NATIVE_SHELL_GUIDE}` : opts.systemPrompt,
     };
+    // A planner that exits before it answers the attach check refused what it was started with, so its words are the failure and no respawn repeats it.
+    let startupExit: string | null = null;
+    let starting: AgentAdapter | null = null;
     const spawned = await spawnAttached({
       runner: this.runner,
       create: () => this.newAdapter(),
       issueToken: () => server.issuePlannerToken({ sessionId: tools.sessionId, hidden: connectorFor(this.runner)?.ordewellTools.plannerHidden(start) }, tools.handler),
       revoke: (token) => server.revoke(token),
-      start: (adapter, credential) => adapter.start({ ...start, mcp: mcpClientConfig(credential) }),
+      start: async (adapter, credential) => {
+        starting = adapter;
+        startupExit = null;
+        await adapter.start({ ...start, mcp: mcpClientConfig(credential) });
+        adapter.onProcessExit?.((code, lastWords) => {
+          if (adapter === starting) startupExit ??= lastWords ?? `${this.runner} exited with code ${code}`;
+        });
+      },
+      startupExit: () => startupExit,
       cancelled: session.discarded,
       failed: (first, second) => `Could not start the ${this.runner} planner with Ordewell's tools. First spawn: ${first}. Respawn: ${second}.`,
     });
@@ -759,10 +833,22 @@ export class CliAgentAiService implements IAiService {
    * `thread/resume`'s `config.web_search` either way (checked live). The
    * native-shell setting is the same kind of spawn-time decision (ADR-0036
    * N1), so a change reopens the process too.
+   *
+   * Also restarted when it no longer reaches Ordewell's tools (ADR-0025). The
+   * attach check was the spawn's, but the link is the process's for its whole
+   * life: an idle rebuild, a revoked token or an MCP client that gave up can
+   * leave a live process planning without `edit_plan`, `list_runners` or any
+   * other tool, and nothing else looks again. A lost link is taken back and
+   * respawned with a fresh token, resuming the conversation, so the turn is
+   * never sent to tools that are gone.
    */
   private async ensureAdapter(session: PlannerSession): Promise<AgentAdapter> {
     const live = session.adapter;
-    if (live && !live.exited && session.nativeSearch === this.nativeSearch(session) && session.nativeShell === this.nativeShellOffered(session)) return live;
+    if (live && !live.exited && session.nativeSearch === this.nativeSearch(session) && session.nativeShell === this.nativeShellOffered(session)) {
+      // A Stop during the check takes the process back; it must not be handed
+      // to the turn it was stopped for.
+      if (await this.stillAttached(live) && session.adapter === live && !live.exited) return live;
+    }
     session.stop();
     const start = session.start;
     if (!start) throw new Error('No active planner conversation.');
@@ -778,6 +864,11 @@ export class CliAgentAiService implements IAiService {
       }
       return adapter;
     } catch (err) {
+      // A failed attach is not a failed resume: the runner refused Ordewell's
+      // server, and its own two-attempt message is the one to show. The
+      // conversation stays, so the next message tries a fresh process rather
+      // than replaying the whole transcript over a server that may be back.
+      if (err instanceof McpAttachError || err instanceof McpAttachTimeout) throw err;
       if (!resumeSessionId || session.discarded.aborted) throw err;
       // Kept, the conversation would ask for the same refused session on
       // every message. Dropped, the next one replays the transcript into a
@@ -785,6 +876,22 @@ export class CliAgentAiService implements IAiService {
       if (this.session === session) this.session = null;
       session.discard();
       throw new Error(`The ${this.runner} planner's session could not be resumed (${err instanceof Error ? err.message : String(err)}). Send your message again: the planner picks the conversation up from its transcript.`);
+    }
+  }
+
+  /**
+   * Whether a live planner still offers Ordewell's tools, as its runner
+   * reports it (ADR-0022, S4). A report that could not be read counts as lost:
+   * a respawn is cheap next to a turn planned against tools that are gone.
+   * Absent only on an adapter the spawn path already refused.
+   */
+  private async stillAttached(adapter: AgentAdapter): Promise<boolean> {
+    if (!adapter.mcpAttached) return true;
+    try {
+      const report = await adapter.mcpAttached();
+      return report === true || report === 'connected';
+    } catch {
+      return false;
     }
   }
 
@@ -858,18 +965,15 @@ export class CliAgentAiService implements IAiService {
         listRunners: async () => ({ text: JSON.stringify({ runners: catalog.runners.map((id) => ({ id, readOnly: readOnlyMode(catalog.runnerModes?.[id]) !== undefined })) }) }),
         listModels: async ({ runner }) => ({ text: JSON.stringify({ runner, models: catalog.modelsByRunner?.[runner] ?? [] }) }),
         submitPlan: async ({ tasks }) => {
-          const result = validatePlanTasks({ tasks }, catalog.runners, catalog.runnerModes, catalog.autonomousDefault);
-          if (!result.ok) return refuse(result.errors.map((error) => error.message));
-          const skills = catalog.taskSkills ? await checkPlanSkills(result.tasks, catalog.taskSkills) : undefined;
+          const checked = await new PlanChangeCheck(requestScope(catalog)).check({ kind: 'plan', tasks }, 'submit');
           if (ended || signal?.aborted) return { text: PLANNER_TURN_ENDED, isError: true };
-          if (skills && skills.errors.length > 0) return refuse(skills.errors.map((error) => error.message));
-          submitted = result.tasks;
+          if (!checked.ok) return refuse(checked.errors.map(planChangeErrorText));
+          submitted = checked.tasks;
           refused = [];
-          const warnings = [...(result.warnings ?? []), ...(skills?.warnings ?? [])];
           return {
             text: JSON.stringify({
               ok: true,
-              ...(warnings.length > 0 ? { warnings } : {}),
+              ...(checked.warnings.length > 0 ? { warnings: checked.warnings } : {}),
               next: 'Plan recorded. End your turn now.',
             }),
           };

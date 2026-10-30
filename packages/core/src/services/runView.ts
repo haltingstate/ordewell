@@ -1,9 +1,9 @@
-import { serializeTask, type RunInput, type RunMergeView, type RunTask, type RunTaskStatus, type RunView, type SerializedTask, type SerializedTaskStatus, type SurfacePlan, type SurfacePlanState, type SurfaceTask } from './SessionMessage';
+import { IDLE_ACTIVITY, serializeTask, type RunInput, type RunMergeView, type RunTask, type RunTaskStatus, type RunView, type SerializedTask, type SerializedTaskStatus, type SurfacePlan, type SurfacePlanState, type SurfaceTask } from './SessionMessage';
 import type { IsolationHandoff } from '../interfaces/IWorktreeIsolation';
 import { rejoinPlanTree } from '../models/Task';
 import { walkPlan } from './PlanTree';
 
-export const EMPTY_RUN: RunView = { tasks: [], runMerge: null, handoff: null, mergeResult: null };
+export const EMPTY_RUN: RunView = { tasks: [], runMerge: null, handoff: null, mergeResult: null, activity: IDLE_ACTIVITY };
 
 type PlanFields = Omit<RunTask, keyof RunTaskStatus>;
 
@@ -12,8 +12,8 @@ type PlanFields = Omit<RunTask, keyof RunTaskStatus>;
  * no plan carries, so only a status update changes it and a plan refresh
  * keeps it. Everything else is the plan's.
  */
-function split({ verdict, idleSince, isolation, checkpoint, queued, continuable, awaitingApproval, mergeGate, forcedPastGate, waitsForApproval, holdReason, handoff, ...plan }: RunTask): { plan: PlanFields; status: RunTaskStatus } {
-  return { plan, status: { verdict, idleSince, isolation, checkpoint, queued, continuable, awaitingApproval, mergeGate, forcedPastGate, waitsForApproval, holdReason, handoff } };
+function split({ verdict, idleSince, completionReceived, attaching, isolation, checkpoint, queued, continuable, awaitingApproval, mergeGate, forcedPastGate, waitsForApproval, holdReason, handoff, attempted, ...plan }: RunTask): { plan: PlanFields; status: RunTaskStatus } {
+  return { plan, status: { verdict, idleSince, completionReceived, attaching, isolation, checkpoint, queued, continuable, awaitingApproval, mergeGate, forcedPastGate, waitsForApproval, holdReason, handoff, attempted } };
 }
 
 /**
@@ -129,14 +129,13 @@ export function reduceRun(view: RunView, input: RunInput): RunView {
         runMerge: input.runMerge ?? null,
         handoff: stillToMerge(view.handoff, input.runMerge),
         usage: input.usage,
+        ...(input.activity ? { activity: input.activity } : {}),
       };
     case 'task_started':
     case 'task_updated': {
       const tasks = changeTask(view.tasks, input.taskId, (task) => (input.type === 'task_started' ? startTask(task) : patchTask(task, input.changes)));
       return tasks === view.tasks ? view : { ...view, tasks };
     }
-    case 'plan_edit_held':
-      return { ...view, heldEdit: input.held ?? undefined };
     case 'isolation_handoff':
       return { ...view, handoff: handoffOf(input) };
     case 'isolation_merge':
@@ -166,6 +165,7 @@ export function reduceRun(view: RunView, input: RunInput): RunView {
     case 'planner_text_retracted':
     case 'planner_usage':
     case 'planner_liveness':
+    case 'planner_compaction':
     case 'subagent_started':
     case 'subagent_finished':
     case 'research_step':

@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   parseSlash, SLASH_COMMANDS, findCommand, completions, registerSkillCommands,
   slashTokens, activeToken, skillMatchKind, tokenCompletions,
+  slashCommandTable, canonicalCommandName, composerCompletions, parseRunnerCommand,
 } from '../slash';
 
 describe('parseSlash', () => {
@@ -25,7 +26,7 @@ describe('SLASH_COMMANDS', () => {
   // Feature-parity contract with the VS Code extension (issue #24). Every
   // capability the webview exposes must be reachable from the TUI.
   const REQUIRED = [
-    'help', 'planner', 'key', 'allowlist', 'refresh',
+    'help', 'planner', 'key', 'allowlist', 'refresh', 'login',
     'sessions', 'new', 'save', 'load', 'delete',
     'runners', 'settings',
     // No 'plan': typing the goal starts planning, so an alias would only
@@ -65,7 +66,9 @@ describe('SLASH_COMMANDS', () => {
 
 describe('completions', () => {
   it('lists every command for a bare slash', () => {
-    expect(completions('/')).toHaveLength(SLASH_COMMANDS.length);
+    // The built-in table plus its aliases: /resume is offered too, right after
+    // /sessions, so a synonym is discoverable where its target is.
+    expect(completions('/')).toHaveLength(slashCommandTable().length);
   });
 
   it('filters by prefix', () => {
@@ -232,5 +235,59 @@ describe('/mouse', () => {
     const description = findCommand('mouse')!.description;
     expect(description).toMatch(/pane/i);
     expect(description).toMatch(/select/i);
+  });
+
+  // Selection is per-pane only where the panes share rows. The composer is
+  // chrome across the frame, and the sheet has to say so, or a user who drags
+  // it and gets the whole line reads the old label as a promise it broke.
+  it('says the composer is selected whole rather than per pane', () => {
+    const description = findCommand('mouse')!.description;
+    expect(description).toMatch(/body/i);
+    expect(description).toMatch(/composer/i);
+    expect(description).toMatch(/on/);
+    expect(description).toMatch(/off/);
+  });
+});
+
+
+describe('command aliases', () => {
+  afterEach(() => registerSkillCommands([]));
+
+  it('resolves /resume to the canonical /sessions command', () => {
+    expect(canonicalCommandName('resume')).toBe('sessions');
+    expect(canonicalCommandName('/resume')).toBe('sessions');
+    expect(canonicalCommandName('sessions')).toBe('sessions');
+  });
+
+  it('offers /resume in completion, right after /sessions', () => {
+    expect(completions('/res').map((c) => c.name)).toContain('resume');
+    const table = slashCommandTable().map((c) => c.name);
+    expect(table.indexOf('resume')).toBe(table.indexOf('sessions') + 1);
+  });
+
+  it('renders /resume as an alias of /sessions that opens a saved session', () => {
+    const alias = slashCommandTable().find((c) => c.name === 'resume');
+    expect(alias?.usage).toBe('/resume');
+    expect(alias?.description).toMatch(/alias for \/sessions/i);
+    expect(alias?.description).toMatch(/saved session/i);
+  });
+
+  it('a skill named resume may not shadow the built-in alias', () => {
+    registerSkillCommands([{ name: 'resume', description: 'A skill pretending to be resume' }]);
+    expect(findCommand('resume')?.source).toBeUndefined();
+    expect(completions('/resume').filter((c) => c.name === 'resume')).toHaveLength(1);
+  });
+});
+
+describe('task-chat boundary', () => {
+  it("a task chat's /resume stays the runner's own command, not the planner alias", () => {
+    // The raw name reaches the runner unchanged — no alias resolution here.
+    expect(parseRunnerCommand('/resume 3')).toEqual({ name: 'resume', args: '3' });
+    const runner = [{ name: 'resume' }] as unknown as Parameters<typeof composerCompletions>[1];
+    const token = { start: 0, end: 7, name: 'res', nameEnd: 7 };
+    expect(composerCompletions(token, runner)).toEqual(['resume']);
+    // The planner's alias lives only in the built-in table; a runner-less chat
+    // still offers it, so the two surfaces stay distinct by construction.
+    expect(composerCompletions(token, null)).toContain('resume');
   });
 });

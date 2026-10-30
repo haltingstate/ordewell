@@ -187,6 +187,55 @@ describe('ordewell rewind', () => {
   });
 });
 
+describe('ordewell compact retry', () => {
+  const pause = { model: 'vendor/model', at: '2026-10-25T10:00:00Z', reason: "vendor/model refused the planner's call as too long for its window. The planner is paused: Retry compaction tries to condense its context and continue the turn, or stop it to drop the turn.", inputs: ['turn-1'] };
+
+  it('retries the paused turn and says it carried on', async () => {
+    const srv = await daemon(({ url }) => url.includes('/load') ? { body: { ...adopted, plan: { tasks: [], plannerContextPause: pause } } } : { body: { plan: { tasks: [] } } });
+    const { handleCompact } = await import('../conversation');
+
+    const { stdout, exitCode } = await capture(() => handleCompact(['retry', '--workspace', '/tmp/ws'], new ApiClient(srv.port)));
+    srv.close();
+
+    expect(exitCode).toBeNull();
+    expect(srv.hits.map((h) => `${h.method} ${h.url}`)).toEqual([
+      'POST /api/sessions/session-1/load?workspace=%2Ftmp%2Fws',
+      'POST /api/plans/session-1/conversation/compact/retry',
+    ]);
+    expect(stdout).toMatch(/carried the paused turn on/);
+  });
+
+  it('exits non-zero with why when the planner paused again', async () => {
+    const srv = await daemon(({ url }) => url.includes('/load') ? { body: adopted } : { body: { plan: { tasks: [], plannerContextPause: pause } } });
+    const { handleCompact } = await import('../conversation');
+
+    const { stderr, exitCode } = await capture(() => handleCompact(['retry', '--workspace', '/tmp/ws'], new ApiClient(srv.port)));
+    srv.close();
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain(pause.reason);
+  });
+
+  it('reports a retry the daemon refused, and exits non-zero', async () => {
+    const error = 'The planner is not paused on its context: there is nothing to retry.';
+    const srv = await daemon(({ url }) => url.includes('/load') ? { body: adopted } : { status: 400, body: { error, code: 'refused' } });
+    const { handleCompact } = await import('../conversation');
+
+    const { stderr, exitCode } = await capture(() => handleCompact(['retry', '--workspace', '/tmp/ws'], new ApiClient(srv.port)));
+    srv.close();
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain(`Failed to retry compaction: ${error}`);
+  });
+
+  it('refuses any other argument with its usage', async () => {
+    const { handleCompact } = await import('../conversation');
+    const { stderr, exitCode } = await capture(() => handleCompact(['again']));
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/Usage: ordewell compact \[retry\]/);
+  });
+});
+
 describe('ordewell compact', () => {
   const compacted = { plan: { tasks: [] }, summary: 'Goal: a JSON parser. Streaming chosen.', keptMessages: 4 };
 
@@ -205,6 +254,8 @@ describe('ordewell compact', () => {
     expect(stdout).toMatch(/Condensed session-1/);
     expect(stdout).toContain('Goal: a JSON parser. Streaming chosen.');
     expect(stdout).toMatch(/tasks are unchanged/);
+    // The transcript is kept whole; only what the planner is sent is shortened.
+    expect(stdout).toMatch(/full conversation stays in the session/);
   });
 
   it.each([
@@ -219,6 +270,27 @@ describe('ordewell compact', () => {
 
     expect(exitCode).toBe(1);
     expect(stderr).toMatch(expected);
+  });
+
+  it('names the session when the connection drops before the condense is answered', async () => {
+    const srv = await new Promise<{ port: number; close: () => void }>((resolve) => {
+      const server = http.createServer((req, res) => {
+        if (req.url?.includes('/compact')) return req.socket.destroy();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(adopted));
+      });
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        resolve({ port: typeof addr === 'object' && addr ? addr.port : 0, close: () => server.close() });
+      });
+    });
+    const { handleCompact } = await import('../conversation');
+
+    const { stderr, exitCode } = await capture(() => handleCompact(['--workspace', '/tmp/ws'], new ApiClient(srv.port)));
+    srv.close();
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('ordewell sessions load session-1');
   });
 
   it('words a planner that cannot plan with the shell\'s commands, not the terminal UI\'s', async () => {

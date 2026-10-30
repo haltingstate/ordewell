@@ -1,5 +1,6 @@
 import type { TaskDiffRead, TaskDiffResult } from '../services/taskDiffRead';
 import type { Task } from '../models/Task';
+import type { HandoffCommit } from '../models/Handoff';
 
 /**
  * Why isolated execution is unavailable for a workspace. The orchestrator needs
@@ -20,6 +21,59 @@ export type IsolationInactiveReason = 'disabled' | 'git-missing' | 'not-git' | '
 export type IsolationAvailability =
   | { active: true; repos?: string[]; shared?: string[] }
   | { active: false; reason: IsolationInactiveReason; repos?: string[] };
+
+/**
+ * What a repository's HEAD is. `unborn` is a repository with no commit yet,
+ * on `branch`; `unknown` is one git could not be asked about.
+ */
+export type RepoHead =
+  | { kind: 'branch'; branch: string; commit: string }
+  | { kind: 'detached'; commit: string }
+  | { kind: 'unborn'; branch?: string }
+  | { kind: 'unknown' };
+
+/** One repository of the group, as it is right now. */
+export interface PreviewRepo {
+  /** Relative to the workspace, as everywhere else: `.` for a workspace that is in one repository. */
+  path: string;
+  head: RepoHead;
+  /** Whether tracked files differ from HEAD; absent when not inspected (isolation is off or git is missing). */
+  dirty?: boolean;
+  /** Only for the lone repository: the workspace-relative path of its top level when the workspace is below it, such as `..`. */
+  top?: string;
+}
+
+/**
+ * What a current look at a workspace says about isolation, for a surface that
+ * shows it before any run (ADR-0013, ADR-0014). Every status but `failed`
+ * answers as `isActive` would for the same workspace, so the two cannot
+ * disagree; only `isActive` at run start is authoritative, and the base
+ * branch a run forks from is read again then.
+ *
+ * - `ready`: code tasks get isolated worktrees from `repos`. A repo with no
+ *   commit yet is listed with an `unborn` head and shared instead.
+ * - `dirty`: as `ready` once the start-time decision (stash, or run without
+ *   isolation) is made; `repos` marks the ones with `dirty`.
+ * - `disabled`, `git-missing`, `no-commits`: code tasks run in the workspace.
+ * - `no-repo`: nothing in the workspace is a repository (`repos` is empty).
+ * - `failed`: git could not be read; says nothing about whether there is a
+ *   repository. `error` is the reason.
+ *
+ * Ops and script tasks use the user's checkout whatever the status.
+ */
+export interface IsolationPreview {
+  status: 'ready' | 'dirty' | 'disabled' | 'git-missing' | 'no-repo' | 'no-commits' | 'failed';
+  repos: PreviewRepo[];
+  /** What every task would share live, as `IsolationAvailability.shared` names it; empty unless `ready` or `dirty`. */
+  shared: string[];
+  error?: string;
+}
+
+/** The read-only look at a workspace's isolation: starts no run and changes nothing in any repository. */
+export interface IIsolationPreview {
+  /** Never rejects: a failed inspection is a `failed` preview. */
+  preview(workspaceRoot: string): Promise<IsolationPreview>;
+}
 
 /**
  * Where a run's tasks work, as the planner is told it: the repos of the group
@@ -96,6 +150,13 @@ export interface IsolationTaskRecord {
    * so a stale reason cannot outlive the failure it explains.
    */
   landingError?: string;
+  /**
+   * The commit the task's done handoff stated, kept from the landing that
+   * first brought it: what Ordewell's own commits for the task are written
+   * from (ADR-0013), a repair's merge and every later landing included,
+   * though a repair's handoff states none.
+   */
+  commit?: HandoffCommit;
   /** Repo-relative paths, in `conflictRepo`, that conflicted; set only while `status` is `conflict` or `repairing`. */
   conflictFiles?: string[];
   /**
@@ -279,7 +340,7 @@ export type IsolationMergeBlockReason = 'merge-in-progress' | 'conflict' | 'unco
 export interface IsolationMergeBlock {
   repo: string;
   reason: IsolationMergeBlockReason;
-  /** The files that would conflict, or the user's uncommitted ones the merge also changes; empty for the other reasons. */
+  /** The files that would conflict, or the user's uncommitted ones the merge would change or stand in the way of; empty for the other reasons. */
   files: string[];
   /** `wrong-branch` only: the branch the run started on. */
   expected?: string;
@@ -299,6 +360,9 @@ export interface IsolationMergeBlock {
  *   which cannot preflight, or for a reason no preflight could foresee. That
  *   merge was aborted, leaving `repo` as it was; `landed` names the repos
  *   merged before it, which stay merged, and is absent when there are none.
+ *   A `failed` merge git itself refused carries the first line it said as
+ *   `error`; one that never started, for a merge of the user's already in
+ *   progress, carries none.
  *
  * A group of one is blocked only by a partial landing or by being on the wrong
  * branch; otherwise its one merge lands or is aborted whole, so it reports as
@@ -307,7 +371,7 @@ export interface IsolationMergeBlock {
 export type IsolationMergeResult =
   | { outcome: 'merged' }
   | { outcome: 'blocked'; blocked: IsolationMergeBlock[] }
-  | { outcome: 'conflict' | 'failed'; repo: string; files?: string[]; landed?: string[] };
+  | { outcome: 'conflict' | 'failed'; repo: string; files?: string[]; landed?: string[]; error?: string };
 
 /**
  * What `discard` does with each repo's integration branch: `keep` it for review
@@ -445,7 +509,9 @@ export interface IWorktreeIsolation {
    * the Runner into. Fresh attempts start clean from the tips. A `restore`
    * puts the previous attempt's preserved work on top of them, falling back
    * to the tips in every repo when any restoration conflicts (ADR-0018).
-   * `readOnly` marks the record as a read-only task's (ADR-0046).
+   * `readOnly` marks the record as a read-only task's (ADR-0046). A failure
+   * after the last attempt was replaced throws `PrepareFailedError`, naming
+   * the work that was kept on branches as that attempt's record went.
    */
   prepare(task: Task, run: IsolationRun, intent?: PrepareIntent, opts?: { readOnly?: boolean }): Promise<PreparedTask>;
 
@@ -481,8 +547,13 @@ export interface IWorktreeIsolation {
    * `persist` is called once `run.landing` is set and before the first
    * merge; the caller saves the run there, synchronously, which is what
    * lets `pruneOrphans` finish a landing a crash interrupted.
+   *
+   * `commit`, the one the task's done handoff stated, is kept on the record,
+   * and what Ordewell commits and merges for the task is written from it;
+   * without one, the record's earlier commit, else the task title. A commit
+   * the runner made is never rewritten.
    */
-  integrate(task: Task, run: IsolationRun, persist?: () => void): Promise<IsolationOutcome>;
+  integrate(task: Task, run: IsolationRun, persist?: () => void, commit?: HandoffCommit): Promise<IsolationOutcome>;
 
   /**
    * `keep: false` removes the task's worktree, branch and record (retry, task

@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomBytes } from 'crypto';
 import { Server as McpProtocolServer } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, CancelledNotificationSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { extractPresentedToken } from '../../utils/daemonToken';
 import { PLANNER_TOOLS, READ_ONLY_TASK_TOOLS, TASK_TOOLS, type McpTool, type PlannerToolHandler, type TaskToolHandler } from './tools';
 
@@ -35,7 +35,7 @@ export interface TaskTokenScope {
   taskId: string;
   /** The attempt generation the token is good for; a later attempt gets a new token. */
   attempt: number;
-  /** A read-only task's attempt (ADR-0046): its token lists `run_command` too, and no other task's does. */
+  /** A read-only task's attempt (ADR-0046): its token lists `run_command`, `fetch` and `web_search` too, and no other task's does. */
   readOnly?: boolean;
 }
 
@@ -55,16 +55,50 @@ export interface McpCredential {
   token: string;
   /** The planner tools the token hides ({@link PlannerTokenScope.hidden}), so the runner is told of and pre-allows only what it is served. */
   hidden?: readonly string[];
-  /** The token serves a read-only task's tools ({@link TaskTokenScope.readOnly}), so the runner is told of and pre-allows `run_command`. */
+  /** The token serves a read-only task's tools ({@link TaskTokenScope.readOnly}), so the runner is told of and pre-allows `run_command`, `fetch` and `web_search`. */
   readOnly?: true;
 }
 
+/**
+ * Why the server refused a request before any tool ran, kept apart in the
+ * count so a planner that lost its link can be told from one that never had
+ * one: an unknown token is a stale URL or a client that was never issued one,
+ * a revoked token is a session that ended or a process that was respawned, and
+ * a wrong path is a client pointed somewhere other than `/mcp`.
+ */
+export type McpRefusal = 'unknownToken' | 'revokedToken' | 'wrongPath';
+
+/**
+ * How many revoked tokens are remembered so one is told apart from a token
+ * that never existed. A daemon runs for days and revokes one per attempt;
+ * beyond this many, an old one is counted as unknown instead of holding every
+ * token it ever issued.
+ */
+const REVOKED_TOKENS_KEPT = 1024;
+
+/** What a refusal says in the log. Never the token. */
+const REFUSAL_TEXT: Record<McpRefusal, string> = {
+  unknownToken: 'unknown token',
+  revokedToken: 'revoked token — its session ended or its process was respawned',
+  wrongPath: `wrong path (the server serves ${ORDEWELL_MCP_PATH} only)`,
+};
+
+/**
+ * A token's calls in flight, by request id. Stateless, a caller's
+ * cancellation arrives as a request of its own, which finds the call it names
+ * only here; a reused id cancels every call of the token that carries it.
+ */
+type InFlight = Map<string, Set<AbortController>>;
+
 type Grant =
-  | { role: 'task'; scope: TaskTokenScope; handler: TaskToolHandler; revoked: AbortController }
-  | { role: 'planner'; scope: PlannerTokenScope; handler: PlannerToolHandler; revoked: AbortController };
+  | { role: 'task'; scope: TaskTokenScope; handler: TaskToolHandler; revoked: AbortController; calls: InFlight }
+  | { role: 'planner'; scope: PlannerTokenScope; handler: PlannerToolHandler; revoked: AbortController; calls: InFlight };
 
 export class OrdewellMcpServer {
   private readonly grants = new Map<string, Grant>();
+  /** Recently revoked tokens, so a request carrying one is told from a token that never existed. */
+  private readonly revokedTokens = new Set<string>();
+  private readonly refused: Record<McpRefusal, number> = { unknownToken: 0, revokedToken: 0, wrongPath: 0 };
   private http: Server | undefined;
   private listening: Promise<string> | undefined;
   private boundUrl: string | undefined;
@@ -80,14 +114,23 @@ export class OrdewellMcpServer {
     return this.boundUrl;
   }
 
+  /**
+   * How many requests this server refused, by reason, since it started. What
+   * makes a planner whose tools went dead visible after the fact; no token,
+   * path or header is kept here.
+   */
+  refusals(): Readonly<Record<McpRefusal, number>> {
+    return { ...this.refused };
+  }
+
   async issueTaskToken(scope: TaskTokenScope, handler: TaskToolHandler = {}): Promise<McpCredential> {
-    const credential = await this.issue({ role: 'task', scope: { ...scope }, handler, revoked: new AbortController() });
+    const credential = await this.issue({ role: 'task', scope: { ...scope }, handler, revoked: new AbortController(), calls: new Map() });
     return scope.readOnly ? { ...credential, readOnly: true } : credential;
   }
 
   async issuePlannerToken(scope: PlannerTokenScope, handler: PlannerToolHandler = {}): Promise<McpCredential> {
     const hidden = [...(scope.hidden ?? [])];
-    const credential = await this.issue({ role: 'planner', scope: { ...scope, hidden }, handler, revoked: new AbortController() });
+    const credential = await this.issue({ role: 'planner', scope: { ...scope, hidden }, handler, revoked: new AbortController(), calls: new Map() });
     return hidden.length > 0 ? { ...credential, hidden } : credential;
   }
 
@@ -101,11 +144,19 @@ export class OrdewellMcpServer {
     const grant = this.grants.get(token);
     if (!grant) return;
     this.grants.delete(token);
+    this.revokedTokens.add(token);
+    if (this.revokedTokens.size > REVOKED_TOKENS_KEPT) {
+      const oldest = this.revokedTokens.values().next();
+      if (!oldest.done) this.revokedTokens.delete(oldest.value);
+    }
     grant.revoked.abort();
   }
 
   async dispose(): Promise<void> {
     for (const token of [...this.grants.keys()]) this.revoke(token);
+    // Nothing can connect once the listener closes, so the diagnostic history
+    // is not worth holding every token the server ever issued for.
+    this.revokedTokens.clear();
     const http = this.http;
     this.http = undefined;
     this.listening = undefined;
@@ -165,19 +216,19 @@ export class OrdewellMcpServer {
     const token = extractPresentedToken({ authorization: req.headers.authorization });
     const grant = token === undefined ? undefined : this.grants.get(token);
     if (!grant) {
-      reply(res, 401, 'Unauthorized');
+      this.refuse(res, token !== undefined && this.revokedTokens.has(token) ? 'revokedToken' : 'unknownToken', 401, 'Unauthorized');
       return;
     }
     if (new URL(req.url ?? '/', `http://${this.boundHost}`).pathname !== ORDEWELL_MCP_PATH) {
-      reply(res, 404, 'Not found');
+      this.refuse(res, 'wrongPath', 404, 'Not found');
       return;
     }
 
     // Stateless: a fresh server per request, built from the grant, so the tool
     // list and every call are fixed by the token on that very request.
     const mcp = new McpProtocolServer({ name: 'ordewell', version: '1' }, { capabilities: { tools: {} } });
-    if (grant.role === 'task') serveTools(mcp, grant.scope.readOnly ? READ_ONLY_TASK_TOOLS : TASK_TOOLS, taskInventory(grant.scope.readOnly), grant.handler, grant.revoked.signal, this.heartbeatMs);
-    else serveTools(mcp, PLANNER_TOOLS.filter((tool) => !grant.scope.hidden?.includes(tool.name)), plannerInventory(grant.scope.hidden ?? []), grant.handler, grant.revoked.signal, this.heartbeatMs);
+    if (grant.role === 'task') serveTools(mcp, grant.scope.readOnly ? READ_ONLY_TASK_TOOLS : TASK_TOOLS, taskInventory(grant.scope.readOnly), grant.handler, grant, this.heartbeatMs);
+    else serveTools(mcp, PLANNER_TOOLS.filter((tool) => !grant.scope.hidden?.includes(tool.name)), plannerInventory(grant.scope.hidden ?? []), grant.handler, grant, this.heartbeatMs);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {
       void transport.close();
@@ -185,6 +236,13 @@ export class OrdewellMcpServer {
     });
     await mcp.connect(transport);
     await transport.handleRequest(req, res);
+  }
+
+  /** Count one refusal, and say the first of its kind once: a runner retrying a dead token must not flood the log. */
+  private refuse(res: ServerResponse, reason: McpRefusal, status: number, message: string): void {
+    this.refused[reason] += 1;
+    if (this.refused[reason] === 1) console.warn(`[ordewell-mcp] refused a request: ${REFUSAL_TEXT[reason]}`);
+    reply(res, status, message);
   }
 }
 
@@ -226,25 +284,30 @@ function unknownToolMessage(called: string, inventory: ToolInventory): string {
 
 /** A task token's inventory: its own tools, and the planner tools it is refused. */
 function taskInventory(readOnly?: boolean): ToolInventory {
-  return {
-    served: (readOnly ? READ_ONLY_TASK_TOOLS : TASK_TOOLS).map((t) => t.name),
-    // run_command is the one tool a writing task is refused for a different reason than the rest (ADR-0046).
-    withheld: PLANNER_TOOLS.map((t) => ({ name: t.name, reason: t.name === 'run_command' && !readOnly ? 'read-only tasks only' : 'planner tokens only' })),
-  };
+  const served = (readOnly ? READ_ONLY_TASK_TOOLS : TASK_TOOLS).map((t) => t.name);
+  const candidates = [...PLANNER_TOOLS, ...TASK_TOOLS, ...READ_ONLY_TASK_TOOLS];
+  const withheld = [...new Set(candidates.map((t) => t.name))].filter((name) => !served.includes(name));
+  return { served, withheld: withheld.map((name) => ({ name, reason: READ_ONLY_TASK_TOOLS.some((t) => t.name === name) ? 'read-only tasks only' : TASK_TOOLS.some((t) => t.name === name) ? 'change tasks only' : 'planner tokens only' })) };
 }
 
-/** A planner token's inventory: its tools less the ones its runner carries natively (ADR-0027), and the task tools it is refused. */
 function plannerInventory(hidden: readonly string[]): ToolInventory {
+  const served = PLANNER_TOOLS.map((t) => t.name).filter((name) => !hidden.includes(name));
+  const taskNames = [...new Set([...TASK_TOOLS, ...READ_ONLY_TASK_TOOLS].map((t) => t.name))];
   return {
-    served: PLANNER_TOOLS.map((t) => t.name).filter((name) => !hidden.includes(name)),
+    served,
     withheld: [
-      ...TASK_TOOLS.map((t) => ({ name: t.name, reason: 'task tokens only' })),
-      ...hidden.map((name) => ({ name, reason: 'your runner carries its own' })),
+      ...taskNames.filter((name) => !PLANNER_TOOLS.some((t) => t.name === name)).map((name) => ({ name, reason: 'task tokens only' })),
+      ...PLANNER_TOOLS.filter((t) => hidden.includes(t.name)).map((t) => ({ name: t.name, reason: 'your runner carries its own' })),
     ],
   };
 }
 
-function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], inventory: ToolInventory, handler: H, revoked: AbortSignal, heartbeatMs: number): void {
+function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], inventory: ToolInventory, handler: H, { revoked, calls }: Pick<Grant, 'revoked' | 'calls'>, heartbeatMs: number): void {
+  mcp.setNotificationHandler(CancelledNotificationSchema, ({ params }) => {
+    if (params.requestId === undefined) return;
+    for (const call of calls.get(String(params.requestId)) ?? []) call.abort();
+  });
+
   mcp.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: tools.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, ...(annotations ? { annotations } : {}) })),
   }));
@@ -252,18 +315,24 @@ function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], inv
     const tool = tools.find((t) => t.name === request.params.name);
     if (!tool) throw new McpError(ErrorCode.InvalidParams, unknownToolMessage(request.params.name, inventory));
     const progressToken = request.params._meta?.progressToken;
+    const id = String(extra.requestId);
+    const cancelled = new AbortController();
+    const same = calls.get(id) ?? new Set();
+    calls.set(id, same.add(cancelled));
     let beats = 0;
     const heartbeat = progressToken === undefined ? undefined : setInterval(() => {
       beats += 1;
       extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: beats } }).catch(() => undefined);
     }, heartbeatMs);
     try {
-      const result = await tool.call(handler, request.params.arguments, { signal: AbortSignal.any([revoked, extra.signal]) });
+      const result = await tool.call(handler, request.params.arguments, { signal: AbortSignal.any([revoked.signal, extra.signal, cancelled.signal]) });
       return { content: [{ type: 'text', text: result.text }], isError: result.isError ?? false };
     } catch (err) {
       return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true };
     } finally {
       clearInterval(heartbeat);
+      same.delete(cancelled);
+      if (same.size === 0 && calls.get(id) === same) calls.delete(id);
     }
   });
 }

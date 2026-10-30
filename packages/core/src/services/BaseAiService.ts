@@ -7,8 +7,9 @@ import { buildPlanWithResults } from './PlanPrompts';
 import { DEFAULT_PLANNER_MODES, type PlannerModes } from './plannerModes';
 import { generatePlanWithRepair, classifyPlannerReply } from './PlanRepair';
 import { settleReply, type ReplyAttempt } from './settleReply';
-import { compactResearchResults, withProactiveCompaction } from './contextCompaction';
+import { compactResearchResults, type CompactableMessage } from './contextCompaction';
 import type { RunnerModeInfo } from './ModeResolver';
+import type { PlanIntake } from './PlanChangeCheck';
 import { collectResearchContext } from './ContextCollector';
 import { PLANNER_EXECUTION_TOOLS, PLANNER_TASK_READ_TOOLS, type PlannerToolHandler } from './mcp/tools';
 import { redactSecrets } from '../utils/redactSecrets';
@@ -77,7 +78,7 @@ export interface ResearchTurn {
   reasoning?: string;
   /** Provider finish reason, normalized: 'length' means the output-token limit cut the reply mid-stream. */
   finishReason?: string;
-  /** Exact prompt tokens this turn consumed, when the provider reports usage — drives proactive compaction. */
+  /** Exact prompt tokens this turn consumed, when the provider reports usage. */
   promptTokens?: number;
   /** The segment `text` streamed under, where the provider streams it. */
   segmentId?: string;
@@ -87,12 +88,36 @@ export interface ResearchChat {
   sendMessage(text: string, signal?: AbortSignal): Promise<ResearchTurn>;
   sendToolResults(results: ToolResult[], signal?: AbortSignal): Promise<ResearchTurn>;
   /**
-   * Optional: prune bulky raw tool outputs from the history in place (subagent
-   * digests are kept) so a follow-up emission has context to spend on output.
-   * Returns the number of characters removed. Providers whose SDK owns the
-   * history (Gemini) may not support it.
+   * Optional: prune older workspace reads from the history (everything else,
+   * and the newest rounds, are kept) so a follow-up emission has context to
+   * spend on output. Returns the number of characters removed.
    */
   compactHistory?(): number;
+  /**
+   * Whether a call's input is held: the call could not fit the model's window
+   * (`PlannerContextExhaustedError`), so its user message or tool results were
+   * kept out of the history. The next message drops a held message and files
+   * held results as a turn before it.
+   */
+  holdsInput?(): boolean;
+  /** Send the held input again, once room is made: no tool runs a second time. */
+  resend?(signal?: AbortSignal): Promise<ResearchTurn>;
+  /** Whether {@link retry} can send the held input: a window is known to compact against. */
+  retryable?(): boolean;
+  /** The user's Retry compaction: condense with their consent, then send the held input once. */
+  retry?(signal?: AbortSignal): Promise<ResearchTurn>;
+  /**
+   * Take `history` in place of the whole message list in one step — a summary
+   * swapped in for what it condensed. Refused, changing nothing, unless each
+   * tool result answers a call of the assistant message just before it, once.
+   */
+  reseed?(history: readonly CompactableMessage[]): void;
+  /**
+   * Optional: the answer to a call the open turn already made in rounds
+   * condensed out of the model's sight, in place of running it again
+   * (ADR-0002). Undefined for a call that runs.
+   */
+  answered?(call: ToolCall): string | undefined;
 }
 
 /** Everything one conversation turn needs beyond the user message itself. */
@@ -101,6 +126,8 @@ export interface ConversationTurnContext {
   fs: IFileSystem;
   runners: RunnerId[];
   runnerModes?: Record<RunnerId, RunnerModeInfo[]>;
+  /** See {@link ConversationRequest.liveScope}. */
+  liveScope?: () => PlanIntake;
   autonomousDefault?: boolean;
   fetcher?: IWebFetcher;
   /** The session's planner tools; the conversation offers their task reads and execution tools (ADR-0029) when set. */
@@ -110,6 +137,8 @@ export interface ConversationTurnContext {
 export abstract class BaseAiService {
   protected conversation: { ctx: ConversationTurnContext; setProgress: (fn: (p: ResearchProgress) => void) => void } | null = null;
   protected activeAbort: AbortController | null = null;
+  /** See {@link compactions}. */
+  private compacted = 0;
 
   constructor(protected config: IConfig, protected turnBudgets?: TurnBudgets) {}
 
@@ -118,7 +147,20 @@ export abstract class BaseAiService {
 
   hasActiveConversation(): boolean { return this.conversation !== null; }
 
-  pruneContext(): number { return this.conversation?.ctx.chat.compactHistory?.() ?? 0; }
+  pruneContext(): number {
+    return this.conversation?.ctx.chat.compactHistory?.() ?? 0;
+  }
+
+  /**
+   * The compactions of a conversation's history that changed something, which
+   * the chat reports through {@link countCompaction}. A pruning stubs tool
+   * output alone, never the user messages a plan block rides in, but it counts
+   * all the same: the conversation would rather send the plan whole again than
+   * trust a context changed under it (ADR-0012 T10).
+   */
+  compactions(): number { return this.compacted; }
+
+  protected countCompaction(): void { this.compacted++; }
 
   protected startAbortScope(callerSignal?: AbortSignal): AbortSignal {
     this.activeAbort = abortScope(callerSignal);
@@ -140,6 +182,26 @@ export abstract class BaseAiService {
     const combinedSignal = this.startAbortScope(signal);
     try {
       const result = await this.runConversationTurn(this.conversation.ctx, userMessage, onProgress, combinedSignal);
+      if (result.kind === 'plan') this.conversation = null;
+      return result;
+    } finally {
+      this.stopAbortScope();
+    }
+  }
+
+  heldInputRetryable(): boolean {
+    return this.conversation?.ctx.chat.retryable?.() ?? false;
+  }
+
+  /** The turn a held input was for, carried on from it: its first call is the retry, every later one as in any turn. */
+  async retryHeldInput(onProgress: (progress: ResearchProgress) => void, signal?: AbortSignal): Promise<ConversationTurn> {
+    this.ensureInit();
+    const chat = this.conversation?.ctx.chat;
+    if (!this.conversation || !chat?.retry || !this.heldInputRetryable()) throw new Error('The planner holds no input to retry.');
+    this.conversation.setProgress(onProgress);
+    const combinedSignal = this.startAbortScope(signal);
+    try {
+      const result = await this.runConversationTurn(this.conversation.ctx, '', onProgress, combinedSignal, () => chat.retry!(combinedSignal));
       if (result.kind === 'plan') this.conversation = null;
       return result;
     } finally {
@@ -360,19 +422,24 @@ export abstract class BaseAiService {
     message: string,
     onProgress: (progress: ResearchProgress) => void,
     signal?: AbortSignal,
+    /** What the turn's first call is, in place of sending `message`: a held input sent again. */
+    firstCall?: () => Promise<ResearchTurn>,
   ): Promise<ConversationTurn> {
-    // Turns reporting prompt-token pressure compact the underlying history
-    // before the next call — the plan emission should never be the first
-    // moment the context problem surfaces.
-    const chat = withProactiveCompaction(ctx.chat);
+    // Context pressure is the chat's to handle, before each of its calls.
+    const { chat } = ctx;
+    let first = firstCall;
     return settleReply({
       // The turn's own input carries the budgets, not the system prompt, which stays cacheable.
       message: withTurnBudgets(this.turnBudgets, message),
-      send: (text) => this.runToolRounds(chat, ctx, text, onProgress, signal),
-      classify: { runners: ctx.runners, runnerModes: ctx.runnerModes, autonomousDefault: ctx.autonomousDefault },
+      send: (text) => {
+        const opening = first;
+        first = undefined;
+        return this.runToolRounds(chat, ctx, text, onProgress, signal, opening);
+      },
+      classify: { autonomousDefault: ctx.autonomousDefault, ...(ctx.liveScope?.() ?? { runners: ctx.runners, runnerModes: ctx.runnerModes }) },
       onProgress,
       signal,
-      compactHistory: chat.compactHistory,
+      compactHistory: chat.compactHistory?.bind(chat),
     });
   }
 
@@ -383,6 +450,7 @@ export abstract class BaseAiService {
     message: string,
     onProgress: (progress: ResearchProgress) => void,
     signal?: AbortSignal,
+    firstCall?: () => Promise<ResearchTurn>,
   ): Promise<ReplyAttempt> {
     const researchLog: ResearchLogEntry[] = [];
     const MAX_STEPS = this.config.researchMaxSteps;
@@ -399,7 +467,7 @@ export abstract class BaseAiService {
       return next;
     };
     const runs = (): TurnRun[] => (last ? [...narration, last] : [...narration]);
-    let turn = await call(() => chat.sendMessage(message, signal));
+    let turn = await call(firstCall ?? (() => chat.sendMessage(message, signal)));
 
     // Wrap-up rounds after the tool budget runs out: the pending calls are
     // answered synthetically (never executed) so the API history stays
@@ -442,9 +510,7 @@ export abstract class BaseAiService {
         continue;
       }
       const thinking = turn.reasoning ? turn.reasoning.slice(-200) : '';
-      const { toolResults, logEntries } = await this.executeToolCalls(
-        turn.toolCalls, ctx.fs, onProgress, ctx.fetcher, step, thinking, signal, ctx.plannerTools,
-      );
+      const { toolResults, logEntries } = await this.runRound(chat, turn.toolCalls, ctx, onProgress, step, thinking, signal);
       researchLog.push(...logEntries);
       BaseAiService.appendBudgetCountdown(toolResults, MAX_STEPS - step - 1, 'reply to the user (summary, question, or plan JSON)');
       turn = await call(() => chat.sendToolResults(toolResults, signal));
@@ -468,6 +534,52 @@ export abstract class BaseAiService {
     }
 
     return { text: turn.text, researchLog, cutOff: turn.finishReason === 'length', runs: runs() };
+  }
+
+  /**
+   * One round's calls run, except those the chat answers as already made in
+   * the turn's condensed rounds (ADR-0002): each of those is answered with
+   * what it returned and shown as not executed, before anything runs.
+   * Results and steps stay in call order.
+   */
+  private async runRound(
+    chat: ResearchChat,
+    calls: ToolCall[],
+    ctx: ConversationTurnContext,
+    onProgress: (progress: ResearchProgress) => void,
+    stepIndex: number,
+    thinking: string,
+    signal?: AbortSignal,
+  ): Promise<{ toolResults: ToolResult[]; logEntries: ResearchStep[] }> {
+    const answers = calls.map((tc) => chat.answered?.(tc));
+    if (answers.every((a) => a === undefined)) return this.executeToolCalls(calls, ctx.fs, onProgress, ctx.fetcher, stepIndex, thinking, signal, ctx.plannerTools);
+    const answered = new Map<number, { result: ToolResult; step: ResearchStep }>();
+    for (const [i, tc] of calls.entries()) {
+      const output = answers[i];
+      if (output === undefined) continue;
+      const named = stepTool(tc.name, ctx.plannerTools);
+      const step: ResearchStep = {
+        id: `rs-${Date.now()}-${stepIndex}-answered-${i}`,
+        tool: named.tool as ResearchStep['tool'],
+        ...(named.toolLabel ? { toolLabel: named.toolLabel } : {}),
+        args: JSON.stringify(tc.args),
+        result: output,
+        success: false,
+        outcome: 'not_executed',
+        toolCallId: tc.id,
+        timestamp: new Date().toISOString(),
+      };
+      onProgress({ type: 'tool_call', ...named, toolArgs: step.args, toolCallId: tc.id });
+      onProgress({ type: 'tool_result', toolResult: output, step, toolCallId: tc.id });
+      answered.set(i, { result: { name: tc.name, output, truncated: false, totalChars: output.length, id: tc.id }, step });
+    }
+    const fresh = calls.filter((_, i) => !answered.has(i));
+    const ran = fresh.length > 0
+      ? await this.executeToolCalls(fresh, ctx.fs, onProgress, ctx.fetcher, stepIndex, thinking, signal, ctx.plannerTools)
+      : { toolResults: [], logEntries: [] };
+    let next = 0;
+    const merged = calls.map((_, i) => answered.get(i) ?? { result: ran.toolResults[next], step: ran.logEntries[next++] });
+    return { toolResults: merged.map((m) => m.result), logEntries: merged.map((m) => m.step) };
   }
 
   /**
@@ -500,7 +612,6 @@ export abstract class BaseAiService {
     let researchResults = '';
     const MAX_STEPS = this.config.researchMaxSteps;
 
-    chat = withProactiveCompaction(chat);
     let turn = await chat.sendMessage(firstMessage, signal);
 
     for (let step = 0; step < MAX_STEPS; step++) {
@@ -549,7 +660,7 @@ export abstract class BaseAiService {
     onProgress: (progress: ResearchProgress) => void,
     researchLog: ResearchLogEntry[] = [],
     runnerModes?: Record<RunnerId, RunnerModeInfo[]>,
-    autonomousDefault = true,
+    autonomousDefault = false,
     signal?: AbortSignal,
     modes: PlannerModes = DEFAULT_PLANNER_MODES,
   ): Promise<{ tasks: Task[]; researchLog: ResearchLogEntry[] }> {

@@ -1,6 +1,8 @@
 import React from 'react';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, screen, within, fireEvent, cleanup } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { RUN_SETTINGS_DEFAULTS, type GlobalRunSettings } from '@ordewell/core';
 import App from '../App';
 import { api, post as send } from './hostBridge';
@@ -36,9 +38,51 @@ describe('run settings in the Settings panel', () => {
     expect(screen.queryByText(/· 3 parallel/)).toBeNull();
   });
 
+  it('draws each Run row as one segmented control, with its options in order', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/views/chat/styles.css'), 'utf8');
+    document.head.append(style);
+
+    for (const name of ['Autonomy', 'Supervisor', 'Automerge', 'Autorun']) {
+      const group = screen.getByRole('group', { name });
+      expect(group.className).toContain('run-setting-pills');
+      expect(getComputedStyle(group).borderTopWidth).toBe('1px');
+      const options = within(group).getAllByRole('button');
+      expect(options.length).toBeGreaterThan(1);
+      for (const [i, option] of options.entries()) {
+        // The group owns the border, and each divider belongs to the option
+        // after the first, so a segment is one click target.
+        expect(option.parentElement).toBe(group);
+        expect(getComputedStyle(option).borderLeftWidth).toBe(i === 0 ? '0px' : '1px');
+      }
+    }
+
+    const supervisor = screen.getByRole('group', { name: 'Supervisor' });
+    expect(within(supervisor).getByRole('button', { name: 'Watch' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('leaves the Planned-with line to `ordewell trailer` and settings.json', () => {
+    expect(screen.queryByText(/Planned-with/)).toBeNull();
+  });
+
   it('keeps the Settings toggle outside the scrolling body', () => {
     const toggle = screen.getByRole('button', { name: /^Settings/ });
     expect(toggle.closest('.setup-panel-body')).toBeNull();
+  });
+
+  it('reports the Settings panel as expanded only while its body is shown', () => {
+    const toggle = screen.getByRole('button', { name: /^Settings/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle).toHaveClass('open');
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).not.toHaveClass('open');
+    expect(document.querySelector('.setup-panel-body')).toHaveClass('collapsed');
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle).toHaveClass('open');
   });
 
   it.each([
@@ -59,6 +103,13 @@ describe('run settings in the Settings panel', () => {
     expect(api.postMessage).not.toHaveBeenCalled();
   });
 
+  it('says which Run choices follow this session and which are machine-wide', () => {
+    const block = screen.getByRole('region', { name: 'Run' });
+
+    expect(block).toHaveTextContent(/apply to this session; your last change is the default for new ones\./);
+    expect(block).toHaveTextContent(/Autonomy and Parallel tasks apply to every session\./);
+  });
+
   it('a number commits on Enter, any whole number at or above its floor', () => {
     const parallel = screen.getByRole('spinbutton', { name: 'Parallel tasks' });
     expect(parallel).toHaveValue(5);
@@ -77,7 +128,6 @@ describe('run settings in the Settings panel', () => {
 
   it.each([
     ['Parallel tasks', '0'],
-    ['Supervisor reads', '0'],
     ['Supervisor retries', '-1'],
     ['Parallel tasks', '2.5'],
     ['Parallel tasks', ''],
@@ -98,12 +148,36 @@ describe('run settings in the Settings panel', () => {
     expect(parallel).not.toHaveAttribute('aria-invalid', 'true');
   });
 
-  it('hides the supervisor limits while the supervisor is Off', () => {
-    expect(screen.getByRole('spinbutton', { name: 'Supervisor reads' })).toHaveValue(RUN_SETTINGS_DEFAULTS.wakeUpReadBudget);
+  it('never offers a Supervisor reads row, at Off, Watch or Act', () => {
+    for (const supervisorLevel of ['off', 'watch', 'act'] as const) {
+      settings({ supervisorLevel });
+      expect(screen.queryByRole('spinbutton', { name: 'Supervisor reads' })).toBeNull();
+      expect(screen.queryByText('Supervisor reads')).toBeNull();
+    }
+  });
+
+  it('keeps Supervisor retries and the rest when the level changes with the panel open, and never brings reads back', () => {
+    settings({ supervisorLevel: 'act' });
+    expect(screen.getByRole('spinbutton', { name: 'Supervisor retries' })).toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: 'Supervisor reads' })).toBeNull();
+
     settings({ supervisorLevel: 'off' });
     expect(screen.queryByRole('spinbutton', { name: 'Supervisor retries' })).toBeNull();
     expect(screen.queryByRole('spinbutton', { name: 'Supervisor reads' })).toBeNull();
     expect(screen.getByRole('spinbutton', { name: 'Parallel tasks' })).toBeInTheDocument();
+
+    settings({ supervisorLevel: 'watch' });
+    expect(screen.getByRole('spinbutton', { name: 'Supervisor retries' })).toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: 'Supervisor reads' })).toBeNull();
+  });
+
+  it('saves another setting without mentioning a manually configured read budget', () => {
+    settings({ supervisorLevel: 'watch', wakeUpReadBudget: 30 });
+    expect(screen.queryByRole('spinbutton', { name: 'Supervisor reads' })).toBeNull();
+
+    fireEvent.click(row('Supervisor').getByRole('button', { name: 'Off' }));
+    expect(api.postMessage).toHaveBeenCalledWith({ type: 'changeSettings', change: { run: { supervisorLevel: 'off' } } });
+    expect(api.postMessage).not.toHaveBeenCalledWith({ type: 'changeSettings', change: { run: { wakeUpReadBudget: RUN_SETTINGS_DEFAULTS.wakeUpReadBudget } } });
   });
 
   it('/settings opens a collapsed panel and a collapsed Run section, and focuses Run', () => {

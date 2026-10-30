@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -14,9 +15,11 @@ const daemon = vi.hoisted(() => ({
 const apiClient = vi.hoisted(() => ({
   // Swapped per test to hold or shape the daemon's settings reply.
   getSettings: vi.fn(async (): Promise<Record<string, unknown>> => ({})),
+  // Swapped per test to shape the runner rows, auth included.
+  getRunners: vi.fn(async (): Promise<Record<string, unknown>> => ({ runners: [], orchestratorModel: '' })),
   ApiClient: vi.fn(function stub() {
     return {
-      getRunners: async () => ({ runners: [], orchestratorModel: '' }),
+      getRunners: () => apiClient.getRunners(),
       getSettings: () => apiClient.getSettings(),
       getModels: async () => ({ models: [] }),
     };
@@ -30,6 +33,8 @@ const fakeTerminal = vi.hoisted(() => {
     draw: vi.fn(),
     close: vi.fn(),
     reset: vi.fn(),
+    suspend: vi.fn(),
+    resume: vi.fn(),
   };
   return state;
 });
@@ -49,12 +54,15 @@ vi.mock('../terminal', () => ({
       draw: fakeTerminal.draw,
       close: fakeTerminal.close,
       reset: fakeTerminal.reset,
+      suspend: fakeTerminal.suspend,
+      resume: fakeTerminal.resume,
       setMouse: vi.fn(),
     };
   }),
 }));
 
-import { handleTui } from '../index';
+import { handleTui, type LoginSpawn } from '../index';
+import { augmentedPath, clearAugmentedPathCache } from '@ordewell/core';
 
 type SignalName = 'SIGINT' | 'SIGTERM' | 'SIGHUP' | 'SIGCONT' | 'uncaughtException';
 const SIGNALS: SignalName[] = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGCONT', 'uncaughtException'];
@@ -73,6 +81,7 @@ describe('handleTui', () => {
     vi.clearAllMocks();
     fakeTerminal.draw.mockReset();
     apiClient.getSettings.mockImplementation(async () => ({}));
+    apiClient.getRunners.mockImplementation(async () => ({ runners: [], orchestratorModel: '' }));
     daemon.ensureDaemonOwned.mockImplementation(async () => ({ port: 4000, owned: true }));
     fakeTerminal.onKey = undefined;
     priorListeners = new Map(SIGNALS.map((s) => [s, listenersFor(s)]));
@@ -123,7 +132,7 @@ describe('handleTui', () => {
     void handleTui([]);
 
     await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
-    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false });
+    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false, cwd: process.cwd() });
     // With its workspace, so a session a restarted daemon dropped is re-adopted from there.
     expect(apiClient.ApiClient).toHaveBeenCalledWith(4000, process.cwd());
     const frame = fakeTerminal.draw.mock.calls[0][0] as string[];
@@ -158,6 +167,42 @@ describe('handleTui', () => {
     expect(daemon.resolvePort).not.toHaveBeenCalled();
   });
 
+  it('starts its private daemon in the workspace, so the login probe asks that account', async () => {
+    // The daemon judges a login from its own cwd's environment; started from
+    // the shell's directory instead of `--workspace`, `/login` signs one
+    // account in while the probe and the gate keep reporting the other out.
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordewell-tui-workspace-'));
+    try {
+      void handleTui(['--workspace', workspace]);
+
+      await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
+      expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false, cwd: workspace });
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves a relative --workspace once, so its daemon is not handed <ws>/<ws>', async () => {
+    // The daemon runs with the workspace as its cwd. A raw `sub` sent on each
+    // request is then resolved again against the daemon's cwd, so the probe
+    // reads a directory that does not exist and ignores the workspace's env.
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ordewell-tui-relative-'));
+    const cwd = process.cwd();
+    try {
+      fs.mkdirSync(path.join(parent, 'sub'), { recursive: true });
+      process.chdir(parent);
+      void handleTui(['--workspace', 'sub']);
+
+      await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
+      const resolved = path.resolve('sub');
+      expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false, cwd: resolved });
+      expect(apiClient.ApiClient).toHaveBeenCalledWith(4000, resolved);
+    } finally {
+      process.chdir(cwd);
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it('drives the well-known daemon instead when --port is passed explicitly', async () => {
     daemon.resolvePort.mockReturnValueOnce(3742);
     void handleTui(['--port', '3742']);
@@ -165,7 +210,7 @@ describe('handleTui', () => {
     await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
     expect(daemon.resolvePort).toHaveBeenCalledWith(['--port', '3742']);
     expect(daemon.findFreePort).not.toHaveBeenCalled();
-    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(3742, { detached: false });
+    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(3742, { detached: false, cwd: process.cwd() });
   });
 
   it('honours ORDEWELL_AUTONOMOUS_MODE=false from the environment', async () => {
@@ -188,6 +233,9 @@ describe('handleTui', () => {
       fs.mkdirSync(path.join(home, '.ordewell'), { recursive: true });
       vi.stubEnv('HOME', home);
       vi.stubEnv('USERPROFILE', home);
+      // SettingsService prefers this over the home directory, so an ambient
+      // override would make the fixture under HOME dead code.
+      vi.stubEnv('ORDEWELL_SETTINGS_PATH', path.join(home, '.ordewell', 'settings.json'));
       vi.stubEnv('NO_COLOR', '1');
     });
     afterEach(() => {
@@ -198,6 +246,14 @@ describe('handleTui', () => {
     const firstFrame = (): string =>
       // eslint-disable-next-line no-control-regex
       (fakeTerminal.draw.mock.calls[0][0] as string[]).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+
+    it('shows Guarded on the first frame of a fresh install', async () => {
+      void handleTui([]);
+
+      await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
+      expect(firstFrame()).toMatch(/Autonomy\s+Guarded/);
+      expect(firstFrame()).not.toMatch(/Autonomy\s+Full/);
+    });
 
     it('warns, and does not promise approval, when the saved settings have autorun on', async () => {
       fs.writeFileSync(path.join(home, '.ordewell', 'settings.json'), JSON.stringify({ autorun: true }));
@@ -305,6 +361,37 @@ describe('handleTui', () => {
     expect(daemon.stopDaemon).toHaveBeenCalledWith(4000);
   });
 
+  it('waits for the owned daemon\'s stop before exiting, so the stop is not abandoned', async () => {
+    let stopped!: () => void;
+    daemon.stopDaemon.mockImplementationOnce(() => new Promise<void>((resolve) => { stopped = resolve; }));
+    void handleTui([]);
+    await vi.waitFor(() => expect(fakeTerminal.onKey).toBeDefined());
+
+    fakeTerminal.onKey!({ name: 'ctrl-c' });
+
+    await vi.waitFor(() => expect(daemon.stopDaemon).toHaveBeenCalledWith(4000));
+    expect(fakeTerminal.close).toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    stopped();
+    await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
+  });
+
+  it('exits after a bounded wait when the owned daemon\'s stop never settles', async () => {
+    daemon.stopDaemon.mockImplementationOnce(() => new Promise<void>(() => {}));
+    void handleTui([]);
+    await vi.waitFor(() => expect(fakeTerminal.onKey).toBeDefined());
+    vi.useFakeTimers();
+    try {
+      fakeTerminal.onKey!({ name: 'ctrl-c' });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(exitSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('leaves a daemon it did not spawn running on exit', async () => {
     daemon.ensureDaemonOwned.mockResolvedValueOnce({ port: 4000, owned: false });
     void handleTui([]);
@@ -314,5 +401,110 @@ describe('handleTui', () => {
 
     await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
     expect(daemon.stopDaemon).not.toHaveBeenCalled();
+  });
+
+  describe('/login', () => {
+    const signedOut = {
+      id: 'claude-code', name: 'Claude Code', enabled: true,
+      auth: { state: 'signed-out', loginCommand: ['claude', 'login'] },
+    };
+    const signedIn = {
+      ...signedOut,
+      auth: { state: 'signed-in', loginCommand: ['claude', 'login'] },
+    };
+
+    const frame = (): string =>
+      // eslint-disable-next-line no-control-regex
+      (fakeTerminal.draw.mock.calls.at(-1)![0] as string[]).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+
+    const type = (text: string): void => {
+      for (const char of text) fakeTerminal.onKey!({ name: 'char', char });
+      fakeTerminal.onKey!({ name: 'enter' });
+    };
+
+    /** A `/login` typed at a TUI whose active planner is a signed-out Claude Code. */
+    async function signedOutTui(): Promise<{ child: EventEmitter; spawn: ReturnType<typeof vi.fn> }> {
+      apiClient.getSettings.mockImplementation(async () => ({ aiProvider: 'claude-code' }));
+      apiClient.getRunners.mockImplementation(async () => ({ runners: [signedOut], orchestratorModel: '' }));
+      const child = new EventEmitter();
+      const spawn = vi.fn(() => child);
+      vi.stubEnv('NO_COLOR', '1');
+      void handleTui([], { spawn: spawn as unknown as LoginSpawn });
+
+      await vi.waitFor(() => expect(frame()).toContain('Claude Code not logged in'));
+      return { child, spawn };
+    }
+
+    it('hands the terminal to the command the runner declares, then takes it back and repaints sign-in', async () => {
+      const { child, spawn } = await signedOutTui();
+
+      type('/login');
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalled());
+
+      expect(fakeTerminal.suspend).toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledWith('claude', ['login'], expect.objectContaining({
+        stdio: 'inherit',
+        cwd: process.cwd(),
+      }));
+
+      // The daemon's fresh probe finds the account signed in; the reload after
+      // the child is what lets the red line clear without a /refresh.
+      apiClient.getRunners.mockImplementation(async () => ({ runners: [signedIn], orchestratorModel: '' }));
+      child.emit('exit', 0, null);
+
+      await vi.waitFor(() => expect(fakeTerminal.resume).toHaveBeenCalled());
+      await vi.waitFor(() => expect(frame()).toContain('Claude Code is signed in.'));
+      expect(frame()).not.toContain('Claude Code not logged in');
+      vi.unstubAllEnvs();
+    });
+
+    it('runs the login with the same augmented PATH the probe and planner-spawn use', async () => {
+      // A GUI-launched TUI inherits a minimal PATH; the probe and the planner
+      // find an agent in ~/.local/bin, so its own login must start too.
+      const { child, spawn } = await signedOutTui();
+      const original = process.env.PATH;
+      try {
+        process.env.PATH = '/definitely-not-a-real-bin';
+        clearAugmentedPathCache();
+        type('/login');
+        await vi.waitFor(() => expect(spawn).toHaveBeenCalled());
+
+        const env = vi.mocked(spawn).mock.calls[0][2]?.env as NodeJS.ProcessEnv;
+        expect(await augmentedPath()).toContain(path.join(os.homedir(), '.local', 'bin'));
+        expect(env.PATH).toContain(path.join(os.homedir(), '.local', 'bin'));
+        child.emit('exit', 1, null);
+      } finally {
+        process.env.PATH = original;
+        clearAugmentedPathCache();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('takes the terminal back and names the command when the login cannot start', async () => {
+      const { child } = await signedOutTui();
+
+      type('/login');
+      await vi.waitFor(() => expect(fakeTerminal.suspend).toHaveBeenCalled());
+      child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }));
+
+      await vi.waitFor(() => expect(fakeTerminal.resume).toHaveBeenCalled());
+      await vi.waitFor(() => expect(frame()).toContain('Could not run claude'));
+      vi.unstubAllEnvs();
+    });
+
+    it('lets the login keep its own Ctrl-C, so cancelling it does not take the TUI down', async () => {
+      const { child } = await signedOutTui();
+
+      type('/login');
+      await vi.waitFor(() => expect(fakeTerminal.suspend).toHaveBeenCalled());
+      // The tty delivers Ctrl-C to the whole foreground group, the child
+      // included; the parent's handler must leave the login to it.
+      process.emit('SIGINT');
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      child.emit('exit', 130, null);
+      await vi.waitFor(() => expect(fakeTerminal.resume).toHaveBeenCalled());
+      vi.unstubAllEnvs();
+    });
   });
 });

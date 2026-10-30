@@ -51,6 +51,18 @@ describe('reduceRun', () => {
     expect(view.usage).toEqual({ attempts: 1, totals: { inputTokens: 10, outputTokens: 5 }, byModel: [], wallTimeMs: 0 });
   });
 
+  it('carries the run activity a status update says, from an idle run to a start on its way', () => {
+    expect(EMPTY_RUN.activity).toEqual({ starting: false, running: false, scheduled: false, resumable: false, advancesOnItsOwn: false });
+
+    const view = play([{
+      type: 'status_update',
+      tasks: [],
+      activity: { starting: true, running: false, scheduled: true, resumable: false, advancesOnItsOwn: true },
+    }]);
+
+    expect(view.activity).toEqual({ starting: true, running: false, scheduled: true, resumable: false, advancesOnItsOwn: true });
+  });
+
   describe('task messages', () => {
     const waiting = play([
       generated([planned('t1', 1, { status: 'awaiting_user', awaitingReason: 'usage-limit', resumeAt: '2026-10-13T10:00:00.000Z', subtasks: [planned('t1.1', 1)] })]),
@@ -227,6 +239,7 @@ describe('reduceRun', () => {
     const statusOnly: [string, Partial<SerializedTaskStatus>][] = [
       ['verdict', { verdict: { outcome: 'fail', reason: 'tests failed', checks: [] } }],
       ['idleSince', { idleSince: '2026-10-13T09:05:00.000Z' }],
+      ['completionReceived', { completionReceived: 'done' }],
       ['isolation', { isolation }],
       ['queued', { queued: [{ id: 'q1', text: 'also update the docs' }] }],
       ['continuable', { continuable: true }],
@@ -234,6 +247,7 @@ describe('reduceRun', () => {
       ['mergeGate', { mergeGate: ['t0'] }],
       ['forcedPastGate', { forcedPastGate: ['Add the limiter'] }],
       ['handoff', { handoff: { summary: 'Done.', findings: [], findingCount: 0 } }],
+      ['attempted', { attempted: true }],
     ];
 
     it.each(statusOnly)('keeps %s from the last status update', (_field, status) => {

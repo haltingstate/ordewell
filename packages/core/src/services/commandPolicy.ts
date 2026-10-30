@@ -46,7 +46,7 @@ import type { ShellDialect } from './researchShell';
 import { SHELL_STATE_COMMANDS, dialectFor, lexAll, literalCdTarget, type Segment } from './shellLexer';
 import { REFUSED_RUNNERS, XARGS_TARGETS, unwrap } from './commandRunners';
 import { FLAG_POLICY, UNIVERSAL_FLAGS, flagLabel, matchFlag, scanFlags, subcommandOf, takesNextToken, valueFlagIn } from './flagPolicy';
-import { AWK_FAMILY, SED_FAMILY, awkProgramArgs, awkRefusal, sedOnlyPrints, sedProgramArgs, sedRefusal } from './filterPrograms';
+import { AWK_FAMILY, JQ_FAMILY, SED_FAMILY, awkProgramArgs, awkRefusal, jqRefusal, sedOnlyPrints, sedProgramArgs, sedRefusal } from './filterPrograms';
 import { commandAllowedBy, commandExcludedBy, scopeExcluded, type PlannerAllowlist } from './plannerAllowlist';
 import { EFFECT_REFUSAL_HINT, READ_REFUSAL_HINT, webCommand, wgetVersionCommands } from './webCommands';
 import { EFFECT_ROUTE } from './effectRoute';
@@ -74,18 +74,64 @@ export const AUTO_COMMANDS = [
  * read-only against the repository. It reaches the network: it contacts
  * whatever host the named remote or URL resolves to, which routes around the
  * web fetcher's per-origin approval and its request-forgery guard. So it
- * prompts rather than running silently.
- *
- * Prompting only became the right answer once {@link scopeFor} widened. Under
- * the old scope it would have been remembered as `git ls-remote`, so one
- * approval of the workspace's own remote would have authorised a listing
- * against any host at all — which is the same hole with an approval dialog in
- * front of it. The scope now carries the destination.
+ * prompts rather than running silently, and only for a remote the repository
+ * configures: a destination the line spells out is refused
+ * ({@link namesConfiguredRemote}), and the grant is the whole line
+ * ({@link gitScope}), so no approval of one remote covers another.
  */
 export const GIT_READONLY_SUBCOMMANDS = [
   'log', 'status', 'diff', 'show', 'ls-files', 'ls-tree', 'branch', 'tag',
   'rev-parse', 'rev-list', 'describe', 'blame', 'grep', 'shortlog', 'whatchanged', 'cat-file',
 ];
+
+const onlyAction = (...reads: string[]) => (after: string[]): boolean =>
+  after[0] === undefined || reads.includes(after[0]);
+
+/**
+ * The git subcommands outside {@link GIT_READONLY_SUBCOMMANDS} that may run once
+ * approved, each with a test of the arguments after it under which it only
+ * reads. Every other subcommand is refused.
+ *
+ * An allowlist because a list of git's writers was never complete: with
+ * `rm`, `mv` and the rest refused, `git symbolic-ref HEAD refs/heads/x`,
+ * `git hash-object -w`, `git update-server-info` and `git commit-graph write`
+ * still asked, and the first two share a scope with their read, so one
+ * approval of the read ran the write with no second prompt. An alias the
+ * repository defines is refused with them: it can run a shell command.
+ *
+ * The test reads positionally: a subcommand's action is the word right after
+ * it, and `symbolic-ref` with a second name writes, so a flag value counted as
+ * a name refuses rather than asks.
+ */
+const GIT_PROMPTABLE: Record<string, (after: string[]) => boolean> = {
+  'ls-remote': () => true,
+  'for-each-ref': () => true,
+  'show-ref': () => true,
+  'name-rev': () => true,
+  'merge-base': () => true,
+  'count-objects': () => true,
+  'cherry': () => true,
+  'range-diff': () => true,
+  'diff-tree': () => true,
+  'diff-files': () => true,
+  'diff-index': () => true,
+  'show-branch': () => true,
+  'annotate': () => true,
+  'check-ignore': () => true,
+  'check-attr': () => true,
+  'check-ref-format': () => true,
+  'check-mailmap': () => true,
+  'var': () => true,
+  'version': () => true,
+  'worktree': onlyAction('list'),
+  'notes': onlyAction('list', 'show'),
+  'bisect': onlyAction('log'),
+  'sparse-checkout': onlyAction('list'),
+  'reflog': onlyAction('show', 'exists'),
+  'symbolic-ref': (after) => after.filter((a) => !a.startsWith('-')).length <= 1,
+  // `-w` writes the object; git's shared flag set keeps it for `git diff -w`.
+  'hash-object': (after) => !after.some((a) => /^-[^-]*w/.test(a)),
+};
 
 /**
  * Never runs, with or without approval.
@@ -109,11 +155,20 @@ export const REFUSED_COMMANDS = [
   'taskkill', 'tskill', 'reg', 'regedit', 'sc', 'net', 'runas', 'schtasks',
 ];
 
-/** Destructive or outward-facing subcommands of otherwise-permitted multiplexers. */
+/**
+ * Destructive or outward-facing subcommands of otherwise-permitted multiplexers.
+ *
+ * git's list names its commonest writers so the refusal says so; any other
+ * subcommand not known to read is refused by {@link GIT_PROMPTABLE}.
+ */
 const REFUSED_SUBCOMMANDS: Record<string, string[]> = {
   git: ['push', 'reset', 'clean', 'checkout', 'switch', 'restore', 'rebase', 'merge', 'commit',
     'am', 'apply', 'cherry-pick', 'revert', 'stash', 'gc', 'prune', 'filter-branch',
-    'update-ref', 'remote', 'config', 'init', 'clone', 'fetch', 'pull', 'submodule'],
+    'update-ref', 'remote', 'config', 'init', 'clone', 'fetch', 'pull', 'submodule',
+    'add', 'rm', 'mv', 'format-patch', 'replace', 'mergetool',
+    'repack', 'update-index', 'read-tree', 'checkout-index', 'merge-file', 'bundle',
+    'commit-tree', 'write-tree', 'mktree', 'mktag', 'unpack-objects', 'fast-import',
+    'pack-refs', 'prune-packed', 'maintenance'],
   npm: ['publish', 'unpublish', 'deprecate', 'owner', 'access', 'token', 'login', 'logout'],
   yarn: ['publish', 'npm'],
   pnpm: ['publish'],
@@ -295,7 +350,8 @@ export interface CommandClassification {
   /** Separate grants for commands that name several origins. */
   scopes?: string[];
   webUrls?: URL[];
-  webOutboundTexts?: string[];
+  /** What a network-reaching command sends, for the outbound secret check (ADR-0027): a web command's URLs and values, a remote listing's remote and patterns. */
+  outboundTexts?: string[];
   /** What a grant covers, for `ask`. Derived from the non-auto segments only. */
   scope: string;
   /** Populated for `refuse`: why, in a sentence the model can act on. */
@@ -567,12 +623,15 @@ const SCOPE_LEAD_ARGS = 2;
  * declared flag sets to find a subcommand, and that is right for deciding a
  * tier; here it would mean the scope depends on how completely a binary's flags
  * happen to be declared, so the same command line could widen its own grant as
- * the flag tables change.
+ * the flag tables change. git, whose flags are all declared, is the exception:
+ * see {@link gitScope}.
  */
 function scopeFor(seg: Segment): string {
   // A program named by its path keeps the path: a grant for `gh` is not one for the repository's `./bin/gh`.
   const name = seg.binaryPath ?? seg.binary;
-  if (!MULTIPLEXERS.includes(seg.binary.toLowerCase())) return name;
+  const program = programName(seg.binary);
+  if (!MULTIPLEXERS.includes(program)) return name;
+  if (program === 'git') return gitScope(seg, name);
   const lead: string[] = [];
   for (const arg of seg.args) {
     if (arg.startsWith('-')) break;
@@ -580,6 +639,48 @@ function scopeFor(seg: Segment): string {
     if (lead.length === SCOPE_LEAD_ARGS) break;
   }
   return [name, ...lead].join(' ');
+}
+
+/**
+ * git's scope, read from its operands rather than its leading words.
+ *
+ * git is the one multiplexer whose every flag is declared ({@link FLAG_POLICY}),
+ * and one it does not know is refused, so a git command that asks has had each
+ * flag and its value read: the walk cannot widen a grant the way the note on
+ * {@link scopeFor} fears. Stopping at the first flag here emptied the lead for
+ * the commonest spelling of all, `git -C <dir> …`, and one approval of a
+ * worktree listing became a grant for bare `git`.
+ *
+ * `ls-remote` is scoped to its whole command line. It reaches whichever
+ * address the repository `-C` chooses configures for the remote it names, so
+ * the directory, the remote and the patterns it sends all belong in what was
+ * approved, and a flag before them must not drop them from the scope.
+ */
+function gitScope(seg: Segment, name: string): string {
+  const scan = scanFlags({ ...seg, binary: 'git' });
+  if (!scan || scan.unknown || scan.operands[0] === 'ls-remote') return [name, ...seg.args].map(scopeWord).join(' ');
+  return [name, ...scan.operands.slice(0, SCOPE_LEAD_ARGS)].join(' ');
+}
+
+/** A word as an exact scope shows it: quoted where a space or quote would make two spellings read alike. */
+function scopeWord(word: string): string {
+  return word === '' || /[\s"'\\]/.test(word) ? JSON.stringify(word) : word;
+}
+
+/**
+ * A file name word the shell may expand through `..`. bash 3.2 (macOS
+ * `/bin/sh`) and dash let a name segment that starts with a dot match `..`,
+ * so `.?`, `.*` and `.[.]` climb out of the workspace under a spelling that
+ * {@link looksLikePath} and lexical confinement both read as inside it. The
+ * lexer only says some word in the segment is an unquoted glob, so a quoted
+ * look-alike beside one asks too; patterns are skipped, since they are never
+ * opened (ADR-0008).
+ */
+function climbsByGlob(seg: Segment): boolean {
+  if (!seg.globbed) return false;
+  const patterns = patternArgs(seg);
+  return [...seg.args.filter((_, i) => !patterns.has(i)), ...seg.inputs]
+    .some((a) => /(^|[\\/])\.[*?[]/.test(a));
 }
 
 function isAuto(seg: Segment, opts: CommandPolicyOptions): boolean {
@@ -600,9 +701,70 @@ function isAuto(seg: Segment, opts: CommandPolicyOptions): boolean {
   // confinement escape this file exists to close, so treat any variable
   // reference as disqualifying the fast path rather than trying to resolve it.
   if (seg.expandable) return false;
+  if (climbsByGlob(seg)) return false;
   if (seg.binary !== 'git') return true;
   const sub = subcommandOf(seg);
   return sub !== undefined && GIT_READONLY_SUBCOMMANDS.includes(sub);
+}
+
+/**
+ * A short flag, alone or inside a cluster, that git's shared flag set reads as
+ * taking a value (for `git log`) but that under `git branch`/`git tag` is a
+ * force, move or copy whose operand is the ref it writes: `git tag -f v1`,
+ * `git branch -qC copied`. Read that way it swallowed the ref name, so the
+ * positional check never saw one. `-n` is spared: `git tag -n` lists.
+ */
+function swallowsRefName(arg: string): boolean {
+  if (!/^-[^-]/.test(arg)) return false;
+  const values = FLAG_POLICY.git.values ?? [];
+  return [...arg.slice(1)].some((c) => c !== 'n' && values.includes(`-${c}`));
+}
+
+/**
+ * The arguments after git's subcommand, located by walking git's flags. The
+ * first word spelled like the subcommand is not it: in `git -C worktree
+ * worktree list` that word is the directory.
+ */
+function gitArgsAfterSubcommand(seg: Segment): string[] {
+  const at = scanFlags(seg)?.operandAt[0];
+  return at === undefined ? [] : seg.args.slice(at + 1);
+}
+
+/** A word git can only read as the name of a configured remote: no scheme, host separator, path or expansion. */
+const REMOTE_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+/**
+ * Whether `git ls-remote` lists a remote the repository configures, or its
+ * default one, rather than a destination the command line spells out. A URL,
+ * an scp-style `host:path`, a `transport::address` or a path is refused, not
+ * asked: git connects to it with its own resolver and follows a redirect, so
+ * no approval of the text can say where the request lands.
+ */
+function namesConfiguredRemote(seg: Segment, after: string[]): boolean {
+  const destination = scanFlags({ ...seg, args: after })?.operands[0];
+  return destination === undefined || REMOTE_NAME.test(destination);
+}
+
+/**
+ * The program a binary name runs, as refusal and scope read it. Git Bash, the
+ * Windows research shell, lexes as posix, so `git.exe` reaches the tiers with
+ * its suffix where the cmd dialect strips it, and it missed every git refusal.
+ * Only refusal and scope read it: the silent tier stays exact.
+ */
+function programName(binary: string): string {
+  return binary.toLowerCase().replace(/\.exe$/, '');
+}
+
+function isRemoteListing(seg: Segment): boolean {
+  const git = { ...seg, binary: programName(seg.binary) };
+  return git.binary === 'git' && subcommandOf(git) === 'ls-remote';
+}
+
+/** The words `git ls-remote` sends its remote: the remote's name and the patterns, which protocol v2 passes on as ref prefixes. */
+function remoteListingTexts(seg: Segment): string[] {
+  if (!isRemoteListing(seg)) return [];
+  const git = { ...seg, binary: 'git' };
+  return scanFlags({ ...git, args: gitArgsAfterSubcommand(git) })?.operands ?? [];
 }
 
 function refusalFor(seg: Segment, trustedResolves?: ReadonlySet<string>): string | undefined {
@@ -668,8 +830,28 @@ function refusalFor(seg: Segment, trustedResolves?: ReadonlySet<string>): string
   // the subcommand, so these have to be caught here.
   if (seg.binary === 'git') {
     const sub = subcommandOf(seg);
+    const after = gitArgsAfterSubcommand(seg);
+    if (sub !== undefined && !GIT_READONLY_SUBCOMMANDS.includes(sub)) {
+      const reads = GIT_PROMPTABLE[sub];
+      if (!reads) {
+        return `"git ${sub}" is not a git subcommand known only to read, so it may write the repository. You are a read-only planner: ${EFFECT_ROUTE}`;
+      }
+      if (!reads(after)) {
+        return `"git ${[sub, ...after].join(' ')}" is not a read-only form of "git ${sub}". You are a read-only planner: ${EFFECT_ROUTE}`;
+      }
+    }
+    if (sub === 'ls-remote' && !namesConfiguredRemote(seg, after)) {
+      return `"git ls-remote" given a URL, an address or a path reaches it through git's own transport, which resolves the host itself and follows a redirect, so the origin approval, address guard and pinned connection a web read gets (ADR-0027) cannot hold for it. Name a remote the repository configures, such as "git ls-remote origin", or fetch the page with your web fetch tool.`;
+    }
+    // The secret check and the grant read the words as written, and the shell
+    // sends what they expand to: `$TOKEN` passed as text and left as its value.
+    // No ref name holds a `~`, so one is only ever the home directory.
+    if (sub === 'ls-remote' && (seg.expandable || seg.globbed || after.some((a) => a.includes('~')))) {
+      return `The shell rewrites part of this "git ls-remote" before git sees it (a variable, substitution, glob or "~"), so what it sends the remote, and which repository it lists, cannot be checked for a secret or approved. Write the remote and patterns literally, in single quotes where they hold a "*", and re-run.`;
+    }
     if (sub === 'branch' || sub === 'tag') {
-      const flag = seg.args.find((a) => ['-D', '-d', '-m', '-M', '--delete', '--move'].includes(a));
+      const flag = seg.args.find((a) => ['-D', '-d', '-m', '-M', '--delete', '--move'].includes(a))
+        ?? after.find(swallowsRefName);
       if (flag) {
         return `"git ${sub} ${flag}" mutates refs. You are a read-only planner: ${EFFECT_ROUTE}`;
       }
@@ -696,14 +878,17 @@ function refusalFor(seg: Segment, trustedResolves?: ReadonlySet<string>): string
     }
   }
   // sed and awk carry a program that can run a command or write a file with no
-  // flag involved (see filterPrograms.ts), so the program itself is read. One
-  // the shell rewrites first cannot be: a `$` that survives lexing may be an
-  // expansion, and which token holds it is not tracked.
-  if (SED_FAMILY.includes(seg.binary) || AWK_FAMILY.includes(seg.binary)) {
+  // flag involved, and jq and yq one that can read the environment or load a
+  // file no argument names (see filterPrograms.ts), so the program itself is
+  // read. One the shell rewrites first cannot be: a `$` that survives lexing
+  // may be an expansion, and which token holds it is not tracked.
+  if (SED_FAMILY.includes(seg.binary) || AWK_FAMILY.includes(seg.binary) || JQ_FAMILY.includes(seg.binary)) {
     if (AWK_FAMILY.includes(seg.binary) && seg.args.some((a) => a === 'inplace')) {
       return `"${seg.binary} -i inplace" edits files in place. You are a read-only planner — describe the change as a task instead.`;
     }
-    const program = SED_FAMILY.includes(seg.binary) ? sedRefusal(seg.binary, seg.args) : awkRefusal(seg.binary, seg.args);
+    const program = SED_FAMILY.includes(seg.binary) ? sedRefusal(seg.binary, seg.args)
+      : AWK_FAMILY.includes(seg.binary) ? awkRefusal(seg.binary, seg.args)
+        : jqRefusal(seg.binary, seg.args);
     if (program) return program;
     if (seg.expandable) {
       return `The shell rewrites part of this "${seg.binary}" command before "${seg.binary}" sees it, so its program cannot be inspected. Put the program in single quotes, name files literally, and re-run.`;
@@ -877,12 +1062,12 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
       return { tier: 'refuse', scope: '', reason: `curl and wget are refused in Full and allowlist mode. ${web.effect ? EFFECT_REFUSAL_HINT : READ_REFUSAL_HINT}` };
     }
     const allow = opts.allow;
-    if (web && allow && web.urls.some((url) => scopeExcluded(allow, `${seg.binary.toLowerCase().replace(/\.exe$/, '')} ${url.origin}/*`))) {
+    if (web && allow && web.urls.some((url) => scopeExcluded(allow, `${programName(seg.binary)} ${url.origin}/*`))) {
       return { tier: 'refuse', scope: '', reason: `The web origin is excluded by the planner allowlist. ${READ_REFUSAL_HINT}` };
     }
     // Matched case-insensitively: cmd.exe builtins and the default macOS and
     // Windows filesystems all take `RM` or `Del` for the refused name.
-    const reason = refusalFor({ ...seg, binary: seg.binary.toLowerCase() }, opts.trustedWebResolves);
+    const reason = refusalFor({ ...seg, binary: programName(seg.binary) }, opts.trustedWebResolves);
     if (reason) return { tier: 'refuse', scope: '', reason: withWrapperNote(reason, wrappers) };
     if (runner && !XARGS_TARGETS.includes(seg.binary)) {
       return {
@@ -893,7 +1078,7 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
     }
   }
 
-  if (unwrapped.some(({ seg }) => seg.binary.toLowerCase().replace(/\.exe$/, '') === 'wget')
+  if (unwrapped.some(({ seg }) => programName(seg.binary) === 'wget')
     && wgetVersionCommands(command, opts.dialect).includes(undefined)) {
     return { tier: 'refuse', scope: '', reason: `The wget executable cannot be checked safely in this working directory. ${READ_REFUSAL_HINT}` };
   }
@@ -914,14 +1099,25 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   // approving `cd "$HOME"` once would wave through `cd "$HOME" && cat
   // .ssh/id_rsa` later. Its grant is the line the human read. `command` is
   // left out: `command cd` is unwrapped to `cd`, so what remains is a lookup.
+  // A glob that can climb through `..` is held to the line for the same
+  // reason: under `cat`, one approval would cover every later file it names.
+  // A `cd` that runs silently still picks the repository a remote listing
+  // reaches, as `-C` does, so that listing is held to the line too: under its
+  // own words, approving `origin` in one repository covered `origin` in every
+  // other (ADR-0027). So does a wrapper (`env -C`, `env -u HOME`), whose own
+  // words never reach a scope, and anything else on the line that asks: it may
+  // be a name that moves the shell no list here holds (a cmd.exe drive switch,
+  // `cd..`), and its scope keeps only its name.
+  const changesDirectory = unwrapped.some(({ seg }) => seg.binary.toLowerCase() === 'cd');
   const lineScoped = nonAuto.some((u) => {
     const name = u.seg.binary.toLowerCase();
-    return name === 'cd' || (name !== 'command' && SHELL_STATE_COMMANDS.has(name));
+    return name === 'cd' || (name !== 'command' && SHELL_STATE_COMMANDS.has(name)) || climbsByGlob(u.seg)
+      || (isRemoteListing(u.seg) && (changesDirectory || u.wrappers.length > 0 || nonAuto.length > 1));
   });
   const webUrls = nonAuto.flatMap((u) => webCommand(u.seg, opts.trustedWebResolves)?.urls ?? []);
-  const webOutboundTexts = nonAuto.flatMap((u) => webCommand(u.seg, opts.trustedWebResolves)?.outboundTexts ?? []);
+  const outboundTexts = nonAuto.flatMap((u) => webCommand(u.seg, opts.trustedWebResolves)?.outboundTexts ?? remoteListingTexts(u.seg));
   if (lineScoped && webUrls.length === 0) {
-    return { tier: 'ask', scope: trimmed };
+    return { tier: 'ask', scope: trimmed, ...(outboundTexts.length ? { outboundTexts } : {}) };
   }
 
   // A grant covers only the parts that actually needed one, so
@@ -930,7 +1126,7 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   // never covers `xargs cat`.
   const scopes = [...new Set(nonAuto.flatMap((u) => {
     const web = webCommand(u.seg, opts.trustedWebResolves);
-    return web ? web.urls.map((url) => `${u.seg.binary.toLowerCase().replace(/\.exe$/, '')} ${url.origin}/*`)
+    return web ? web.urls.map((url) => `${programName(u.seg.binary)} ${url.origin}/*`)
       : [lineScoped ? trimmed : u.runner ? `${u.runner} ${scopeFor(u.seg)}` : scopeFor(u.seg)];
   }))].sort();
   const scope = scopes.join(' + ');
@@ -938,7 +1134,8 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   const allowedBy = opts.allow && !perInvocation && !lineScoped ? allowlistRule(nonAuto, opts.allow, opts.trustedWebResolves) : undefined;
   return {
     tier: 'ask', scope,
-    ...(webUrls.length ? { webUrls, webOutboundTexts } : {}),
+    ...(webUrls.length ? { webUrls } : {}),
+    ...(outboundTexts.length ? { outboundTexts } : {}),
     ...(scopes.length > 1 && webUrls.length ? { scopes } : {}),
     ...(perInvocation ? { perInvocation } : {}),
     ...(allowedBy ? { allowedBy } : {}),

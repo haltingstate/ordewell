@@ -152,6 +152,7 @@ describe('ordewell plan with an inherited planner model', () => {
     recordInstalledPlanner('claude-code');
     const runner: IRunner = { activeCount: 0, spawn: vi.fn(), stop: vi.fn(), stopAll: vi.fn() } as unknown as IRunner;
     pool = new OrchestratorPool({
+      accountLimitCollectors: () => [],
       modelResolver: inertResolver(),
       runner,
       runnerInstallation: { plannerUsability: async () => ({ usable: true as const }), filterInstalled: async (ids: string[]) => ids.filter((id) => id === 'claude-code') },
@@ -162,7 +163,7 @@ describe('ordewell plan with an inherited planner model', () => {
     const port = (server.address() as AddressInfo).port;
     const { token, file } = mintDaemonToken(port);
     const admission = { port, token, tokenFile: file };
-    server.on('request', createRequestListener(createApp(pool, admission)));
+    server.on('request', createRequestListener(createApp(pool, admission), admission));
     attachWsHandler(server, pool, admission);
     client = new ApiClient(port, workspace);
   });

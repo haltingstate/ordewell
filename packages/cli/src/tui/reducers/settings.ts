@@ -32,8 +32,8 @@ const supervisorOff = (_state: TuiState, choices: StepChoices): boolean => choic
 // their minimum up, with no ceiling (parseCount, parseMaxParallel).
 export const SETTINGS: StepperDefinition = {
   title: 'Settings',
-  advanceOnEnter: false,
-  hint: 'Saved for this run and every later one. Each choice is saved when you press enter.',
+  afterSave: 'stay',
+  hint: 'Supervisor, automerge and autorun apply to this session; your last change is the default for new ones. Autonomy and Parallel tasks apply to every session.',
   steps: [
     {
       id: 'autonomy',
@@ -63,13 +63,6 @@ export const SETTINGS: StepperDefinition = {
       number: { min: 0, current: (state) => state.runSettings.supervisorRetryLimit },
     },
     {
-      id: 'reads',
-      label: 'Supervisor reads',
-      hint: 'How many reads the supervisor may make each time it wakes up',
-      skip: supervisorOff,
-      number: { min: 1, current: (state) => state.runSettings.wakeUpReadBudget },
-    },
-    {
       id: 'automerge',
       label: 'Automerge',
       items: (state) => switchItems(
@@ -90,7 +83,7 @@ export const SETTINGS: StepperDefinition = {
     {
       id: 'parallel',
       label: 'Parallel',
-      hint: 'How many AI tasks run at once, a live run included; research tasks use the same slots',
+      hint: 'How many AI tasks run at once, a live run included',
       number: { min: 1, current: (state) => state.maxParallel },
     },
   ],
@@ -118,10 +111,6 @@ function saveChoices(state: TuiState, choices: StepChoices): Step {
   if (choices.retries !== undefined && Number(choices.retries) !== state.runSettings.supervisorRetryLimit) {
     run.supervisorRetryLimit = Number(choices.retries);
     changed.push(`Supervisor retries ${choices.retries}`);
-  }
-  if (choices.reads !== undefined && Number(choices.reads) !== state.runSettings.wakeUpReadBudget) {
-    run.wakeUpReadBudget = Number(choices.reads);
-    changed.push(`Supervisor reads ${choices.reads}`);
   }
   const automerge = choices.automerge === 'on';
   if (automerge !== state.runSettings.mergeAtGatesAutomatically) {
@@ -152,7 +141,7 @@ function saveChoices(state: TuiState, choices: StepChoices): Step {
       kind: 'confirm',
       title: 'Save this setting?',
       message: effect.message,
-      note: `${risks.join('\n')}\nIt applies to this session's run now, and to every later run.`,
+      note: `${risks.join('\n')}\nIt applies to this session's run now, and is the default for new ones.`,
       action: { kind: 'save-settings', effect, ...(state.overlay?.kind === 'stepper' ? { menu: state.overlay.stepper } : {}) },
     },
   });

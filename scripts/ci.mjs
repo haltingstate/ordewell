@@ -8,12 +8,16 @@
 // CI-only with the reason: a step added to the workflow and not here fails
 // this script before anything runs, so the two cannot drift apart unnoticed.
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const MOCK_PROVIDER_PORT = 3799;
+
+// Nothing in a CI run may reach ordewell.ai (ADR-0048); every step below
+// inherits this. ci.yml sets it for the job too.
+process.env.ORDEWELL_NO_VERSION_CHECK = '1';
 
 const sh = (cmd, args, env) => spawnSync(cmd, args, { stdio: 'inherit', env: { ...process.env, ...env } }).status ?? 1;
 const npm = (...args) => sh('npm', args);
@@ -76,6 +80,43 @@ function integrationTest() {
     : sh('npm', ['run', 'test:integration', '-w', 'ordewell'], env);
 }
 
+/**
+ * CI installs exactly the lockfile with `npm ci`; a local run uses whatever
+ * node_modules holds, which can drift from it without npm noticing (its own
+ * node_modules/.package-lock.json may still claim the locked version). A
+ * stale @vscode/test-electron 2.x, for one, fails the integration test minutes
+ * in with `spawn .../Contents/MacOS/Electron ENOENT`. A package absent from
+ * disk is an optional or other-platform one and is not checked.
+ */
+function installedMatchesLockfile() {
+  const { packages } = JSON.parse(readFileSync('package-lock.json', 'utf8'));
+  const drifted = [];
+  for (const [dir, locked] of Object.entries(packages)) {
+    if (!dir.includes('node_modules/') || locked.link || !locked.version) continue;
+    const manifest = join(dir, 'package.json');
+    if (!existsSync(manifest)) continue;
+    const { version } = JSON.parse(readFileSync(manifest, 'utf8'));
+    if (version !== locked.version) drifted.push(`${dir}: installed ${version}, locked ${locked.version}`);
+  }
+  if (!drifted.length) return true;
+  console.error('node_modules does not match package-lock.json, so this run would not test what CI installs:');
+  for (const d of drifted) console.error(`  ${d}`);
+  console.error('Reinstall them: `npm ci`, or off Linux, where ci.yml explains why that fails, delete each directory above and run `npm install`.');
+  return false;
+}
+
+/**
+ * `npm run test:coverage` runs every workspace and exits 1 without saying which
+ * one failed, and the middle of its output is what a saved log loses. So run
+ * the workspaces one by one, in the order it would, and name each that fails.
+ */
+function testWithCoverage() {
+  const { workspaces } = JSON.parse(readFileSync('package.json', 'utf8'));
+  const failed = workspaces.filter((ws) => npm('run', 'test:coverage', '-w', ws, '--if-present') !== 0);
+  if (failed.length) console.error(`\nCoverage run failed in: ${failed.join(', ')}`);
+  return failed.length ? 1 : 0;
+}
+
 /** Run here, keyed by the step's name in ci.yml. */
 const STEPS = {
   'Build (core first — cli, web and vscode compile against its dist/)': () => npm('run', 'build:core'),
@@ -87,12 +128,14 @@ const STEPS = {
     return 0;
   },
   'Planner conversation loop — offline e2e (mock model, no API key)': plannerE2e,
+  'Bench harness tests (offline, against the built core)': () => npm('run', 'test:bench'),
   'Build (vscode, cli & web)': () => npm('run', 'build', '-w', 'packages/vscode', '-w', 'packages/cli', '-w', 'packages/web', '--if-present'),
   'VS Code integration test (synthetic runner — no API key)': integrationTest,
   'Typecheck': () => npm('run', 'typecheck'),
-  'Test with coverage': () => npm('run', 'test:coverage'),
+  'Test with coverage': testWithCoverage,
   'Lint': () => npm('run', 'lint'),
   'Package VS Code Extension': () => npm('run', 'package', '-w', 'packages/vscode'),
+  'Verify packaged npm and VS Code artifacts': () => sh('node', ['scripts/package-check.mjs']),
 };
 
 /** Named in ci.yml but not run here, and why. */
@@ -102,6 +145,7 @@ const CI_ONLY = {
   // `npm ci` would also wipe the node_modules you are working in.
   'Install dependencies': 'run `npm ci` yourself after a lockfile change',
   'Cache the VS Code download': 'packages/vscode/.vscode-test is already kept between runs',
+  'Resolve the VS Code version under test': 'the workflow asks the update service which stable it will download; a local run keeps the .vscode-test it has',
   'Install xvfb if the image lacks it': 'the integration step checks for a display itself',
   'Append coverage summaries to the job summary': 'a GitHub job summary',
   'Upload coverage reports': 'reports stay in packages/*/coverage/',
@@ -117,6 +161,7 @@ if (unknown.length || stale.length) {
   for (const n of stale) console.error(`scripts/ci.mjs names a step ci.yml no longer has: "${n}"`);
   process.exit(1);
 }
+if (!installedMatchesLockfile()) process.exit(1);
 
 for (const name of named.filter((n) => n in STEPS)) {
   console.log(`\n=== ${name}`);

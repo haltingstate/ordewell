@@ -1,12 +1,32 @@
 import React from 'react';
 import type { GlobalRunSettings } from '@ordewell/core';
 import { SUPERVISOR_LEVEL_LABEL } from '@ordewell/core/plan-utils';
+import type { IsolationPreview } from '@ordewell/core';
+import IsolationNotice from './IsolationNotice';
 import PlanApprovalNote, { type HostRunSettings } from './PlanApprovalNote';
+import PlannerLoginAction from './PlannerLogin';
+
+export interface SignedOutPlannerRow {
+  /** The runner whose login the row's action runs; also the key of its pending and failure state. */
+  runner: string;
+  label: string;
+  onLogIn?: () => void;
+  pending?: boolean;
+  failure?: string;
+}
 
 interface EmptyStateProps {
   onLoadSession?: () => void;
   /** The user's autonomy level and run settings (ADR-0030); absent until the host sends them. */
   runSettings?: HostRunSettings | null;
+  /**
+   * Every coding agent whose own status command says it is signed out, the
+   * active planner first. Each row's login runs that agent's own terminal
+   * login; the other two are its progress and the reason it did not finish.
+   */
+  signedOut?: SignedOutPlannerRow[];
+  /** The repositories and branches the host found; see {@link IsolationNotice}. */
+  isolationPreview?: IsolationPreview | null;
 }
 
 /** One Setup row: what is set, and the command that changes it. */
@@ -15,7 +35,7 @@ function SetupRow({ label, value, command, warn }: { label: string; value: React
     <div className="empty-state-setup-row">
       <span className="empty-state-setup-label">{label}</span>
       <span className={`empty-state-setup-value${warn ? ' warn' : ''}`}>{value}</span>
-      <code className="empty-state-setup-command">{command}</code>
+      <code className="empty-state-setup-command command-token">{command}</code>
     </div>
   );
 }
@@ -31,7 +51,7 @@ function RunValue({ run }: { run: GlobalRunSettings }) {
   );
 }
 
-export default function EmptyState({ onLoadSession, runSettings }: EmptyStateProps) {
+export default function EmptyState({ onLoadSession, runSettings, signedOut, isolationPreview }: EmptyStateProps) {
   return (
     <div className="empty-state">
       <div className="empty-state-logo">
@@ -76,16 +96,49 @@ export default function EmptyState({ onLoadSession, runSettings }: EmptyStatePro
           </g>
         </svg>
       </div>
-      <h2>What would you like to build?</h2>
-      <p>
-        Describe your goal and Ordewell will research your codebase,
-        generate a structured task plan, and execute it.
-      </p>
+      <div className="empty-state-hero">
+        <h2>What would you like to build?</h2>
+        <p className="empty-state-lead">Describe your goal.</p>
+        <p className="empty-state-support">
+          Ordewell will research your codebase, generate a structured task plan, and execute it.
+        </p>
+      </div>
       <PlanApprovalNote runSettings={runSettings} />
+      <IsolationNotice preview={isolationPreview} />
       {runSettings && (
         <div className="empty-state-setup">
           <SetupRow label="Autonomy" value={runSettings.autonomous ? 'Full' : 'Guarded'} warn={runSettings.autonomous} command="/settings" />
           <SetupRow label="Run" value={<RunValue run={runSettings.run} />} command="/settings" />
+        </div>
+      )}
+      {signedOut && signedOut.length > 0 && (
+        <div className="planner-auth-rows" role="status" aria-live="polite">
+          {signedOut.map((row) => (
+            <div className="planner-auth-row" data-runner={row.runner} key={row.runner}>
+              <span className="planner-auth-dot" aria-hidden="true" />
+              <div className="planner-auth-warning-body">
+                {/* One line per agent, always: the state before a login, the
+                    last attempt's result after one. The retry is the same
+                    button beside it. */}
+                {row.failure
+                  ? <span className="planner-auth-failure" title={row.failure}>{row.failure}</span>
+                  : (
+                    <span className="planner-auth-warning-text">
+                      <span className="planner-auth-warning-agent">{row.label}</span>
+                      {' not logged in.'}
+                    </span>
+                  )}
+              </div>
+              {row.onLogIn && (
+                <PlannerLoginAction
+                  className="planner-login-btn"
+                  onLogIn={row.onLogIn}
+                  pending={row.pending}
+                  ariaLabel={row.pending ? `Signing in to ${row.label}` : `Log in to ${row.label}`}
+                />
+              )}
+            </div>
+          ))}
         </div>
       )}
       {onLoadSession && (

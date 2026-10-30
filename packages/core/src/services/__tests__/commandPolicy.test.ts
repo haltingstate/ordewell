@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { AUTO_COMMANDS, classifyCommand, innerCommandScopes, pathLikeArgs, pathRefs } from '../commandPolicy';
+import { parseAllowlist } from '../plannerAllowlist';
 
 describe('classifyCommand', () => {
   describe('auto tier — read-only inspection runs with no prompt', () => {
@@ -91,10 +92,65 @@ describe('classifyCommand', () => {
       'touch newfile',
       'git push origin main',
       'git commit -m "x"',
+      // Writes to the working tree, the index or a file of their own: on a host
+      // with no sandbox, one approval of these deleted a tracked file.
+      'git rm old.txt',
+      'git rm -r src',
+      'git add README.md',
+      'git mv a.txt b.txt',
+      'git worktree remove ../wt',
+      'git notes add -m hello',
+      'git format-patch -1 HEAD',
+      'git -C sub rm old.txt',
+      // Not named anywhere, so refused because git is an allowlist: a list of
+      // its writers was never complete.
+      'git symbolic-ref HEAD refs/heads/attacker',
+      'git symbolic-ref --short HEAD refs/heads/attacker',
+      'git hash-object -w README.md',
+      'git hash-object -tw blob README.md',
+      'git update-server-info',
+      'git commit-graph write',
+      'git multi-pack-index write',
+      'git pack-objects base',
+      'git index-pack x.pack',
+      'git rerere forget a.txt',
+      'git -C sub update-server-info',
+      'git my-alias',
+      'git worktree add ../wt',
+      'git worktree -n remove list',
+      'git notes add -m hello',
+      'git bisect start',
+      'git sparse-checkout set src',
+      'git reflog expire --all',
       'npm publish',
       'kubectl delete pod foo',
     ])('%s', (cmd) => {
       expect(classifyCommand(cmd).tier).toBe('refuse');
+    });
+
+    // Refusing a writer must not take its subcommand's reads with it.
+    it.each([
+      'git worktree list',
+      'git worktree list --porcelain',
+      'git notes',
+      'git notes list',
+      'git notes show HEAD',
+      'git bisect log',
+      'git sparse-checkout list',
+      'git reflog',
+      'git reflog show main',
+      'git symbolic-ref HEAD',
+      'git symbolic-ref --short HEAD',
+      'git hash-object -t blob README.md',
+      'git for-each-ref',
+      'git merge-base main HEAD',
+    ])('asks for the read %s', (cmd) => {
+      expect(classifyCommand(cmd).tier).toBe('ask');
+    });
+
+    it('names an unknown git subcommand and a write form of a reading one', () => {
+      expect(classifyCommand('git commit-graph write').reason).toContain('"git commit-graph" is not a git subcommand known only to read');
+      expect(classifyCommand('git worktree add ../wt').reason).toContain('"git worktree add ../wt" is not a read-only form');
     });
 
     it('refuses output redirection, which would make the planner a writer', () => {
@@ -225,10 +281,36 @@ describe('classifyCommand', () => {
       expect(classifyCommand('git tag -a v1.0.0 -m "release"').tier).toBe('refuse');
     });
 
+    // The version-control flag set reads -f/-m/-M/-C as taking a value (for
+    // `git log`), so under branch/tag they swallowed the ref name and left no
+    // positional for the check above to see. Each of these rewrote a ref on
+    // real git with no prompt.
+    it.each([
+      'git tag -f v1',
+      'git branch -f other',
+      'git branch -qm renamed',
+      'git branch -qM renamed',
+      'git branch -qC copied',
+      'git branch -c copied',
+      'git branch -C copied',
+      'git branch --force other',
+      'git branch --copy copied',
+      'git branch --move renamed',
+      'git tag --force v1',
+      'git branch --delete feature',
+      'git tag -fa v1 -m x',
+    ])('refuses the force, copy and move forms of git branch/tag: %s', (cmd) => {
+      expect(classifyCommand(cmd).tier).toBe('refuse');
+    });
+
     it('still allows listing branches/tags by name pattern, which is read-only', () => {
       expect(classifyCommand('git branch --list "feature/*"').tier).toBe('auto');
       expect(classifyCommand('git tag -l "v0.4.*"').tier).toBe('auto');
       expect(classifyCommand('git branch --contains HEAD~5').tier).toBe('auto');
+      expect(classifyCommand('git branch -vv').tier).toBe('auto');
+      expect(classifyCommand('git branch -a --sort=-committerdate').tier).toBe('auto');
+      expect(classifyCommand('git -C packages/core branch --list').tier).toBe('auto');
+      expect(classifyCommand('git tag -n5 -l "v0.*"').tier).toBe('auto');
     });
 
     it('refuses sed -i and awk -i inplace, which edit files in place', () => {
@@ -613,6 +695,10 @@ describe('flags on permitted binaries are an allowlist, not an afterthought', ()
     'tree -o out.txt',
     'git diff --output=out.diff',
     'git archive --output=x.tar HEAD',
+    // sort writes its run files into the directory these name.
+    'sort -T . names.txt',
+    'sort -T/tmp names.txt',
+    'sort --temporary-directory=/tmp names.txt',
     'find . -fprint out.txt',
     'find . -fprint0 out.txt',
     'find . -fprintf out.txt "%p"',
@@ -836,28 +922,314 @@ describe('a grant covers the command that was approved, not its family', () => {
 /**
  * Read-only against the repository, but it contacts whatever host the remote
  * resolves to — around the web fetcher's per-origin approval and its
- * request-forgery guard. It could only move from permitted to prompted once the
- * scope carried the destination: under the old scope, one approval of the
- * workspace's own remote would have authorised a listing against any host.
+ * request-forgery guard. A configured remote prompts, scoped to the whole
+ * line; a destination the line spells out is refused.
  */
-describe('the remote-listing subcommand prompts, scoped to where it reaches', () => {
+describe('the remote-listing subcommand prompts for a configured remote, scoped to where it reaches', () => {
   it('no longer runs unprompted', () => {
     expect(classifyCommand('git ls-remote origin').tier).toBe('ask');
-    expect(classifyCommand('git ls-remote https://github.com/o/r').tier).toBe('ask');
+    expect(classifyCommand('git ls-remote https://github.com/o/r').tier).toBe('refuse');
   });
 
   it('does not let an approval for one destination cover another', () => {
     const origin = classifyCommand('git ls-remote origin').scope;
-    const attacker = classifyCommand('git ls-remote https://attacker.example/r').scope;
+    const upstream = classifyCommand('git ls-remote upstream').scope;
     expect(origin).toBe('git ls-remote origin');
-    expect(attacker).toBe('git ls-remote https://attacker.example/r');
-    expect(origin).not.toBe(attacker);
+    expect(upstream).toBe('git ls-remote upstream');
+    expect(classifyCommand('git ls-remote https://attacker.example/r').tier).toBe('refuse');
   });
 
   it('keeps the rest of the read-only version-control surface unprompted', () => {
     for (const cmd of ['git ls-files', 'git ls-tree HEAD', 'git log --oneline -5', 'git status']) {
       expect(classifyCommand(cmd).tier).toBe('auto');
     }
+  });
+
+  // Git's transport resolves the host itself and follows a redirect, so no
+  // approval of the text can hold it to a vetted, pinned origin (ADR-0027).
+  it.each([
+    'git ls-remote https://trusted.example/x',
+    'git ls-remote --heads https://trusted.example/x',
+    'git ls-remote https://trusted.example/x --heads',
+    'git -C packages/core ls-remote http://169.254.169.254/latest/meta-data/',
+    'git ls-remote --tags http://10.0.0.7/r',
+    'git ls-remote http://[::1]/r',
+    'git ls-remote http://localhost/r',
+    'git ls-remote ssh://git@host.example/r',
+    'git ls-remote git://host.example/r',
+    'git ls-remote git@host.example:o/r',
+    'git ls-remote file:///tmp/r',
+    'git ls-remote ext::nc',
+    'git ls-remote ../elsewhere',
+    'git ls-remote ./vendored',
+    'git ls-remote /srv/repo',
+    'git ls-remote -- https://trusted.example/x',
+    'git ls-remote --sort=refname https://trusted.example/x',
+    'git ls-remote $REMOTE',
+    'GIT -C packages/core ls-remote https://trusted.example/x',
+    'echo $(git ls-remote https://trusted.example/x)',
+  ])('refuses a listing that names its destination: %s', (cmd) => {
+    const result = classifyCommand(cmd);
+    expect(result.tier).toBe('refuse');
+    expect(result.reason).toContain('git ls-remote');
+    expect(result.reason).not.toContain('trusted.example');
+  });
+
+  it.each([
+    ['git ls-remote', 'git ls-remote'],
+    ['git ls-remote origin', 'git ls-remote origin'],
+    ['git ls-remote --heads origin', 'git ls-remote --heads origin'],
+    ['git ls-remote origin --heads', 'git ls-remote origin --heads'],
+    ['git ls-remote --heads --tags upstream main', 'git ls-remote --heads --tags upstream main'],
+    ['git -C packages/core ls-remote --heads origin', 'git -C packages/core ls-remote --heads origin'],
+  ])('asks about a listing of a configured remote under its whole line: %s', (cmd, scope) => {
+    expect(classifyCommand(cmd)).toMatchObject({ tier: 'ask', scope });
+  });
+
+  // The secret check reads the words as written; the shell sends what they
+  // expand to, and a `-C $DIR` or `env -C $DIR` picks a repository no grant names.
+  it.each([
+    ['posix', 'git ls-remote origin $MY_SECRET_TOKEN'],
+    ['posix', 'git ls-remote --heads origin refs/heads/$MY_SECRET_TOKEN'],
+    ['posix', 'git ls-remote origin "refs/heads/$MY_SECRET_TOKEN"'],
+    ['posix', 'git ls-remote origin ${MY_SECRET_TOKEN}'],
+    ['posix', 'git ls-remote origin $(cat .env)'],
+    ['posix', 'git ls-remote origin `cat .env`'],
+    ['posix', "git ls-remote origin $'\\x41'"],
+    ['posix', 'git ls-remote origin refs/heads/{a,b}'],
+    ['posix', 'git ls-remote origin refs/heads/*'],
+    ['posix', 'git ls-remote origin ~'],
+    ['posix', 'git ls-remote origin x=~/y'],
+    ['posix', 'git -C $DIR ls-remote origin'],
+    ['posix', 'env -C $DIR git ls-remote origin'],
+    ['posix', 'nice git ls-remote --tags origin $MY_SECRET_TOKEN'],
+    ['posix', 'echo $(git ls-remote origin $MY_SECRET_TOKEN)'],
+    ['posix', 'git.exe ls-remote origin $MY_SECRET_TOKEN'],
+    ['cmd', 'git ls-remote origin %MY_SECRET_TOKEN%'],
+    ['cmd', 'git ls-remote origin refs/heads/!MY_SECRET_TOKEN!'],
+    ['cmd', 'chdir packages\\web && git ls-remote origin %MY_SECRET_TOKEN%'],
+  ] as const)('refuses a listing the shell rewrites under %s: %s', (dialect, cmd) => {
+    const result = classifyCommand(cmd, { dialect });
+    expect(result.tier).toBe('refuse');
+    expect(result.reason).toContain('git ls-remote');
+  });
+
+  // Quoted, the words are what git is sent, and the secret check reads them.
+  it.each([
+    ["git ls-remote origin 'refs/heads/feat*'", ['origin', 'refs/heads/feat*']],
+    ["git ls-remote origin '$MY_SECRET_TOKEN'", ['origin', '$MY_SECRET_TOKEN']],
+    ['git ls-remote --heads origin "refs/heads/main"', ['origin', 'refs/heads/main']],
+  ])('asks about the literal listing %s', (cmd, outboundTexts) => {
+    expect(classifyCommand(cmd, { dialect: 'posix' })).toMatchObject({ tier: 'ask', outboundTexts });
+  });
+
+  it('hands the remote and its patterns to the outbound secret check', () => {
+    expect(classifyCommand('git -C packages/core ls-remote --heads origin main').outboundTexts).toEqual(['origin', 'main']);
+    expect(classifyCommand('git ls-remote').outboundTexts).toBeUndefined();
+    expect(classifyCommand('git -C packages/core for-each-ref').outboundTexts).toBeUndefined();
+  });
+});
+
+/**
+ * git's scope stopped at its first flag, so the commonest spelling of all,
+ * `git -C <dir> …`, scoped to bare `git`, and one approval of a worktree
+ * listing covered every later git command that asks.
+ */
+describe('a git grant is scoped by the subcommand it runs, past leading flags', () => {
+  it.each([
+    ['git -C packages/core worktree list', 'git worktree list'],
+    ['git --no-pager -C packages/core for-each-ref refs/heads', 'git for-each-ref refs/heads'],
+    ['git -C packages/core show-ref --heads', 'git show-ref'],
+    ['git -C packages/core notes list', 'git notes list'],
+  ])('%s scopes to %s', (cmd, scope) => {
+    expect(classifyCommand(cmd)).toMatchObject({ tier: 'ask', scope });
+  });
+
+  it('gives no two git operations behind the same leading flag one scope', () => {
+    const scopes = ['git -C packages/core worktree list', 'git -C packages/core ls-remote origin',
+      'git -C packages/core notes show', 'git -C packages/core for-each-ref']
+      .map((cmd) => classifyCommand(cmd).scope);
+    expect(new Set(scopes).size).toBe(scopes.length);
+    expect(scopes).not.toContain('git');
+  });
+
+  // A rule must spell out at least the words the scope holds (ADR-0026), so
+  // a bare `git` rule stopped covering everything behind a leading flag too.
+  it.each([
+    ['git ls-remote *', 'git ls-remote origin', 'git ls-remote *'],
+    ['git ls-remote *', 'git ls-remote --heads upstream', undefined],
+    ['git ls-remote *', 'git -C packages/core ls-remote origin', undefined],
+    ['git ls-remote', 'git ls-remote origin', undefined],
+    ['git', 'git -C packages/core worktree list', undefined],
+    ['git', 'git -C packages/core ls-remote origin', undefined],
+  ])('the allowlist rule %s covering %s is %s', (rule, cmd, allowedBy) => {
+    expect(classifyCommand(cmd, { allow: parseAllowlist([rule]) }).allowedBy).toBe(allowedBy);
+  });
+
+  it('refuses a named destination whatever the allowlist says', () => {
+    expect(classifyCommand('git ls-remote https://trusted.example/x', { allow: parseAllowlist(['git ls-remote *', 'git']) }).tier).toBe('refuse');
+  });
+
+  it('keeps read-only git under -C unprompted', () => {
+    for (const cmd of ['git -C packages/core log --oneline -5', 'git -C packages/core status', 'git -C worktree diff']) {
+      expect(classifyCommand(cmd).tier).toBe('auto');
+    }
+  });
+
+  // A followed `cd` is auto-tier, so the directory never reaches scopeFor: the
+  // grant was the git segment alone, and one approval of a listing in one
+  // repository covered the same listing in every other one (ADR-0027: the
+  // grant includes the directory, so another repository's `origin` is not
+  // covered).
+  it('scopes a listing to the repository a preceding cd selects', () => {
+    const web = classifyCommand('cd packages/web && git ls-remote --heads origin').scope;
+    const other = classifyCommand('cd packages/evil && git ls-remote --heads origin').scope;
+    expect(web).not.toBe(other);
+  });
+
+  // `;` and a substitution leave the `cd` unfollowed but still silent.
+  it.each([
+    'cd packages/web && git ls-remote --heads origin',
+    'cd packages/web; git ls-remote --heads origin',
+    'cd packages/web && git -C . ls-remote origin',
+    'echo $(cd packages/web && git ls-remote origin)',
+    'command cd packages/web && git ls-remote origin',
+  ])('holds %s to its line', (cmd) => {
+    expect(classifyCommand(cmd)).toMatchObject({ tier: 'ask', scope: cmd });
+  });
+
+  // A wrapper's own words never reach a scope, and `env -C` picks the
+  // repository as `-C` does: `env -C packages/evil` shared the grant of
+  // `env -C packages/web`. `env -u HOME` changes which config git reads.
+  it.each([
+    'env -C packages/web git ls-remote --heads origin',
+    'env -Cpackages/web git ls-remote --heads origin',
+    'env --chdir=packages/web git ls-remote --heads origin',
+    'env --chdir packages/web git ls-remote origin --heads',
+    'nice env -C packages/web git ls-remote origin',
+    'timeout 5 env -C packages/web git -C . ls-remote origin',
+    'env -u HOME git ls-remote origin',
+    'nice git ls-remote origin',
+    'env -C packages/web git.exe ls-remote origin',
+  ])('holds the wrapped listing %s to its line', (cmd) => {
+    expect(classifyCommand(cmd, { dialect: 'posix' })).toMatchObject({ tier: 'ask', scope: cmd, outboundTexts: ['origin'] });
+  });
+
+  // cmd.exe's `chdir` is its `cd`, and every other name that can move cmd.exe
+  // (`pushd`, a drive switch, `cd..`) is a word the listing's scope never held.
+  it.each([
+    'chdir packages/web && git ls-remote --heads origin',
+    'CHDIR packages\\web && git ls-remote --heads origin',
+    'chdir /d packages\\web & git ls-remote origin',
+    'CD packages\\web && git ls-remote origin',
+    'cd /d packages\\web && git ls-remote origin',
+    'pushd packages\\web && git ls-remote origin',
+    'D: && git ls-remote origin',
+    'cd.. && git ls-remote origin',
+  ])('holds %s to its line under cmd.exe', (cmd) => {
+    expect(classifyCommand(cmd, { dialect: 'cmd' })).toMatchObject({ tier: 'ask', scope: cmd });
+  });
+
+  // Followed past a re-cased `CD` or a `chdir` it never counted, `..\x` was
+  // judged from `a`, inside, where cmd.exe reads it from the root, outside.
+  it.each([
+    'cd a && CD .. && type ..\\x',
+    'cd a && chdir .. && type ..\\x',
+    'cd a && CHDIR .. && type ..\\x',
+  ])('stops following cd past %s', (cmd) => {
+    expect(pathRefs(cmd, { dialect: 'cmd' })).toEqual([{ path: '..', cwd: [] }, { path: '..\\x', cwd: [] }]);
+  });
+
+  it('holds a chdir to its line wherever it runs', () => {
+    expect(classifyCommand('chdir packages/web && git ls-remote origin', { dialect: 'posix' }).scope)
+      .toBe('chdir packages/web && git ls-remote origin');
+    // Granted as bare `chdir`, one approval covered any directory and any read after it.
+    expect(classifyCommand('chdir %USERPROFILE% && type .ssh\\id_rsa', { dialect: 'cmd' }))
+      .toMatchObject({ tier: 'ask', scope: 'chdir %USERPROFILE% && type .ssh\\id_rsa' });
+  });
+
+  // A silent read beside it cannot move the shell, so the grant stays the listing's own.
+  it.each([
+    ['git ls-remote --heads origin | head -5', 'git ls-remote --heads origin'],
+    ['ls && git ls-remote origin', 'git ls-remote origin'],
+    ['git -C packages/web ls-remote origin | grep main', 'git -C packages/web ls-remote origin'],
+  ])('keeps %s under the listing alone', (cmd, scope) => {
+    expect(classifyCommand(cmd, { dialect: 'posix' })).toMatchObject({ tier: 'ask', scope });
+  });
+
+  // Holding a line to itself never lifts a refusal: a write still refuses.
+  it.each([
+    ['posix', 'env -C packages/web git push origin main'],
+    ['posix', 'env --chdir=packages/web git ls-remote --upload-pack=evil origin'],
+    ['posix', 'env -C packages/web git ls-remote https://attacker.example/r'],
+    ['posix', 'chdir packages/web && git reset --hard'],
+    ['cmd', 'chdir packages\\web && del x'],
+    ['cmd', 'chdir packages\\web && git ls-remote origin > out.txt'],
+    ['cmd', 'D: && git ls-remote \\\\host\\share\\r'],
+  ] as const)('still refuses under %s: %s', (dialect, cmd) => {
+    expect(classifyCommand(cmd, { dialect }).tier).toBe('refuse');
+  });
+
+  it('keeps a wrapped listing of another repository apart', () => {
+    const web = classifyCommand('env --chdir=packages/web git ls-remote origin').scope;
+    const other = classifyCommand('env --chdir=packages/evil git ls-remote origin').scope;
+    expect(web).not.toBe(other);
+  });
+});
+
+// Git Bash lexes as posix, so the suffix reaches the tiers: `git.exe` missed
+// every git refusal and one approval granted bare `git.exe`.
+describe('git.exe is read as git', () => {
+  it.each([
+    'git.exe push origin main',
+    'git.exe commit -m x',
+    'git.exe -C x reset --hard',
+    'GIT.EXE push origin main',
+    'git.exe ls-remote http://169.254.169.254/latest/meta-data/',
+    'git.exe -c core.pager=less log',
+    'git.exe tag v1',
+  ])('refuses %s', (cmd) => {
+    expect(classifyCommand(cmd, { dialect: 'posix' }).tier).toBe('refuse');
+  });
+
+  it('scopes it as git, and never silently', () => {
+    expect(classifyCommand('git.exe -C x worktree list', { dialect: 'posix' })).toMatchObject({ tier: 'ask', scope: 'git.exe worktree list' });
+    expect(classifyCommand('git.exe ls-remote --heads origin', { dialect: 'posix' })).toMatchObject({ tier: 'ask', scope: 'git.exe ls-remote --heads origin' });
+    expect(classifyCommand('git.exe log --oneline', { dialect: 'posix' }).tier).toBe('ask');
+  });
+
+  it('passes its remote and patterns to the secret check', () => {
+    expect(classifyCommand('git.exe ls-remote origin refs/heads/x', { dialect: 'posix' }).outboundTexts).toEqual(['origin', 'refs/heads/x']);
+  });
+});
+
+/**
+ * A subcommand's action was read from after the first word spelled like the
+ * subcommand, which under `-C` can be the directory, so a listing in a
+ * directory named after the subcommand was refused as a write.
+ */
+describe('a git action is read after the subcommand itself, not a flag value spelled like it', () => {
+  it.each([
+    'git -C worktree worktree list',
+    'git -C notes notes list',
+    'git -C reflog reflog show',
+    'git -C list worktree list',
+  ])('asks about %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('ask');
+  });
+
+  it.each([
+    'git -C worktree worktree add ../x',
+    'git -C list worktree add ../x',
+    'git -C packages/core worktree remove x',
+    'git -C worktree worktree prune',
+    'git -C notes notes add -m x',
+    'git -C show notes add -m x',
+    'git -C reflog reflog expire --all',
+    'git -C tag tag v1',
+    'git -C branch branch -D x',
+  ])('still refuses the write %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
   });
 });
 
@@ -932,7 +1304,7 @@ describe('a command runner is classified by the command it runs', () => {
   );
 });
 
-describe('sed and awk programs are read for commands they run and files they write', () => {
+describe('sed and awk programs are read for commands they run and files they write or read', () => {
   it.each([
     "awk 'BEGIN{system(\"rm -rf x\")}'",
     "awk '{print | \"sh\"}' f",
@@ -946,6 +1318,42 @@ describe('sed and awk programs are read for commands they run and files they wri
     'sed -f script.sed f',
   ])('refuses %s', (cmd) => {
     expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  // Path confinement reads only the arguments, so a file the program names, and
+  // the environment that holds provider keys, were reached with no prompt once
+  // any ordinary `sed` or `awk` had been approved.
+  it.each([
+    ["sed -n '1r /etc/passwd' README.md", '"r"/"R" command'],
+    ["sed '$R ~/.ssh/id_rsa' README.md", '"r"/"R" command'],
+    ["sed -e 's/a/b/' -e '1 r /etc/passwd' f", '"r"/"R" command'],
+    [`awk 'BEGIN{while((getline l < "/etc/passwd")>0) print l}'`, '"getline <"'],
+    [`awk '{getline line<"/etc/passwd"; print line}' f`, '"getline <"'],
+    [`awk 'BEGIN{getline a[1] < "/etc/passwd"; print a[1]}'`, '"getline <"'],
+    [`awk 'BEGIN{ARGV[1]="/etc/passwd"; ARGC=2} {print}'`, '"ARGV"'],
+    [`awk 'BEGIN{print ENVIRON["OPENAI_API_KEY"]}'`, '"ENVIRON"'],
+    ["awk 'BEGIN{for (k in ENVIRON) print k, ENVIRON[k]}'", '"ENVIRON"'],
+    // gawk reaches ENVIRON and ARGV through SYMTAB under a name built at run
+    // time, and `awk` may be gawk.
+    [`gawk 'BEGIN{print SYMTAB["ENVIRON"]["OPENAI_API_KEY"]}'`, '"SYMTAB"'],
+    [`awk 'BEGIN{print SYMTAB["ENVIRON"]["HOME"]}' f`, '"SYMTAB"'],
+    [`gawk 'BEGIN{print SYMTAB["EN" "VIRON"]["HOME"]}'`, '"SYMTAB"'],
+    [`gawk 'BEGIN{e="ENVIRON"; for (k in SYMTAB[e]) print k}'`, '"SYMTAB"'],
+    [`gawk 'BEGIN{SYMTAB["ARGV"][1]="/etc/passwd"; ARGC=2} {print}'`, '"SYMTAB"'],
+  ])('refuses %s, which reads what confinement cannot see', (cmd, named) => {
+    const { tier, reason } = classifyCommand(cmd);
+    expect(tier).toBe('refuse');
+    expect(reason).toContain(named);
+  });
+
+  it('leaves getline from the input, and a comparison outside it, on the prompt tier', () => {
+    expect(classifyCommand("awk '{while ((getline line) > 0) n++} END {print n}' f")).toEqual({ tier: 'ask', scope: 'awk' });
+    expect(classifyCommand("awk 'NR < 3 {print}' f")).toEqual({ tier: 'ask', scope: 'awk' });
+    expect(classifyCommand("awk '{if ((getline l) < 1) exit; print l}' f")).toEqual({ tier: 'ask', scope: 'awk' });
+    expect(classifyCommand("awk '{getline}\n$1 < 3 {print}' f")).toEqual({ tier: 'ask', scope: 'awk' });
+    expect(classifyCommand(`awk '{print $1 "<" ENV}' f`)).toEqual({ tier: 'ask', scope: 'awk' });
+    expect(classifyCommand("sed 's/r/R/g' f")).toEqual({ tier: 'ask', scope: 'sed' });
+    expect(classifyCommand("sed -n '1p' f").tier).toBe('auto');
   });
 
   // GNU sed takes an option after a file name, so the script can arrive last.
@@ -962,6 +1370,55 @@ describe('sed and awk programs are read for commands they run and files they wri
 
   it('refuses a program the shell rewrites before the filter sees it', () => {
     expect(classifyCommand('sed "s/$OLD/new/" f').tier).toBe('refuse');
+  });
+});
+
+// jq and yq ran unprompted with any program, and a program can read the
+// environment (`$ENV`, `env`, yq's `strenv`) or load a file from a directory
+// no argument names (`import … {search: "~"}`, yq's `load`). With a provider
+// key set, `jq -rn '$ENV.ANTHROPIC_API_KEY'` printed it while `printenv` asked.
+describe('jq and yq programs are read for the environment and files they reach', () => {
+  it.each([
+    "jq -rn '$ENV.ANTHROPIC_API_KEY'",
+    "jq -n 'env'",
+    "jq -r 'env.HOME' package.json",
+    'jq -rn \'"\\(env.HOME)"\'',
+    "jq -n '[$ENV[]] | length'",
+    "jq -n 'import \"secrets\" as $d {search: \"~\"}; $d'",
+    "jq -n 'include \"lib\" {search: \"/tmp\"}; 1'",
+    "jq -n '\"lib\" | modulemeta'",
+    "jq --arg k v -r '$ENV[$k]' package.json",
+    "jq -f prog.jq package.json",
+    "jq -rf prog.jq package.json",
+    "jq --from-file prog.jq package.json",
+    "jq -n '# \"\nenv\n# \"'",
+    'jq "$PROGRAM" package.json',
+    "yq 'env(HOME)' a.yml",
+    "yq '.a = strenv(TOKEN)' a.yml",
+    "yq '\"${HOME}\" | envsubst' a.yml",
+    "yq 'load(\"/etc/hosts.yml\")' a.yml",
+    "yq '.a = load_str(\"../x\")' a.yml",
+    "yq eval 'env(HOME)' a.yml",
+    "yq --expression='strenv(HOME)' a.yml",
+  ])('refuses %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it.each([
+    'jq . package.json',
+    "jq -r '.version' package.json",
+    "jq --arg k version -r '.[$k]' package.json",
+    "jq -r '.env.NODE_ENV' compose.json",
+    "jq '.services[] | select(.name == \"env\")' compose.json",
+    "jq '{name, env: .environment}' compose.json",
+    "jq -r 'map(.load) | add' stats.json",
+    "jq -n --arg env prod '$env'",
+    "jq -c . env.json",
+    "jq '.a' -n -r env",
+    "yq -o json '.jobs' ci.yml",
+    "yq '.load' load-balancer.yml",
+  ])('keeps an ordinary filter unprompted: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('auto');
   });
 });
 
@@ -1020,6 +1477,32 @@ describe('pathLikeArgs — path arguments an auto-tier binary could still read o
   it('looks inside every chained segment and command substitution', () => {
     expect(pathLikeArgs('git status && cat /etc/passwd')).toEqual(['/etc/passwd']);
     expect(pathLikeArgs('echo $(cat /etc/hostname)')).toEqual(['/etc/hostname']);
+  });
+
+  // bash 3.2 (macOS /bin/sh) and dash expand a name segment that starts with a
+  // dot and a glob character to `..` among its matches, so `cat .?/secret.txt`
+  // read a file above the workspace with no prompt while `cat ../secret.txt`
+  // asked. No path the command line spells is outside, so confinement cannot
+  // judge it, and it asks under the line the human read, as a steered `cd` does.
+  it.each([
+    'cat .?/secret.txt',
+    'cat .[.]/secret.txt',
+    'cat \\.?/secret.txt',
+    'grep -r X .?',
+    'head .?/.?/notes.txt',
+    'ls src/.*/x',
+    'git status && cat .*/secret.txt',
+    'cat < .?/secret.txt',
+  ])('asks about a glob that can climb out through "..": %s', (cmd) => {
+    expect(classifyCommand(cmd)).toEqual({ tier: 'ask', scope: cmd });
+  });
+
+  it('still runs a glob that cannot climb, and a dotted pattern that is never opened', () => {
+    expect(classifyCommand('cat docs/*.md').tier).toBe('auto');
+    expect(classifyCommand('ls src/?.ts').tier).toBe('auto');
+    expect(classifyCommand('grep -E ".*TODO" src/*.ts').tier).toBe('auto');
+    expect(classifyCommand('find . -name ".*rc"').tier).toBe('auto');
+    expect(classifyCommand("cat '.?/literal'").tier).toBe('auto');
   });
 });
 

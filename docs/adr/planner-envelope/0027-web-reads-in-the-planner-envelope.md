@@ -229,9 +229,12 @@ what guards it has to hold without one:
   redirect hop included — against `plannerWebReadBudget`
   (`ORDEWELL_WEB_READ_BUDGET`), and a new turn starts a new count. A read is
   counted before its approval resolves, so reads raised in parallel cannot
-  all pass at once, and given back if it does not happen. Past the budget,
+  all pass at once, and given back if it is then refused; one its caller
+  cancels after it was allowed keeps its count. Past the budget,
   reads are refused with a message the planner can report. A budget of 0
-  turns web reads off.
+  turns web reads off. A read-only task's attempt counts its own reads
+  against the same setting, apart from every planner turn and every other
+  attempt (ADR-0046).
 - **Every decision is recorded in the research log**: what was asked, the path
   that carried it, and why it was allowed or refused (mode, grant, allowlist,
   exclusion, SSRF guard, secret check, budget), so the timeline shows it in
@@ -359,10 +362,37 @@ Research subagents get `fetch` and `web_search`, and still never prompt
   and the like) says the planner should not do it itself, and sends it to
   the plan as an ops task, with a change task beside it if it writes files.
 
+### `git ls-remote` in `run_command`
+
+- **A destination the command line spells out is refused,** not asked: a URL
+  of any scheme, an address, an scp-style `host:path`, a
+  `transport::address` or a path. Git connects through its own transport,
+  which resolves the host itself and follows a redirect, so none of the
+  guarantees above (an origin grant, the SSRF guard, a pinned address) can
+  hold for it. The refusal names neither the command nor the destination.
+- **A remote the repository configures asks, under its whole line.** The
+  grant is the command as written, `-C`, flags, remote and patterns
+  included. It is the whole line when anything else on it could pick the
+  repository: a `cd` or `chdir`, a wrapper (`env -C`, `env -u HOME`), whose
+  own words reach no scope, or any other command that asks, which may move
+  the shell under a name no list holds (a cmd.exe drive switch, `cd..`). So
+  `git ls-remote --heads origin` covers neither `upstream` nor `origin` of
+  another repository, and an approval of another git command covers no
+  listing. A silent read beside it (`| head`) leaves the grant its own.
+  `git.exe`, as Git Bash names it, is held to the same rules.
+- **Its remote and patterns pass the outbound secret check before approval,**
+  as a web command's URL does: protocol v2 sends the patterns to the server
+  as ref prefixes. The check reads the words as written, so a listing the
+  shell rewrites first is refused: a variable, a substitution, a brace list,
+  an unquoted glob or a `~` anywhere in it, `-C $DIR` included. A quoted
+  pattern is sent as written and asks.
+
 GNU Wget 1.x has no curl-style host-to-address override preserving the
 original hostname for HTTP and TLS, so it still resolves again at connection
 time. Curl pins the named URL hosts, but an explicitly approved redirect to
-another host is still outside that pin set. Both residuals require phase 2.
+another host is still outside that pin set. A configured remote's address is
+the repository's to choose and is not vetted before `git ls-remote` runs.
+These residuals require phase 2.
 
 ### Phase 2: filtering at the network
 
@@ -389,8 +419,9 @@ filed as its own issue.
   through the web-read policy, the budget or `run_command`'s `curl`/`wget`
   rules. How an ops task is authorized beyond plan approval — the mandate,
   issue #23 — is deliberately out of scope here. Read-only tasks withhold
-  native web tools: they have no task web-policy channel to apply the checks
-  above (ADR-0046).
+  native web tools and read through Ordewell's `fetch` and `web_search` under
+  this policy, as a research subagent does: never asking, with a budget per
+  attempt (ADR-0046).
 - **Absent is denial (T5).** An `ask` web read with no approval channel, a
   dismissed card or a timeout is refused, as before.
 - **The secret check narrows, it does not close.** A Full planner that read
@@ -471,3 +502,8 @@ filed as its own issue.
   about them per origin.
 
 - 2026-10-21 — read-only tasks withhold native web tools because they have no task web-policy channel (ADR-0046).
+- 2026-10-25 — read-only tasks read through Ordewell's `fetch` and `web_search` under this policy, never prompting, each attempt with a budget of its own (ADR-0046).
+- 2026-10-25 — a read its caller cancels after it was allowed keeps its count; only a refused one is given back.
+- 2026-10-29 — `git ls-remote` naming its destination is refused; a configured remote asks under its whole line, its remote and patterns secret-checked.
+- 2026-10-29 — a listing after a `cd` is granted under the whole line, and `git.exe` is read as git.
+- 2026-10-29 — a listing beside a wrapper, `chdir` or anything else that asks is granted under its line; one the shell rewrites is refused.

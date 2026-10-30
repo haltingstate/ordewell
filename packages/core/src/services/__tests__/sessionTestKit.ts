@@ -55,7 +55,7 @@ export interface SessionOverrides {
   /** Fakes go through the constructor seam — Partial so a test only stubs the calls it expects. */
   aiService?: Partial<IAiService>;
   planner?: Partial<SessionPlanner>;
-  modelResolver?: Pick<ModelResolver, 'modelsForRunners'> & Partial<Pick<ModelResolver, 'getCachedRunnerModels' | 'contextWindowFor'>>;
+  modelResolver?: Pick<ModelResolver, 'modelsForRunners'> & Partial<Pick<ModelResolver, 'getCachedRunnerModels' | 'contextWindowFor' | 'maxOutputTokensFor' | 'warmPickerOptions'>>;
   skillsService?: Pick<SkillsService, 'findSkill'> & Partial<Pick<SkillsService, 'listSkills'>>;
   taskOutput?: TaskOutputSource;
   /** Defaults to git behind a config with isolation off, so no test runs git in the repo it runs in. */
@@ -69,7 +69,11 @@ export interface SessionOverrides {
   saveSession?: SaveSession;
   /** Defaults to attempt files held in memory, so a structured run never writes into the repo the suite runs in. */
   openTaskLog?: SessionDeps['openTaskLog'];
+  /** Defaults to none: a session saving through the fake store owns nothing on disk. */
+  leaseHost?: SessionDeps['leaseHost'];
   mcpServer?: SessionDeps['mcpServer'];
+  /** A fake network for web reads (ADR-0027); the real transport, DNS, cache and search provider unless given. */
+  web?: SessionDeps['web'];
 }
 
 /** Task-log files that live in memory, numbered per task as the real store numbers them. */
@@ -134,6 +138,8 @@ export function makeSession(overrides: SessionOverrides = {}): Session {
     saveSession: overrides.saveSession ?? save,
     openTaskLog: overrides.openTaskLog ?? memoryTaskLogs(),
     mcpServer: overrides.mcpServer,
+    leaseHost: overrides.leaseHost,
+    web: overrides.web,
   });
   if (!overrides.saveSession) saveFakes.set(session, save);
   return session;

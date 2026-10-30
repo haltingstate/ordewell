@@ -1,4 +1,46 @@
+import { readFileSync } from 'fs';
+import { homedir } from 'os';
+import { join, resolve } from 'path';
 import type { RunnerManifest } from '../types';
+import { parseToml } from '../../services/harness/toml';
+
+const NOT_LOGGED_IN = /^\s*not logged in\s*$/im;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether `codex login status` saying "Not logged in" is not this user's
+ * answer. That command only knows the credentials Codex itself stores. Codex
+ * authenticates some working setups another way: `OPENAI_API_KEY` on the
+ * default provider, or any custom `model_provider` that does not delegate to
+ * Codex's login (Azure, an enterprise gateway, a credential-less local server).
+ *
+ * Read from the probe's own environment, not `process.env`: a workspace can
+ * point `CODEX_HOME` or `HOME` at another account (ADR-0016). Real codex
+ * resolves the config at `$HOME/.codex/config.toml` when `CODEX_HOME` is
+ * unset — an empty one counts as unset — so the fallback walks the probe's
+ * HOME, not the daemon's.
+ */
+function statusCannotJudgeLogin(env: NodeJS.ProcessEnv): boolean {
+  if (env.OPENAI_API_KEY) return true;
+  let config: Record<string, unknown>;
+  try {
+    const home = env.CODEX_HOME ? resolve(env.CODEX_HOME) : join(env.HOME ?? homedir(), '.codex');
+    config = parseToml(readFileSync(join(home, 'config.toml'), 'utf8'));
+  } catch {
+    // No readable config is no declared provider, so the status is the answer.
+    return false;
+  }
+  const id = typeof config.model_provider === 'string' ? config.model_provider : undefined;
+  const providers = isRecord(config.model_providers) ? config.model_providers : {};
+  const provider = id !== undefined && isRecord(providers[id]) ? providers[id] : undefined;
+  if (!provider) return false;
+  // This provider delegates to Codex's own login, which is what the status
+  // command asked about, so its answer stands.
+  return provider.requires_openai_auth !== true;
+}
 
 export const CODEX_MANIFEST: RunnerManifest = {
   name: 'codex',
@@ -43,7 +85,8 @@ export const CODEX_MANIFEST: RunnerManifest = {
     appServer: {
       command: 'codex',
       args: ['app-server'],
-      cacheFile: '~/.codex/models_cache.json',
+      // CODEX_HOME moves all of Codex's own files from `~/.codex`.
+      cacheFile: (env) => `${env.CODEX_HOME?.trim() || '~/.codex'}/models_cache.json`,
     },
     canonicalAliases: [
       { modelId: 'gpt-5.6-sol', modelLabel: 'GPT-5.6-Sol' },
@@ -62,6 +105,23 @@ export const CODEX_MANIFEST: RunnerManifest = {
       { id: 'high', label: 'High' },
       { id: 'xhigh', label: 'Xhigh' },
     ],
+  },
+
+  auth: {
+    statusArgs: ['login', 'status'],
+    loginArgs: ['login'],
+    // `codex login status` prints "Not logged in" and exits 1 when signed out;
+    // a clean exit is the only other answer it gives. Anchored to its own line:
+    // a failure can quote another tool that is not logged in.
+    signedOut: NOT_LOGGED_IN,
+    // But it only knows the credentials Codex stores itself. A key or a custom
+    // provider that authenticates another way is not signed out in any sense
+    // this command can see, so leave that answer unknown rather than wall it.
+    read: ({ output, code, env }) => {
+      if (code === 0) return 'signed-in';
+      if (!NOT_LOGGED_IN.test(output)) return null;
+      return statusCannotJudgeLogin(env) ? null : 'signed-out';
+    },
   },
 
   contextFile: 'AGENTS.md',

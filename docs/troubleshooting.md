@@ -170,6 +170,39 @@ Finish it (`git rebase --continue`) or abort it (`git rebase --abort`) in the
 repository named, check out the base branch, and merge again. A run that
 started on a detached HEAD names no branch and is not checked.
 
+## A gateway model is not offered for Claude Code
+
+An edit is refused with **Runner "claude-code" does not offer model
+"gproxy/default"**, or `ordewell model set` says the model was not discovered.
+
+The sources Ordewell asks for Claude Code's models, the Anthropic Models API
+and `claude --help`, list only Anthropic's models. Ordewell also offers each
+model listed in `modelPicker.options` of Claude Code's settings:
+
+```json
+{ "modelPicker": { "options": [{ "model": "gproxy/default", "label": "Gateway" }] } }
+```
+
+A row needs a `model` string; `label` is optional. As Claude Code does,
+Ordewell takes the whole list from the highest file that sets one: the managed
+settings file (`managed-settings.json` and its `managed-settings.d/` files in
+Claude Code's system directory), then your user settings,
+`~/.claude/settings.json` or `settings.json` in `CLAUDE_CONFIG_DIR` when that
+is set. `CLAUDE_CONFIG_DIR`, and the `HOME` (`USERPROFILE` on Windows) that
+`~` stands for, are read from the environment the workspace's tasks run with,
+its `.envrc` or `.ordewell/env` included, so each workspace a daemon serves is
+offered its own account's list. Ordewell reads the files when it
+discovers Claude's models, so restart it after editing one.
+
+Ordewell does not read a list your organization delivers any other way: from
+the claude.ai console or a Claude apps gateway (server-managed settings), a
+macOS configuration profile, or the Windows `HKLM` or `HKCU` registry. Such a
+list is not offered. And because Claude Code takes the whole list from the
+highest source that sets one, such a list also replaces a file's list in
+Claude Code's own `/model` picker while Ordewell still offers the file's.
+Ordewell ignores a row's `behavesAs` and the list's `replaceBuiltInOptions`
+too: it offers the listed models beside Anthropic's own either way.
+
 ## A runner shows as switched off, and tasks are flagged
 
 A task row reads **codex is switched off** or **Opus 4 is not in the allowlist**,
@@ -205,6 +238,56 @@ when the limit resets, or hit it again right after a resend, or you moved the
 planner to another runner, nothing is resent on its own: send a message once
 the limit has reset.
 
+## The planner is paused on its context
+
+A turn of an API planner (OpenAI, OpenRouter, an OpenAI-compatible server,
+Gemini) ends with **The planner is paused**, and the chat offers **Retry
+compaction**.
+
+Before every call, such a planner keeps its prompt inside 90% of the model's
+window: it trims older file reads first, then condenses the conversation into a
+summary written by the same model, which shows as **Context compacted
+automatically** in the chat. When the provider still refuses a call as too long,
+it compacts once more against what the refusal showed and sends the same call
+once more. It pauses only when that leaves the call too large (once a summary
+was written, past those 90%), the summary could not be written, or your message
+is too long by itself
+([ADR-0002](adr/planner/0002-planner-as-conversation-loop.md)). Only the planner
+pauses: running tasks carry on and finish. What the call was to send is kept,
+and so is your message, so nothing is cut to fit.
+
+- **Retry compaction** attempts recovery: it condenses again and sends the
+  call once, whatever the estimate. Switch the planner to a model with a
+  larger window first if the same one paused twice. It does not promise the
+  turn continues: if the call still does not fit it pauses again, and in the
+  cases below it stays paused. In the terminal UI it is `/compact retry`, from
+  the shell `ordewell compact retry`, and in VS Code the button above the
+  composer.
+- **Stop** drops the paused turn and its message; send a shorter one.
+
+Messages you send while it is paused wait behind it. On the live context, a
+retry sends the held results without running the turn's completed commands
+again, and a call a turn condensed away is answered "not run again" if the
+planner asks for it a second time within that turn. Nothing guards a fresh
+request you make yourself: if you deliberately ask the planner to do the same
+thing again in an intact context, it may.
+
+After a reload, a switch of provider or a switch to a model whose window
+Ordewell does not know, the planner no longer holds what the paused turn did. A
+turn that only read files starts again from the conversation, its reads made
+again. One that ran a command, read the web or started a task is not started
+again from a note of what it did, since that could do it twice: Retry
+compaction stays paused and lists what already ran. Switch to a model whose
+window is known if you only switched models and the live context is still
+there, or **Stop** and tell the planner where to pick up.
+
+This needs the model's window: a model whose catalog states none gets no
+automatic compaction. A refusal pauses it at once, and Retry compaction uses the
+window the provider's refusal states. `/compact` still condenses on request. To
+turn automatic compaction off, set `"plannerAutoCompaction": false` in the
+global `settings.json` (`~/.ordewell/settings.json`). A harness planner (Claude
+Code, Codex, OpenCode) compacts its own context, and is not affected.
+
 ## A task waits for your approval
 
 A row reads **waits for your approval** and the scheduler skips it.
@@ -235,3 +318,32 @@ Model and effort are locked while a task's runner is up, and so is its runner.
 Stop the task, edit, and continue, or use the runner's own `/model` in the task's chat: the plan then
 follows it. A model the runner changed by itself is stated in the task log and
 is not written to the plan.
+
+## A session is open in another Ordewell host
+
+Loading a session shows **This session is open in another Ordewell host: … has
+held it since …**, or **The Ordewell host that last ran this session … is gone,
+but runners it started are still running**.
+
+### Cause
+
+One session is run by one host at a time
+([ADR-0049](adr/isolation/0049-a-session-has-one-live-host.md)). Every TUI starts
+a daemon of its own, and a VS Code window is a host too, so a second one in the
+same checkout could otherwise run a session again beside the first, in the same
+worktrees. The message names the host that has it: its kind, its pid, and since
+when.
+
+### Fix
+
+Close the session in that host, or quit it, and load the session again. A host
+that crashed or was killed lets the session go once its pid is gone, or a minute
+after it last refreshed its lease.
+
+If the host is gone but its runners are not, stop the process groups the
+message names before loading again:
+
+```bash
+ps -eo pid,pgid,command | awk '$2 == <group>'   # what is still running in that group
+kill -TERM -- -<group>
+```

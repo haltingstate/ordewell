@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolve } from 'path';
 import { migrateOldConfigDir } from '@ordewell/core';
 import { loadEnvFile, moveAutonomyToSettings } from './utils/env';
 import { printHelp } from './help';
@@ -6,6 +7,7 @@ import { describeConnectionRefused, isConnectionRefused, resolvePort } from './d
 import { ApiClient } from './apiClient';
 import { COMMANDS } from './commands/registry';
 import { cliVersion } from './version';
+import { startCliVersionCheck, toStderr } from './versionCheck';
 import { expandSessionId, flag } from './utils';
 
 const TUI_FLAGS = new Set(['--workspace', '--port']);
@@ -32,7 +34,9 @@ async function main(): Promise<void> {
     console.log(cliVersion());
     return;
   }
-  ApiClient.defaultWorkspace = flag(argv, '--workspace') || undefined;
+  // Resolved once, so a daemon that runs in another directory never resolves a
+  // relative `--workspace` against its own cwd.
+  ApiClient.defaultWorkspace = resolve(flag(argv, '--workspace') || process.cwd());
   const sessionAt = argv.indexOf('--session-id');
   if (sessionAt > 0 && argv[sessionAt + 1]) {
     argv[sessionAt + 1] = expandSessionId(argv[sessionAt + 1], flag(argv, '--workspace') || process.cwd());
@@ -43,6 +47,8 @@ async function main(): Promise<void> {
     console.error('Run `ordewell --help` for usage.');
     process.exit(1);
   }
+  // The TUI starts its own, to draw it in its frame: one check per start either way.
+  if (command !== 'tui') startCliVersionCheck(toStderr);
   try {
     await handler(argv.slice(1));
   } catch (err) {

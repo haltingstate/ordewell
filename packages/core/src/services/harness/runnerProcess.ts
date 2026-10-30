@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'child_process';
+import { Socket } from 'net';
 import { StringDecoder } from 'string_decoder';
 import { augmentedPath } from '../../utils/shellPath';
 import { planDirectLaunch, isExecutableResolved, ExecutableNotFoundError } from '../../utils/launch';
@@ -17,6 +18,24 @@ const STDERR_TAIL_CHARS = 4000;
  * that a descendant still holding its stdout or stderr does not hang the turn.
  */
 const CLOSE_GRACE_MS = 2000;
+
+/**
+ * Let go of the pipes of a runner that has exited, for a descendant that still
+ * holds them: one setsid'd out of the group outlives Stop, and its pipes alone
+ * would keep the host alive for as long as it runs. Unref'd rather than
+ * destroyed, so the host can exit without the holder's next write meeting a
+ * closed pipe — SIGPIPE would end a process that is not ours to stop — and
+ * still drained, so a full pipe never blocks it either. The pipes close, and
+ * their handles go, when the holder lets go of them.
+ */
+function releasePipes(child: ChildProcess): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    if (stream instanceof Socket) stream.unref();
+  }
+  for (const stream of [child.stdout, child.stderr]) {
+    if (stream instanceof Socket) stream.resume();
+  }
+}
 
 export interface RunnerCommand {
   command: string;
@@ -52,6 +71,8 @@ export class RunnerProcess {
   readonly ended: Promise<void>;
   private markEnded!: () => void;
   private child: ChildProcess | null = null;
+  /** Disposed before, or while, it launched: nothing may be spawned for an owner that has gone. */
+  private disposed = false;
   private exitStatus: RunnerExit | null = null;
   /** The process itself reported its end, before its pipes drained; see {@link hasExited}. */
   private exitReported = false;
@@ -105,6 +126,9 @@ export class RunnerProcess {
     if (!isExecutableResolved(command.command, launch, PATH, { platform: this.deps.platform, exists: this.deps.exists })) {
       throw new ExecutableNotFoundError(command.command, PATH);
     }
+    // The awaits above leave room for a dispose: a Stop takes the adapter back
+    // while its start runs on, and a dispose finds no child to kill yet.
+    if (this.disposed) throw new Error('The runner was stopped before it launched.');
     this.spawnEnv = runnerEnv(PATH, workspace, command.env?.(workspace), command.envDrop);
 
     const child = spawnInOwnGroup((detached) => this.deps.spawn(launch.file, launch.args, {
@@ -137,6 +161,7 @@ export class RunnerProcess {
       const grace = setTimeout(() => {
         for (const flush of [...this.stdoutEnds]) flush();
         this.end({ code, signal });
+        releasePipes(child);
       }, CLOSE_GRACE_MS);
       grace.unref?.();
       void this.ended.then(() => clearTimeout(grace));
@@ -220,6 +245,7 @@ export class RunnerProcess {
    * disposed runner is never the reason the host refuses to exit.
    */
   dispose(): void {
+    this.disposed = true;
     const child = this.child;
     this.child = null;
     killTree(child, { platform: this.deps.platform });

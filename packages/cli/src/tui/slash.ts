@@ -34,14 +34,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   // Tasks
   { name: 'add-task', usage: '/add-task <title>', description: 'Add a task to the current plan', category: 'tasks' },
   { name: 'remove-task', usage: '/remove-task <id>', description: 'Remove a task from the plan', category: 'tasks' },
-  { name: 'complete', usage: '/complete <id>', description: 'Mark a task complete', category: 'tasks' },
-  { name: 'uncomplete', usage: '/uncomplete <id>', description: 'Mark a completed task not done', category: 'tasks' },
+  { name: 'complete', usage: '/complete <id>', description: 'Mark a task complete (asks first)', category: 'tasks' },
+  { name: 'uncomplete', usage: '/uncomplete <id>', description: 'Mark a completed task not done (asks first)', category: 'tasks' },
   { name: 'skip', usage: '/skip <id>', description: 'Skip a task', category: 'tasks' },
   { name: 'retry', usage: '/retry <id>', description: 'Re-run a failed task', category: 'tasks' },
   { name: 'cancel', usage: '/cancel <id>', description: 'Kill a running task', category: 'tasks' },
   { name: 'force-start', usage: '/force-start <id>', description: 'Approve a task and start it now, or once its dependencies finish', category: 'tasks' },
   { name: 'continue', usage: '/continue <id> <message>', description: 'Continue a finished task in its saved runner session, with your message', category: 'tasks' },
-  { name: 'open', usage: '/open <id>', description: "Open a task's view: its log, and the keys that answer its checkpoint or tool request", category: 'tasks' },
+  { name: 'open', usage: '/open <id>', description: "Open a started task's chat: its view, and the keys that answer its checkpoint or tool request", category: 'tasks' },
   { name: 'checkpoint', usage: '/checkpoint <id> approve|reject [reason]', description: 'Answer the checkpoint a task waits at: approve lets it go on, reject tells it why not', category: 'tasks' },
   { name: 'task-runner', usage: '/task-runner <id> [runner]', description: "Choose or set a task's executor (re-picks its model and mode)", category: 'tasks' },
   { name: 'task-model', usage: '/task-model <id> [model]', description: "Choose or set a task's executor model", category: 'tasks' },
@@ -56,13 +56,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'key', usage: '/key [set <provider> <key>]', description: 'Configure API provider keys', category: 'models' },
   { name: 'allowlist', usage: '/allowlist [set <runner> <ids> | clear <runner>]', description: 'Limit which models a runner may use', category: 'models' },
   { name: 'runners', usage: '/runners [<id> on|off]', description: `Enable or disable runners (${runnerIdList()})`, category: 'models' },
+  { name: 'login', usage: '/login [<runner>]', description: 'Sign the active coding agent in, or the one named, in this terminal', category: 'models' },
   { name: 'settings', usage: '/settings', description: 'Run settings: autonomy, supervisor, merging, autorun and parallel tasks', category: 'models' },
-  { name: 'refresh', usage: '/refresh', description: 'Re-discover runners and model catalogs', category: 'models' },
+  { name: 'refresh', usage: '/refresh', description: 'Re-check runners; reread settings and cached models', category: 'models' },
 
   // Sessions
   { name: 'sessions', usage: '/sessions', description: 'List saved sessions', category: 'session' },
   { name: 'fork', usage: '/fork', description: 'Continue in a copy of this conversation and its tasks; the original stays as it is', category: 'session' },
-  { name: 'compact', usage: '/compact', description: 'Condense this conversation into a summary; the last two exchanges and all tasks are kept', category: 'session' },
+  { name: 'compact', usage: '/compact [retry]', description: 'Condense what the planner is sent into a summary; the full conversation, the last two exchanges and all tasks are kept. retry: retry compaction of a planner paused on its context', category: 'session' },
   { name: 'rewind', usage: '/rewind [<message>]', description: 'Fork the conversation from just before one of your messages, after a confirmation (the original is kept)', category: 'session' },
   { name: 'new', usage: '/new', description: 'Start a new session', category: 'session' },
   { name: 'save', usage: '/save', description: 'Save the current session', category: 'session' },
@@ -71,11 +72,55 @@ export const SLASH_COMMANDS: SlashCommand[] = [
 
   // System
   { name: 'help', usage: '/help', description: 'Show available commands', category: 'system' },
-  { name: 'mouse', usage: '/mouse [on|off]', description: "Wheel scrolling and per-pane drag-select (on), or the terminal's own selection (off)", category: 'system' },
+  { name: 'mouse', usage: '/mouse [on|off]', description: "Wheel scrolling and drag-select, per-pane in the body and full-width in the composer (on), or the terminal's own selection (off)", category: 'system' },
   { name: 'quit', usage: '/quit', description: 'Exit the TUI', category: 'system' },
 ];
 
-const BY_NAME = new Map(SLASH_COMMANDS.map((c) => [c.name, c]));
+/**
+ * Familiar spellings the planner chat answers the same way as a built-in. Kept
+ * as data rather than extra `SLASH_COMMANDS` rows so one canonical command owns
+ * the behaviour: an alias is a name and a target, never a second
+ * implementation, so the pair cannot drift and a further synonym is one line.
+ * An alias also joins `BY_NAME` below, which is what `registerSkillCommands`
+ * checks first — a skill may never silently shadow it.
+ */
+export interface CommandAlias {
+  name: string;
+  target: string;
+  description: string;
+}
+
+export const COMMAND_ALIASES: CommandAlias[] = [
+  // Editors call reopening a saved session "resume"; here it must open the same
+  // saved-session picker as /sessions, not restart a task or a runner.
+  { name: 'resume', target: 'sessions', description: 'Alias for /sessions: open a saved session, not restart a task' },
+];
+
+/**
+ * The built-in table with each alias placed right after the command it spells,
+ * so `/help` and the completion menu group a synonym with its target. This is
+ * what user-facing listings read; `SLASH_COMMANDS` stays the canonical,
+ * one-entry-per-behaviour list the parity test checks.
+ */
+export function slashCommandTable(): SlashCommand[] {
+  const table: SlashCommand[] = [];
+  for (const command of SLASH_COMMANDS) {
+    table.push(command);
+    for (const alias of COMMAND_ALIASES) {
+      if (alias.target !== command.name) continue;
+      table.push({ name: alias.name, usage: `/${alias.name}`, description: alias.description, category: command.category });
+    }
+  }
+  return table;
+}
+
+const BY_NAME = new Map(slashCommandTable().map((c) => [c.name, c]));
+
+/** The canonical command a name finally runs as: an alias resolves to its target, everything else is itself. */
+export function canonicalCommandName(name: string): string {
+  const key = name.replace(/^\//, '').toLowerCase();
+  return COMMAND_ALIASES.find((a) => a.name === key)?.target ?? key;
+}
 
 export interface SkillCommandSource {
   name: string;
@@ -134,7 +179,7 @@ export function completions(text: string): SlashCommand[] {
   const typed = text.slice(1);
   if (/\s/.test(typed)) return [];
   const prefix = typed.toLowerCase();
-  return [...SLASH_COMMANDS, ...skillCommands].filter((c) => c.name.startsWith(prefix));
+  return [...slashCommandTable(), ...skillCommands].filter((c) => c.name.startsWith(prefix));
 }
 
 /** A `/word` token found anywhere in a prompt, whitespace- (or string-edge-) bounded. */
@@ -226,6 +271,6 @@ export function composerCompletions(token: SlashToken, runner: readonly RunnerCo
  * only ever loads a discovered skill, never a built-in.
  */
 export function tokenCompletions(token: SlashToken): SlashCommand[] {
-  const pool = token.start === 0 ? [...SLASH_COMMANDS, ...skillCommands] : skillCommands;
+  const pool = token.start === 0 ? [...slashCommandTable(), ...skillCommands] : skillCommands;
   return pool.filter((c) => c.name.startsWith(token.name));
 }

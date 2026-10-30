@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
-import { latestTaskCommands } from '../shared/taskCommands';
-import { canContinue, isMeasured, pausedOnLimit, resumeLabel, taskUsageSummary, usageLine, type CommandOutcome, type DisplayBlock, type ExecutionActor, type ExecutionCommand, type PendingApproval, type SessionMessage, type Task, type TaskLogEvent } from '@ordewell/core';
+import { accountLimitsOf, assignedRunnerOf, lastServedModel, taskActionCommand, canContinue, taskLogHeaderView, type AccountLimitSnapshot, type CommandOutcome, type DisplayBlock, type ExecutionActor, type ExecutionCommand, type PendingApproval, type SessionMessage, type Task, type TaskLogEvent } from '@ordewell/core';
 import { EMPTY_TASK_LOG_FOLLOW, followTaskLog } from '@ordewell/core/plan-utils';
 import { diffConversation } from '../shared/conversationPatch';
 import { renderWebviewHtml } from './webviewHtml';
@@ -23,8 +22,16 @@ export interface TaskLogSession {
 export interface TaskLogPanelDeps {
   session: TaskLogSession;
   getTask: (taskId: string) => Task | undefined;
+  /** The task's dotted reference ("2", "2.1"): a subtask's own order restarts at 1. */
+  orderLabel?: (taskId: string) => string | undefined;
+  /** Every runner's account limits; the panel shows only those of the runner its task is assigned to. */
+  accountLimits?: () => readonly AccountLimitSnapshot[];
+  /** Open a workspace-relative file the handoff saved, such as its patch (ADR-0050). */
+  openFile: (path: string) => void;
   log: (msg: string) => void;
 }
+
+const NO_LIMITS = JSON.stringify([]);
 
 // A plan event that can change the task the header describes. Everything else
 // the panel hears is ignored, so a planner's text deltas cost it nothing.
@@ -47,6 +54,16 @@ export class TaskLogPanel {
   private sequence = 0;
   private ready = false;
   private lastStatus = '';
+  /** What the webview holds; a new one starts with none. */
+  private lastLimits = NO_LIMITS;
+  /** When the runner last went quiet, as the status stream says it: the Session keeps no per-task answer to ask for. */
+  private idleSince: string | null = null;
+  /**
+   * The task's latest attempt, the model its own calls last ran on there, and
+   * the assignment that was current when it was seen: an account that meters
+   * one provider is drawn by what serves the task, not only by what was planned.
+   */
+  private served: { attempt: number; model?: string; assignment?: string } = { attempt: 0 };
 
   constructor(
     private readonly panel: vscode.WebviewPanel,
@@ -69,7 +86,7 @@ export class TaskLogPanel {
     panel.onDidDispose(() => onDisposed());
   }
 
-  /** Bring the tab to the front; used when "Open log" is clicked on an open panel. */
+  /** Bring the tab to the front; used when "Open chat" is clicked on an open panel. */
   reveal(): void { this.panel.reveal(); }
 
   dispose(): void { this.panel.dispose(); }
@@ -81,13 +98,51 @@ export class TaskLogPanel {
   receive(msg: SessionMessage): void {
     if (msg.type === 'task_log') {
       if (msg.taskId !== this.taskId) return;
+      if (this.observeServed(msg.attempt, msg.events)) this.pushAccountLimits();
       const previous = this.follow.attempt;
       this.follow = followTaskLog(this.follow, { type: 'live', attempt: msg.attempt, events: msg.events, position: this.position(++this.sequence) });
       if (this.ready && this.follow.attempt > previous) this.load(this.follow.attempt);
       else this.push();
       return;
     }
-    if (TASK_STATE_EVENTS.has(msg.type)) this.pushStatus();
+    if (msg.type === 'status_update') this.idleSince = msg.tasks.find((t) => t.id === this.taskId)?.idleSince ?? null;
+    if (TASK_STATE_EVENTS.has(msg.type)) {
+      this.pushStatus();
+      // A reassigned task draws its new runner's account.
+      this.pushAccountLimits();
+    }
+  }
+
+  /**
+   * The limits of the account the task's runner uses now, when they differ
+   * from what the panel was last sent. Never the planner's or another
+   * runner's, and never from the attempt on screen: they are the account's
+   * live state.
+   */
+  pushAccountLimits(): void {
+    if (!this.ready) return;
+    const task = this.deps.getTask(this.taskId);
+    const limits = accountLimitsOf(this.deps.accountLimits?.() ?? [], task && assignedRunnerOf(task), task && this.servedModel(task));
+    const key = JSON.stringify(limits);
+    if (key === this.lastLimits) return;
+    this.lastLimits = key;
+    this.panel.webview.postMessage({ type: 'accountLimits', limits } satisfies HostToTaskLog);
+  }
+
+  /** Whether the latest attempt's own calls now name another model than before. */
+  private observeServed(attempt: number, events: readonly TaskLogEvent[]): boolean {
+    const before = this.served;
+    if (attempt > this.served.attempt) this.served = { attempt };
+    const model = attempt === this.served.attempt ? lastServedModel(events) : undefined;
+    const task = model ? this.deps.getTask(this.taskId) : undefined;
+    if (model && task) this.served = { attempt, model, assignment: assignmentKey(task) };
+    return this.served.model !== before.model || this.served.assignment !== before.assignment;
+  }
+
+  /** What serves the task now: its latest attempt's model, while the assignment it ran under stands; else the assignment's. */
+  private servedModel(task: Task): string | undefined {
+    if (this.served.model && this.served.assignment === assignmentKey(task)) return this.served.model;
+    return task.assignedModel?.modelId;
   }
 
   private handle(msg: TaskLogToHost): void {
@@ -97,6 +152,9 @@ export class TaskLogPanel {
         // The first attempt may not have existed when the panel was built.
         if (this.follow.attempt === 0) this.loadLatest();
         else this.postInit();
+        // A reloaded webview holds nothing, so it is sent them whatever was sent before.
+        this.lastLimits = NO_LIMITS;
+        this.pushAccountLimits();
         return;
       case 'selectAttempt':
         this.selectAttempt(msg.attempt);
@@ -120,11 +178,14 @@ export class TaskLogPanel {
         this.controlAsync(() => this.userCommand({ command: 'interrupt_task', task: this.taskId }));
         return;
       case 'cancelResume':
-        this.controlAsync(() => this.userCommand({ command: 'cancel_resume', task: this.taskId }));
+        this.controlAsync(() => this.userCommand(taskActionCommand('cancel-resume', this.taskId)));
         return;
       case 'resumeNow':
         this.follow = { ...this.follow, followLatest: true };
-        this.controlAsync(() => this.userCommand({ command: 'retry_task', task: this.taskId, from: 'session' }));
+        this.controlAsync(() => this.userCommand(taskActionCommand('resume-now', this.taskId)));
+        return;
+      case 'openFile':
+        this.deps.openFile(msg.path);
         return;
       case 'continueTask':
         // The continue is a new attempt: show it, even from an earlier one.
@@ -164,6 +225,8 @@ export class TaskLogPanel {
     // Session reads and broadcasts share this stack, so the local sequence
     // marks exactly what the synchronous read contains, just as the daemon's.
     const events = attempt > 0 ? this.deps.session.taskLog(this.taskId, attempt) : [];
+    // What served a saved attempt the panel did not hear live comes from this read, never from a second one.
+    this.observeServed(attempt, events);
     this.follow = followTaskLog(this.follow, { type: 'loaded', attempt, events, position: this.position() });
     this.sent = [];
     if (this.ready) this.postInit();
@@ -199,36 +262,27 @@ export class TaskLogPanel {
 
   private status(): TaskLogStatus {
     const task = this.deps.getTask(this.taskId);
-    const resumes = task ? resumeLabel(task) : null;
-    const spend = task ? taskUsageSummary(task) : undefined;
-    // A log saved before attempt ledgers still measured its own usage; it is
-    // the only report there is, and the TUI task view draws it too.
-    const logged = this.follow.view.usage;
-    const loggedLine = logged && isMeasured(logged.totals) ? usageLine(logged) : undefined;
-    const usage = spend && spend.attempts > 0
-      ? { totals: spend.totals, ...(spend.contextFill ? { contextFill: spend.contextFill } : {}) }
-      : loggedLine
-        ? { totals: loggedLine.totals, ...(loggedLine.contextFill ? { contextFill: loggedLine.contextFill } : {}) }
-        : undefined;
+    const approvals = this.deps.session.outstandingApprovals()
+      .filter((p) => p.request.kind === 'runner_tool' && p.request.taskId === this.taskId).length;
     return {
-      commands: latestTaskCommands(this.deps.session, this.taskId),
       taskId: this.taskId,
       order: task?.order ?? 0,
+      orderLabel: this.deps.orderLabel?.(this.taskId),
       title: task?.title ?? '',
-      runner: task?.assignedRunner ?? '',
-      planStatus: task?.status ?? 'pending',
-      awaitingReason: task?.awaitingReason,
-      ...(resumes ? { resumes } : {}),
-      awaitingApproval: this.deps.session.outstandingApprovals()
-        .filter((p) => p.request.kind === 'runner_tool' && p.request.taskId === this.taskId).length,
-      working: this.follow.view.working,
-      lastTurnEnd: this.follow.view.lastTurnEnd,
+      runner: (task && assignedRunnerOf(task)) ?? '',
+      script: task?.type === 'script',
+      header: taskLogHeaderView({
+        status: task?.status ?? '',
+        ...(task?.awaitingReason ? { awaitingReason: task.awaitingReason } : {}),
+        ...(task?.skipReason !== undefined ? { skipReason: task.skipReason } : {}),
+        resumeAt: task?.resumeAt ?? null,
+        idleSince: this.idleSince,
+        continuable: task ? canContinue(task) : false,
+        attemptUsage: task?.attemptUsage ?? [],
+      }, this.follow, approvals, this.follow.attempt),
       queued: this.follow.view.queued,
       attempts: this.follow.attempts,
       attempt: this.follow.attempt,
-      continuable: task ? canContinue(task) : false,
-      resumable: task ? pausedOnLimit(task) && canContinue(task) : false,
-      ...(usage ? { usage } : {}),
     };
   }
 
@@ -258,7 +312,12 @@ export class TaskLogPanel {
   }
 }
 
-/** The tab title ADR-0018 asks for: `Task N · <title>`. */
-export function taskTabTitle(status: Pick<TaskLogStatus, 'order' | 'title'>): string {
-  return `Task ${status.order} · ${status.title}`;
+/** A reassignment of runner or model is a new binding: what the old one was seen running on no longer speaks for it. */
+function assignmentKey(task: Task): string {
+  return `${task.assignedRunner}\0${task.assignedModel?.modelId ?? ''}`;
+}
+
+/** The tab title ADR-0018 asks for: `Task N · <title>`, with a subtask's dotted reference. */
+export function taskTabTitle(status: Pick<TaskLogStatus, 'order' | 'orderLabel' | 'title'>): string {
+  return `Task ${status.orderLabel ?? status.order} · ${status.title}`;
 }

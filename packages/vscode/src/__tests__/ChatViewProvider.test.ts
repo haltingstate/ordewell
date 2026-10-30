@@ -62,7 +62,7 @@ describe('ChatViewProvider after its webview is disposed', () => {
     executeCommand.mockClear();
 
     dispose();
-    provider.setConversationBusy(true);
+    provider.showError('late');
     provider.reveal();
 
     expect(posted).toEqual([]);
@@ -158,6 +158,28 @@ describe('ChatViewProvider.resendAllState', () => {
   });
 });
 
+describe('ChatViewProvider.setIsolationPreview', () => {
+  it('posts the preview, and a null that says the read is out', () => {
+    const { provider, posted } = providerWithCapture();
+    const preview = { status: 'no-repo' as const, repos: [], shared: [] };
+
+    provider.setIsolationPreview(preview);
+    provider.setIsolationPreview(null);
+
+    expect(posted).toEqual([{ type: 'isolationPreview', preview }, { type: 'isolationPreview', preview: null }]);
+  });
+
+  it('is not replayed to a webview that reconnects, whose branch it may no longer match', () => {
+    const { provider, posted } = providerWithCapture();
+    provider.setIsolationPreview({ status: 'no-repo', repos: [], shared: [] });
+    posted.length = 0;
+
+    provider.resendAllState();
+
+    expect(posted.map((m) => m.type)).not.toContain('isolationPreview');
+  });
+});
+
 describe('ChatViewProvider conversation reloads', () => {
   const history = [
     { role: 'user' as const, content: 'goal', timestamp: '2026-01-01T00:00:00Z' },
@@ -173,6 +195,9 @@ describe('ChatViewProvider conversation reloads', () => {
 
     expect(posted).toEqual([
       { type: 'restoreChat' },
+      // A turn the old conversation asked for is closed with it, even if the
+      // host never opened it: the restored session's input must be free.
+      { type: 'plannerTurn', active: false },
       {
         type: 'conversationPatch',
         order: ['b1', 'b2', 'b3'],
@@ -181,21 +206,23 @@ describe('ChatViewProvider conversation reloads', () => {
           expect.objectContaining({ type: 'tool', headline: { name: 'Read', keyArg: 'a.ts' }, status: 'ok' }),
           expect.objectContaining({ type: 'plan', status: 'generated', taskCount: 1 }),
         ],
+        replaced: true,
       },
     ]);
   });
 
-  it('redraws only the conversation after a compaction — a restoreChat would also wipe a running task\'s output', () => {
+  it('folds a compaction into the conversation it was made in: a patch of the new block, never a replacement or a restore', () => {
     const { provider, posted } = providerWithCapture();
-    provider.replaceConversation({ conversationHistory: history, researchLog });
+    provider.restoreChat({ conversationHistory: history, researchLog });
+    posted.length = 0;
 
-    expect(posted.map((m) => m.type)).toEqual(['conversationPatch']);
-  });
+    provider.conversation.receive({ type: 'planner_compaction', compaction: { phase: 'started', id: 'c1', origin: 'ordewell', trigger: 'manual', at: '2026-01-01T00:00:00Z' } });
+    provider.conversation.flush();
 
-  it('tells the webview when to lock and free the input', () => {
-    const { provider, posted } = providerWithCapture();
-    provider.setConversationBusy(true);
-    provider.setConversationBusy(false);
-    expect(posted).toEqual([{ type: 'conversationBusy', busy: true }, { type: 'conversationBusy', busy: false }]);
+    expect(posted).toEqual([{
+      type: 'conversationPatch',
+      order: ['b1', 'b2', 'b3', 'b4'],
+      changed: [expect.objectContaining({ type: 'compaction', compactionId: 'c1', status: 'running' })],
+    }]);
   });
 });

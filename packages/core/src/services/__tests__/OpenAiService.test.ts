@@ -20,6 +20,8 @@ import { OpenAiService } from '../OpenAiService';
 import { PlannerUsageLedger } from '../PlannerUsage';
 import { SessionWindows } from '../ContextWindowFill';
 import { TurnBudgets } from '../PlannerBudgets';
+import { createTask, type LegacyPlanState } from '../../models/Task';
+import { makeSession, testWorkspace } from './sessionTestKit';
 
 function streamOf(chunks: unknown[]): AsyncIterable<unknown> {
   return (async function* () {
@@ -194,7 +196,7 @@ describe('OpenAiService turn budgets', () => {
   it('puts the budget block in each turn\'s user message and never in the system prompt', async () => {
     createSpy.mockImplementation(() => streamOf([{ choices: [{ delta: { content: 'Which store?' }, finish_reason: 'stop' }] }]));
     let left = 40;
-    const service = new OpenAiService(cfg(), new TurnBudgets([() => `Web reads left this turn: ${left}.`]));
+    const service = new OpenAiService(cfg(), { turnBudgets: new TurnBudgets([() => `Web reads left this turn: ${left}.`]) });
     await service.startConversation({ goal: 'add a cache', runners: ['claude-code'], modelsByRunner: {}, fs: fakeFileSystem(), onProgress: () => {} });
     left = 39;
     await service.continueConversation('in-process', () => {});
@@ -236,6 +238,131 @@ describe('OpenAiService conversation history', () => {
 
     const sent = createSpy.mock.calls.at(-1)?.[0] as { messages: Parameters<typeof unansweredCalls>[0] };
     expect(unansweredCalls(sent.messages)).toEqual([]);
+  });
+});
+
+/**
+ * A provider counting four characters of message text to a token, so what a
+ * call is measured at follows what it carries.
+ */
+function measuring(next: () => unknown[]) {
+  return ({ messages }: { messages: Array<{ content?: string | null }> }) => {
+    const promptTokens = Math.ceil(messages.reduce((n, m) => n + (m.content ?? '').length, 0) / 4);
+    return streamOf([...next(), { choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: 5 } }]);
+  };
+}
+
+/** A window whose ceiling (three quarters of a window under 128k) sits just over `promptTokens`, so a call carrying more is pruned. */
+const windowJustOver = (promptTokens: number) => Math.floor((promptTokens * 1.05) / 0.75);
+
+/** What the provider measured the last call at. */
+const lastPromptTokens = () => (createSpy.mock.calls.at(-1)![0] as { messages: Array<{ content?: string | null }> }).messages.reduce((n, m) => n + (m.content ?? '').length, 0) / 4;
+
+// ADR-0012 T10: a history pruned in place may have lost what a turn was sent,
+// so the conversation is told of every pruning that removed something.
+describe('OpenAiService compactions', () => {
+  beforeEach(() => { createSpy.mockReset(); });
+
+  const readsFile = (id: string) => () => [
+    { choices: [{ delta: { tool_calls: [{ index: 0, id, function: { name: 'read_file', arguments: `{"path":"${id}.ts"}` } }] }, finish_reason: 'tool_calls' }] },
+  ];
+  const answers = () => [{ choices: [{ delta: { content: 'Read it.' }, finish_reason: 'stop' }] }];
+  const script = (...turns: Array<() => unknown[]>) => createSpy.mockImplementation(measuring(() => turns.shift()!()));
+  const start = (service: OpenAiService) => service.startConversation({
+    goal: 'add a cache', runners: ['claude-code'], modelsByRunner: {}, onProgress: () => {},
+    fs: fakeFileSystem({ readFile: async () => ({ success: true, output: 'x'.repeat(40_000), truncated: false }) }),
+  });
+
+  it('counts a pruning ahead of a call, and no call that found nothing to prune', async () => {
+    const catalog: { contextWindow?: number } = {};
+    const service = new OpenAiService(cfg(), { modelLimits: () => catalog });
+    script(readsFile('a'), answers, answers, answers);
+    await start(service);
+    expect(service.compactions()).toBe(0);
+
+    // The read is a turn old: the next message has no room for it.
+    catalog.contextWindow = windowJustOver(lastPromptTokens());
+    await service.continueConversation('go on', () => {});
+    expect(service.compactions()).toBe(1);
+
+    await service.continueConversation('and on', () => {});
+    expect(service.compactions()).toBe(1);
+  });
+
+  it('counts a pruning asked for through pruneContext, which keeps the two newest rounds', async () => {
+    script(readsFile('a'), readsFile('b'), readsFile('c'), answers);
+    const service = new OpenAiService(cfg());
+    await start(service);
+    expect(service.compactions()).toBe(0);
+
+    expect(service.pruneContext()).toBeGreaterThan(0);
+    expect(service.compactions()).toBe(1);
+    expect(service.pruneContext()).toBe(0);
+    expect(service.compactions()).toBe(1);
+  });
+});
+
+// ADR-0012 T10 end to end, through a session: the message list keeps every
+// turn, so the plan goes whole once, then as what changed.
+describe('the plan block an API planner is sent', () => {
+  beforeEach(() => { createSpy.mockReset(); });
+
+  const WHOLE = /^<current_plan>$/m;
+  const says = () => [{ choices: [{ delta: { content: 'Noted.' }, finish_reason: 'stop' }] }];
+  const readsAFile = () => [
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-read', function: { name: 'read_file', arguments: '{"path":"a.ts"}' } }] }, finish_reason: 'tool_calls' }] },
+  ];
+
+  function twoTaskPlan(): LegacyPlanState {
+    return {
+      tasks: [
+        createTask({ id: 'a', order: 1, title: 'Setup', prompt: 'p', assignedRunner: 'claude-code' }),
+        createTask({ id: 'b', order: 2, title: 'Build', prompt: 'p', dependencies: ['a'], assignedRunner: 'claude-code' }),
+      ],
+      generatedAt: '2026-10-23T09:00:00Z',
+      status: 'draft',
+      runners: ['claude-code'],
+      lastUpdated: '2026-10-23T09:00:00Z',
+      conversationHistory: [
+        { role: 'user', content: 'add a cache', timestamp: '2026-10-23T09:00:00Z' },
+        { role: 'assistant', content: 'Two tasks.', timestamp: '2026-10-23T09:00:01Z' },
+      ],
+    };
+  }
+
+  it('goes whole into the replay, then as what changed, and whole again after a turn pruned the history', async () => {
+    const sent: string[] = [];
+    const calls: Array<() => unknown[]> = [says, says, readsAFile, says, says, says];
+    const measured = measuring(() => calls.shift()!());
+    createSpy.mockImplementation((req: { messages: Array<{ role: string; content: string }> }) => {
+      const last = req.messages.at(-1);
+      if (last?.role === 'user') sent.push(last.content);
+      return measured(req);
+    });
+    const catalog: { contextWindow?: number } = {};
+    const session = makeSession({
+      aiService: new OpenAiService(cfg(), { modelLimits: () => catalog }),
+      fsAdapter: fakeFileSystem({ readFile: async () => ({ success: true, output: 'x'.repeat(40_000), truncated: false }) }),
+    });
+    session.loadPlan(twoTaskPlan(), 'add a cache', testWorkspace, { persist: false });
+
+    await session.continueConversation('what is there?');
+    await session.continueConversation('anything new?');
+    await session.continueConversation('read a.ts');
+    // The read is a turn old by the next message, which has no room for it.
+    // That turn's blocks were built before its call pruned, against a context
+    // that held them (pruning takes tool output only); the turn after it goes whole.
+    catalog.contextWindow = windowJustOver(lastPromptTokens());
+    await session.continueConversation('and now?');
+    await session.continueConversation('and then?');
+
+    expect(sent).toHaveLength(5);
+    expect(sent[0]).toMatch(WHOLE);
+    expect(sent[1]).not.toMatch(WHOLE);
+    expect(sent[1]).toMatch(/<plan_changes>[^\n]*unchanged/);
+    expect(sent[2]).not.toMatch(WHOLE);
+    expect(sent[3]).not.toMatch(WHOLE);
+    expect(sent[4]).toMatch(WHOLE);
   });
 });
 
@@ -357,8 +484,9 @@ describe('OpenAiService execution tools (ADR-0029)', () => {
       plannerTools: { sessionId: 's1', handler: { stopTask } },
     });
 
-    expect(toolNames(0)).toEqual(expect.arrayContaining(['run_plan', 'run_task', 'stop_task', 'stop_run', 'retry_task', 'message_task', 'answer_approval']));
+    expect(toolNames(0)).toEqual(expect.arrayContaining(['run_plan', 'run_task', 'stop_task', 'stop_run', 'retry_task', 'message_task', 'answer_approval', 'answer_checkpoint']));
     expect(systemPrompt()).toContain('RUNNING THE PLAN:');
+    expect(systemPrompt()).toMatch(/- answer_checkpoint .*Only the supervisor at Act may, in a wake-up turn; in the user's own turn they answer it from the task's checkpoint card/);
     expect(stopTask).toHaveBeenCalledWith({ task: '2' }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     const fedBack = (createSpy.mock.calls[1][0] as { messages: Array<{ role: string; content: string }> }).messages.find((m) => m.role === 'tool');
     expect(fedBack?.content).toBe('{"ok":true,"result":"Stopped task #2."}');

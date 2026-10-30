@@ -2,10 +2,11 @@ import { describe, it, expect, vi, type Mock, type Mocked } from 'vitest';
 import { runEffect, type EffectDeps, type OrdewellApi } from '../effects';
 import { initialState, reduce, type Action } from '../reducer';
 import type { Effect } from '../reducer';
-import type { SessionMessage } from '@ordewell/core';
+import { fromTranscript, RUN_SETTINGS_DEFAULTS, type IsolationPreview, type SessionMessage } from '@ordewell/core';
 import { DaemonError } from '../../apiClient';
 import type { TuiState } from '../state';
 import { chatOf, messagesOf } from './chat';
+import { emptyEditor } from '../editor';
 
 function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {}) {
   const actions: Action[] = [];
@@ -19,18 +20,9 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
       executePlan: vi.fn().mockResolvedValue({ status: 'started' }),
       stopExecution: vi.fn().mockResolvedValue({ status: 'stopped' }),
       cancelPlanning: vi.fn().mockResolvedValue({ cancelled: true }),
-      taskControl: vi.fn().mockResolvedValue({ ok: true }),
-      skipTask: vi.fn().mockResolvedValue({ ok: true }),
-      markTaskComplete: vi.fn().mockResolvedValue({ ok: true }),
-      markTaskIncomplete: vi.fn().mockResolvedValue({ ok: true }),
+      execute: vi.fn().mockResolvedValue({ ok: true, message: 'Done.' }),
       getTaskLogAttempts: vi.fn().mockResolvedValue({ attempts: [] }),
       getTaskLog: vi.fn().mockResolvedValue({ attempt: 1, events: [] }),
-      sendTaskMessage: vi.fn().mockResolvedValue({ id: 'm1' }),
-      removeQueuedTaskMessage: vi.fn().mockResolvedValue({ removed: true }),
-      forceSendTaskMessage: vi.fn().mockResolvedValue({ id: 'm2' }),
-      forceSendQueuedTaskMessage: vi.fn().mockResolvedValue({ sent: true }),
-      interruptTask: vi.fn().mockResolvedValue({ ok: true }),
-      continueTask: vi.fn().mockResolvedValue({ ok: true }),
       addTask: vi.fn().mockResolvedValue({ ok: true }),
       updateTask: vi.fn().mockResolvedValue({ ok: true }),
       setMergeAtGatesAutomatically: vi.fn().mockResolvedValue({ ok: true }),
@@ -44,13 +36,14 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
       getRunners: vi.fn().mockResolvedValue({ runners: [{ id: 'claude-code', name: 'Claude Code', enabled: true }], orchestratorModel: 'm/1' }),
       setRunnerEnabled: vi.fn().mockResolvedValue({ ok: true }),
       getModels: vi.fn().mockResolvedValue({ models: [], providers: [] }),
+      getIsolationPreview: vi.fn().mockResolvedValue({ preview: { status: 'no-repo', repos: [], shared: [] } }),
       streamPlanning: vi.fn().mockReturnValue({ close: vi.fn() }),
       streamExecution: vi.fn().mockImplementation((_id: string, _callback: (event: unknown) => void, onReady?: (error?: Error) => void) => {
         onReady?.();
         return Promise.resolve();
       }),
       closeExecutionStream: vi.fn(),
-      followSession: vi.fn().mockReturnValue({ ready: Promise.resolve(), ended: new Promise(() => {}), close: vi.fn() }),
+      followSession: vi.fn().mockReturnValue({ ready: Promise.resolve(true), ended: new Promise(() => {}), close: vi.fn() }),
       ...api,
     } as OrdewellApi,
     workspace: '/ws',
@@ -64,6 +57,7 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
     // fixtures on the developer's actual clipboard.
     hasBin: () => true,
     pipeToClipboard: vi.fn(),
+    login: vi.fn().mockResolvedValue({ ok: true }),
     writeTerminal: vi.fn(),
     reviveDaemon: vi.fn().mockResolvedValue(true),
     exit,
@@ -100,6 +94,16 @@ describe('planning', () => {
     expect(h.actions[0]).toEqual({ type: 'sessionStarted', sessionId: 'session-new', goal: 'ship it' });
   });
 
+  it('reads the new session\'s settings once it exists, not the file\'s for the next one', async () => {
+    const run = { ...RUN_SETTINGS_DEFAULTS, autorun: true };
+    const h = harness({ getSettings: vi.fn().mockResolvedValue({ run }) });
+
+    await runEffect({ type: 'startConversation', goal: 'ship it' }, h.deps);
+
+    expect(h.api.getSettings).toHaveBeenCalledWith('session-new');
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'settingsLoaded', sessionId: 'session-new', settings: { run } }));
+  });
+
   /** A harness whose planning socket the test drives from inside the REST call. */
   function streaming(call: (emit: (e: unknown) => void) => Promise<unknown>, method: 'startConversation' | 'sendConversationMessage' | 'forceSendPlannerMessage' = 'startConversation') {
     let emit: (e: unknown) => void = () => {};
@@ -129,6 +133,14 @@ describe('planning', () => {
     open();
     await sent;
     expect(h.api.sendConversationMessage).toHaveBeenCalledWith('s1', 'add streaming');
+  });
+
+  it('reloads the runner list after a planner turn, so a login made outside the TUI clears the flag', async () => {
+    const h = harness();
+
+    await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'carry on' }, h.deps);
+
+    expect(h.api.getRunners).toHaveBeenCalled();
   });
 
   it('passes the turn\'s messages to the reducer as they came, one action each', async () => {
@@ -411,7 +423,7 @@ describe('planning', () => {
   it('dispatches a burst still held when the turn fails, ahead of the failure', async () => {
     const h = streaming(async (emit) => {
       emit({ type: 'planner_text_delta', turnId: 't1', segmentId: 's1', text: 'Half a' });
-      throw new Error('no key');
+      throw new DaemonError('no key', 400);
     });
 
     await runEffect({ type: 'startConversation', goal: 'x' }, h.deps);
@@ -471,9 +483,9 @@ describe('planning', () => {
   });
 
   it('clears the optimistic session id when the very first planning call fails', async () => {
-    // The daemon registers a session only after planning succeeds, so keeping
-    // the id would route every following message to a session that is not there.
-    const h = harness({ startConversation: vi.fn().mockRejectedValue(new Error('no key')) });
+    // A refusal the daemon answered leaves no conversation a reply could
+    // continue, so keeping the id would route every following message to nothing.
+    const h = harness({ startConversation: vi.fn().mockRejectedValue(new DaemonError('no key', 400)) });
     await runEffect({ type: 'startConversation', goal: 'x' }, h.deps);
 
     expect(types(h.actions)).toContain('sessionCleared');
@@ -484,18 +496,26 @@ describe('planning', () => {
     const close = vi.fn();
     const h = harness({
       streamPlanning: vi.fn().mockReturnValue({ close }),
-      startConversation: vi.fn().mockRejectedValue(new Error('no key')),
+      startConversation: vi.fn().mockRejectedValue(new DaemonError('no key', 400)),
     });
 
     await runEffect({ type: 'startConversation', goal: 'x' }, h.deps);
     expect(close).toHaveBeenCalled();
-    expect(h.actions).toContainEqual({ type: 'failed', message: 'no key', turn: true });
+    expect(h.actions).toContainEqual({ type: 'failed', message: 'no key', turn: true, sessionId: 'session-new' });
   });
 
   it('continues an open conversation', async () => {
     const h = harness();
     await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'use bcrypt' }, h.deps);
     expect(h.api.sendConversationMessage).toHaveBeenCalledWith('s1', 'use bcrypt');
+  });
+
+  // The user can load another session while this turn runs; the reducer drops
+  // a failure that names a session no longer on screen.
+  it('names the session a failed turn was for', async () => {
+    const h = harness({ sendConversationMessage: vi.fn().mockRejectedValue(new DaemonError('planner down', 500)) });
+    await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'use bcrypt' }, h.deps);
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'failed', turn: true, sessionId: 's1' }));
   });
 
   // Turn serialization moved out of the effect layer and into the reducer:
@@ -843,34 +863,21 @@ describe('duplicate run subscriptions', () => {
 });
 
 describe('task control', () => {
+  // Every task action is one command at the seam (core's taskActionCommand), whichever button sent it.
   it.each([
-    ['retry', 'retry'],
-    ['cancel', 'cancel'],
-    ['force-start', 'force-start'],
-  ] as const)('%s goes to the orchestrator', async (action, segment) => {
+    ['retry', { command: 'retry_task', task: 't1', from: 'fresh' }],
+    ['cancel', { command: 'stop_task', task: 't1' }],
+    ['force-start', { command: 'force_start', task: 't1' }],
+    ['resume-now', { command: 'retry_task', task: 't1', from: 'session' }],
+    ['cancel-resume', { command: 'cancel_resume', task: 't1' }],
+    ['complete', { command: 'mark_complete', task: 't1' }],
+    ['uncomplete', { command: 'mark_not_done', task: 't1' }],
+    ['skip', { command: 'skip_task', task: 't1' }],
+  ] as const)('%s sends its command to the seam, and no other', async (action, command) => {
     const h = harness();
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action }, h.deps);
-    expect(h.api.taskControl).toHaveBeenCalledWith('s1', 't1', segment);
-  });
-
-  it('completing a task marks it complete', async () => {
-    const h = harness();
-    await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
-    expect(h.api.markTaskComplete).toHaveBeenCalledWith('s1', 't1');
-  });
-
-  it('un-completing a task marks it not done', async () => {
-    const h = harness();
-    await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'uncomplete' }, h.deps);
-    expect(h.api.markTaskIncomplete).toHaveBeenCalledWith('s1', 't1');
-    expect(h.api.markTaskComplete).not.toHaveBeenCalled();
-  });
-
-  it('skipping a task skips it, and never marks it complete: only Mark complete vouches for work', async () => {
-    const h = harness();
-    await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'skip' }, h.deps);
-    expect(h.api.skipTask).toHaveBeenCalledWith('s1', 't1');
-    expect(h.api.markTaskComplete).not.toHaveBeenCalled();
+    expect(h.api.execute).toHaveBeenCalledOnce();
+    expect(h.api.execute).toHaveBeenCalledWith('s1', command);
   });
 
   it('refreshes the plan after a task action so the pane matches the server', async () => {
@@ -888,15 +895,15 @@ describe('task control', () => {
         onEvent({ type: 'status_update', tasks: [{ id: 't1', status: 'in_progress' }] });
         return Promise.resolve();
       }),
-      taskControl: vi.fn().mockImplementation(async () => {
-        order.push('taskControl');
-        return { ok: true };
+      execute: vi.fn().mockImplementation(async () => {
+        order.push('execute');
+        return { ok: true, message: 'Done.' };
       }),
     });
 
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'force-start', watch: true }, h.deps);
 
-    expect(order).toEqual(['streamExecution', 'taskControl']);
+    expect(order).toEqual(['streamExecution', 'execute']);
     expect(h.actions).toContainEqual({
       type: 'statusUpdate',
       tasks: [{ id: 't1', status: 'in_progress' }],
@@ -963,10 +970,10 @@ describe('planner switch', () => {
 
     await runEffect({ type: 'setPlanner', provider: 'claude-code' }, h.deps);
 
-    expect(h.actions).toContainEqual({
+    expect(h.actions).toContainEqual(expect.objectContaining({
       type: 'settingsLoaded',
       settings: { aiProvider: 'claude-code', orchestratorModel: 'sonnet', plannerThinkingEffort: 'high' },
-    });
+    }));
   });
 
   it('says which model it restored, when the daemon remembered one', async () => {
@@ -1051,6 +1058,130 @@ describe('planner choice', () => {
       { type: 'notice', message: 'Planner: Claude Code · Claude Opus 5.5 · High effort' },
     ]);
   });
+
+  it('shows a signed-out pick at error level, the words unchanged', async () => {
+    const h = harness();
+    await runEffect({ ...choice, noticeLevel: 'error' }, h.deps);
+    expect(h.actions.filter((a) => a.type === 'notice')).toEqual([
+      { type: 'notice', message: 'Planner: Claude Code · Claude Opus 5.5 · High effort', level: 'error' },
+    ]);
+  });
+});
+
+describe('runner login', () => {
+  const loginEffect: Effect = { type: 'plannerLogin', command: ['claude', 'login'], label: 'Claude Code' };
+
+  it('runs the login command, re-probes the runners, then says the agent is signed in', async () => {
+    const order: string[] = [];
+    const h = harness({}, {
+      login: vi.fn(async () => {
+        order.push('login');
+        return { ok: true };
+      }),
+    });
+    h.api.getRunners.mockImplementation(async () => {
+      order.push('runners');
+      return {
+        runners: [{
+          id: 'claude-code', name: 'Claude Code', enabled: true,
+          auth: { state: 'signed-in' as const, loginCommand: ['claude', 'auth', 'login'] },
+        }],
+        orchestratorModel: '',
+      };
+    });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(h.deps.login).toHaveBeenCalledWith(['claude', 'login']);
+    // The welcome line and the picker read the daemon's fresh probe, so the
+    // reload must follow the child rather than run before it.
+    expect(order).toEqual(['login', 'runners']);
+    expect(messageOf(h.actions, 'notice')).toBe('Claude Code is signed in.');
+  });
+
+  it('reloads the runners after a failed login too, and reports the message the login gave as context', async () => {
+    const h = harness({}, {
+      login: vi.fn(async () => ({ ok: false, message: 'claude exited with status 1 without finishing the login.' })),
+    });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(h.api.getRunners).toHaveBeenCalled();
+    expect(messageOf(h.actions, 'notice')).toContain('Could not confirm that Claude Code is signed in');
+    expect(messageOf(h.actions, 'notice')).toContain('claude exited with status 1 without finishing the login.');
+  });
+
+  it('names the agent when a failed login gave no message', async () => {
+    const h = harness({}, { login: vi.fn(async () => ({ ok: false })) });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(messageOf(h.actions, 'notice')).toBe('Could not confirm that Claude Code is signed in: the login did not finish');
+  });
+
+  it('believes a fresh signed-in verdict even when the child exited non-zero', async () => {
+    // The child's exit is not the runner's verdict, in either direction: a
+    // login that reports a failure can still leave the account signed in.
+    const h = harness({
+      getRunners: vi.fn().mockResolvedValue({
+        runners: [{
+          id: 'claude-code', name: 'Claude Code', enabled: true,
+          auth: { state: 'signed-in', loginCommand: ['claude', 'auth', 'login'] },
+        }],
+        orchestratorModel: '',
+      }),
+    }, { login: vi.fn(async () => ({ ok: false, message: 'claude exited with status 1' })) });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(messageOf(h.actions, 'notice')).toBe('Claude Code is signed in.');
+  });
+
+  it('fails the effect when the login throws, so the runtime restores the terminal', async () => {
+    const h = harness({}, {
+      login: vi.fn(async () => {
+        throw new Error('spawn claude ENOENT');
+      }),
+    });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(messageOf(h.actions, 'failed')).toContain('spawn claude ENOENT');
+  });
+
+  it('never starts the login twice when the reload after it finds the server gone', async () => {
+    // `runEffect` retries a refused connection, and this effect is not one it
+    // may replay: the child already ran and the user may already be signed in.
+    const login = vi.fn(async () => ({ ok: true }));
+    const h = harness({ getRunners: vi.fn().mockRejectedValue(refused()) }, { login });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(login).toHaveBeenCalledTimes(1);
+    expect(messageOf(h.actions, 'notice')).toContain('Could not confirm that Claude Code is signed in.');
+    expect(messageOf(h.actions, 'notice')).toContain('could not be refreshed');
+  });
+
+  it('does not claim a sign-in the fresh probe still contradicts', async () => {
+    // The child's exit code is not the runner's own verdict: a login can print
+    // success and still leave the account signed out. Claiming success here
+    // leaves the red welcome line and the planner gate disagreeing with the
+    // notice the user just read.
+    const h = harness({
+      getRunners: vi.fn().mockResolvedValue({
+        runners: [{
+          id: 'claude-code', name: 'Claude Code', enabled: true,
+          auth: { state: 'signed-out', loginCommand: ['claude', 'auth', 'login'] },
+        }],
+        orchestratorModel: '',
+      }),
+    }, { login: vi.fn(async () => ({ ok: true })) });
+
+    await runEffect(loginEffect, h.deps);
+
+    expect(messageOf(h.actions, 'notice')).not.toBe('Claude Code is signed in.');
+    expect(messageOf(h.actions, 'notice')).toMatch(/still|not logged in/i);
+  });
 });
 
 describe('settings', () => {
@@ -1095,6 +1226,22 @@ describe('settings', () => {
     expect(types(h.actions)).toEqual(['runnersLoaded']);
   });
 
+  it('carries each runner\'s login verdict into the state', async () => {
+    const auth = { state: 'signed-out' as const, loginCommand: ['claude', 'login'] };
+    const h = harness({
+      getRunners: vi.fn().mockResolvedValue({
+        runners: [{ id: 'claude-code', name: 'Claude Code', enabled: true, auth }],
+        orchestratorModel: 'm/1',
+      }),
+    });
+    await runEffect({ type: 'loadRunners' }, h.deps);
+    expect(h.actions).toContainEqual({
+      type: 'runnersLoaded',
+      runners: [{ id: 'claude-code', name: 'Claude Code', enabled: true, auth }],
+      orchestratorModel: 'm/1',
+    });
+  });
+
   it('applies a confirmed runner set as one batch, reloading and reporting once', async () => {
     const h = harness();
     await runEffect({
@@ -1110,6 +1257,14 @@ describe('settings', () => {
     expect(h.actions).toContainEqual({ type: 'notice', message: 'Runners enabled: OpenCode.' });
   });
 
+  it('reads the settings of the session on screen when the scope reloads', async () => {
+    const h = harness();
+    await runEffect({ type: 'loadScope', sessionId: 's1' }, h.deps);
+
+    expect(h.api.getSettings).toHaveBeenCalledWith('s1');
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'settingsLoaded', sessionId: 's1' }));
+  });
+
   it('/settings saves the run settings in one update, then parallel and autonomy, with one notice', async () => {
     const run = { supervisorLevel: 'watch', mergeAtGatesAutomatically: false, autorun: true, supervisorRetryLimit: 3, wakeUpReadBudget: 12 };
     const saved: boolean[] = [];
@@ -1122,7 +1277,7 @@ describe('settings', () => {
       message: 'Settings: Autonomy Guarded · Supervisor retries 3 · Autorun on · Parallel 3', sessionId: 's1',
     }, h.deps);
     expect(h.api.updateRunSettings.mock.calls).toEqual([[{ autorun: true, supervisorRetryLimit: 3 }, 's1']]);
-    expect(h.actions).toContainEqual({ type: 'settingsLoaded', settings: { run } });
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'settingsLoaded', settings: { run } }));
     expect(h.api.updateSettings).toHaveBeenCalledWith({ env: { ORDEWELL_MAX_PARALLEL: '3' } });
     expect(h.env.ORDEWELL_MAX_PARALLEL).toBe('3');
     expect(saved).toEqual([false]);
@@ -1226,12 +1381,52 @@ describe('catalogs and sessions', () => {
     expect(h.api.adoptSession).toHaveBeenCalledWith('s9', '/ws');
   });
 
+  // The daemon says the planner is compacting; the transcript the chat is
+  // drawn from cannot, so the load ends with the compaction folded in and the
+  // planner busy until its end arrives.
+  it('loading a session that is mid-compaction shows it running and holds the planner until its end', async () => {
+    const started = { type: 'planner_compaction', compaction: { phase: 'started', id: 'c1', origin: 'ordewell', trigger: 'auto', at: '2026-01-02T00:00:00.000Z' } } as const;
+    const h = harness({ adoptSession: vi.fn().mockResolvedValue({ plan: { tasks: [] }, goal: 'g', plannerCompaction: started }) });
+    await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
+
+    let state = h.actions.reduce((s, a) => reduce(s, a).state, initialState({ sessionId: 's9' }));
+    expect(state.planner).toBe('compacting');
+    expect(state.conversation.blocks.filter((b) => b.type === 'compaction')).toEqual([expect.objectContaining({ compactionId: 'c1', status: 'running' })]);
+
+    state = reduce(state, { type: 'sessionMessage', sessionId: 's9', message: { ...started, compaction: { phase: 'ended', id: 'c1', origin: 'ordewell', trigger: 'auto', outcome: 'condensed', at: '2026-01-02T00:00:05.000Z' } } }).state;
+    expect(state.planner).toBe('idle');
+  });
+
   it('loading a session restores its plan and goal', async () => {
     const h = harness();
     await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
 
     expect(h.actions).toContainEqual({ type: 'sessionLoaded', sessionId: 's9', goal: 'Rate limiting' });
     expect(h.actions).toContainEqual({ type: 'planUpdated', plan: { tasks: [{ id: 't1' }] }, sessionId: 's9' });
+  });
+
+  it('re-reads the loaded session\'s own run settings, not the file\'s', async () => {
+    const run = { ...RUN_SETTINGS_DEFAULTS, supervisorLevel: 'act' as const };
+    const h = harness({ getSettings: vi.fn().mockResolvedValue({ run }) });
+
+    await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
+
+    expect(h.api.getSettings).toHaveBeenCalledWith('s9');
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'settingsLoaded', sessionId: 's9', settings: { run } }));
+  });
+
+  it('shows the loaded session\'s values once its settings answer lands', async () => {
+    const run = { ...RUN_SETTINGS_DEFAULTS, supervisorLevel: 'act' as const };
+    const h = harness({ getSettings: vi.fn().mockResolvedValue({ run }) });
+
+    await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
+    const state = h.actions.reduce(
+      (s, action) => reduce(s, action).state,
+      initialState({ sessionId: 's1', runSettings: { ...RUN_SETTINGS_DEFAULTS, supervisorLevel: 'off' } }),
+    );
+
+    expect(state.sessionId).toBe('s9');
+    expect(state.runSettings.supervisorLevel).toBe('act');
   });
 
   it('says the session is live once it is loaded', async () => {
@@ -1248,6 +1443,18 @@ describe('catalogs and sessions', () => {
 
     expect(types(h.actions)).toContain('failed');
     expect(messageOf(h.actions, 'failed')).toContain('Reload it with /sessions');
+  });
+
+  // ADR-0049: the daemon's words name the host that holds it; the advice to
+  // reload with /sessions would be refused the same way.
+  it('reports a session another host runs in the daemon\'s words, naming that host', async () => {
+    const held = 'This session is open in another Ordewell host: a TUI (pid 76271), through its daemon on port 49558 (pid 76279) has held it since 10/24/2026, 1:40:00 AM. Close it there, or stop that process, then open it here.';
+    const h = harness({ adoptSession: vi.fn().mockRejectedValue(new DaemonError(held, 409, 'session_held')) });
+    await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
+
+    const failure = h.actions.find((a) => a.type === 'failed') as Extract<Action, { type: 'failed' }>;
+    expect(failure).toMatchObject({ message: held, code: 'session_held' });
+    expect(types(h.actions)).not.toContain('sessionLoaded');
   });
 
   it('words a missing session from the daemon\'s code, never from its message', async () => {
@@ -1295,7 +1502,7 @@ describe('catalogs and sessions', () => {
   it('an announced refresh posts the notice', async () => {
     const h = harness();
     await runEffect({ type: 'refresh', announce: true }, h.deps);
-    expect(h.actions).toContainEqual({ type: 'notice', message: 'Refreshed runners, settings and models.' });
+    expect(h.actions).toContainEqual({ type: 'notice', message: 'Refreshed runners, settings, models and repositories.' });
   });
 });
 
@@ -1303,7 +1510,7 @@ describe('failures', () => {
   // Now that loading adopts the session, this only happens when the daemon has
   // restarted underneath us — so the advice is to reload, not to re-plan.
   it('tells the user to reload a session the daemon no longer holds', async () => {
-    const h = harness({ markTaskComplete: vi.fn().mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')) });
+    const h = harness({ execute: vi.fn().mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')) });
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
 
     const failure = h.actions.find((a) => a.type === 'failed') as Extract<Action, { type: 'failed' }>;
@@ -1311,6 +1518,16 @@ describe('failures', () => {
     expect(failure.message).not.toMatch(/re-?plan/i);
     // Another surface may have deleted it: a restart is not the only way a session goes.
     expect(failure.message).toMatch(/deleted/);
+  });
+
+  it('names the host that runs the session when a call\'s re-adoption was refused, not a reload', async () => {
+    const held = 'This session is open in another Ordewell host: the Ordewell daemon on port 3742 (pid 37797) has held it since 10/24/2026, 1:40:00 AM. Close it there, or stop that process, then open it here.';
+    const h = harness({ execute: vi.fn().mockRejectedValue(new DaemonError(held, 409, 'session_held')) });
+    await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
+
+    const failure = h.actions.find((a) => a.type === 'failed') as Extract<Action, { type: 'failed' }>;
+    expect(failure.message).toBe(held);
+    expect(failure.message).not.toContain('/sessions');
   });
 
   it('shows why a model edit was refused, without the success notice (#106)', async () => {
@@ -1323,7 +1540,7 @@ describe('failures', () => {
   });
 
   it('leaves an unrelated error message alone', async () => {
-    const h = harness({ markTaskComplete: vi.fn().mockRejectedValue(new Error('disk on fire')) });
+    const h = harness({ execute: vi.fn().mockRejectedValue(new Error('disk on fire')) });
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
     expect(h.actions).toContainEqual({ type: 'failed', message: 'disk on fire' });
   });
@@ -1373,8 +1590,14 @@ describe('a daemon that went away mid-session', () => {
     const h = harness({ startConversation });
 
     await runEffect({ type: 'startConversation', goal: 'ship it' }, h.deps);
+    // Whether the opening is still the session on screen is the reducer's to say.
+    const revived = h.actions.find((a): a is Extract<Action, { type: 'openingRevived' }> => a.type === 'openingRevived');
+    expect(revived).toMatchObject({ goal: 'ship it' });
+    const { effects } = reduce(initialState({ sessionId: revived!.sessionId, planner: 'planning' }), revived!);
+    await runEffect(effects[0], h.deps);
 
     expect(startConversation).toHaveBeenCalledTimes(2);
+    expect(startConversation.mock.calls[1][0]).toBe(startConversation.mock.calls[0][0]);
   });
 
   it('gives up with an actionable message when the daemon will not come back', async () => {
@@ -1401,7 +1624,7 @@ describe('a daemon that went away mid-session', () => {
   // 404s. That is a different problem with a different fix.
   it('explains a post-revive 404 as a lost session, not as a dead server', async () => {
     const h = harness({
-      markTaskComplete: vi.fn()
+      execute: vi.fn()
         .mockRejectedValueOnce(refused())
         .mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')),
     });
@@ -1525,7 +1748,7 @@ describe('loading an in-flight conversation', () => {
     state = { ...state, editor: { ...state.editor, text: 'check tests', cursor: 11 } };
     const sent = reduce(state, { type: 'key', key: { name: 'enter' } });
     state = sent.state;
-    const h = harness({ sendConversationMessage: vi.fn().mockRejectedValue(new Error('planner down')) }, {
+    const h = harness({ sendConversationMessage: vi.fn().mockRejectedValue(new DaemonError('planner down', 500)) }, {
       dispatch: (action) => { state = reduce(state, action).state; },
     });
     await runEffect(sent.effects[0], h.deps);
@@ -1637,6 +1860,7 @@ describe('conversation fork and rewind effects', () => {
       { type: 'sessionForked', sessionId: 'session-fork', goal: 'build me a parser' },
       { type: 'chatRestored', history, sessionId: 'session-fork' },
       { type: 'planUpdated', plan, sessionId: 'session-fork' },
+      { type: 'settingsLoaded', settings: {}, read: 1, sessionId: 'session-fork' },
       { type: 'notice', message: expect.stringMatching(/Forked session-1.*session-fork/) },
     ]);
   });
@@ -1680,6 +1904,7 @@ describe('conversation fork and rewind effects', () => {
       { type: 'sessionForked', sessionId: 'session-fork', goal: 'build me a parser' },
       { type: 'chatRestored', history, sessionId: 'session-fork' },
       { type: 'planUpdated', plan, sessionId: 'session-fork' },
+      { type: 'settingsLoaded', settings: {}, read: 1, sessionId: 'session-fork' },
       { type: 'inputPrefilled', text: 'JSON only', sessionId: 'session-fork' },
       { type: 'notice', message: expect.stringMatching(/session-1.*session-fork.*from before that message.*original is kept.*\/sessions.*ready to edit and resend/) },
     ]);
@@ -1728,65 +1953,200 @@ describe('conversation fork and rewind effects', () => {
 });
 
 describe('conversation compact effect', () => {
-  const condensed = [
-    { role: 'assistant' as const, content: 'Conversation condensed: …', timestamp: '2026-01-02T00:00:00Z', kind: 'compaction' as const },
-    { role: 'user' as const, content: 'add CSV', timestamp: '2026-01-02T00:00:01Z' },
+  const checkpoint = { id: 'c1', keptFrom: 2, trigger: 'manual' as const };
+  const before = [
+    { role: 'user' as const, content: 'build me a parser', timestamp: '2026-01-02T00:00:00.000Z' },
+    { role: 'assistant' as const, content: 'Which formats?', timestamp: '2026-01-02T00:00:01.000Z' },
+    { role: 'user' as const, content: 'add CSV', timestamp: '2026-01-02T00:00:02.000Z' },
+    { role: 'assistant' as const, content: 'CSV it is.', timestamp: '2026-01-02T00:00:03.000Z' },
   ];
+  const summary = { role: 'assistant' as const, content: 'Conversation condensed: the state', timestamp: '2026-01-02T00:00:04.000Z', kind: 'compaction' as const, checkpoint };
+  const plan = { tasks: [{ id: 't1' }], conversationHistory: [...before, summary] };
+  const startedAt = '2026-01-02T00:00:03.500Z';
+  const started = (id = 'c1') => ({ type: 'planner_compaction', compaction: { phase: 'started', id, origin: 'ordewell', trigger: 'manual', at: startedAt } });
+  const ended = (outcome: string, id = 'c1') => ({ type: 'planner_compaction', compaction: { phase: 'ended', id, origin: 'ordewell', trigger: 'manual', outcome, at: '2026-01-02T00:00:04.000Z' } });
+  const generated = { type: 'plan_generated', plan, goal: 'g', runners: [] };
 
-  it('condenses, then redraws the transcript and plan from what the daemon kept', async () => {
-    const plan = { tasks: [{ id: 't1' }], conversationHistory: condensed };
-    const h = harness({ compactConversation: vi.fn().mockResolvedValue({ plan, summary: 'the state', keptMessages: 4 }) });
+  /** The TUI as /compact finds it: a session read back, scrolled up, with half a thought in the box. */
+  const session = (over: Partial<TuiState> = {}): TuiState => initialState({
+    sessionId: 'session-1',
+    planner: 'condensing',
+    conversation: fromTranscript(before, []),
+    scroll: 7,
+    editor: { ...emptyEditor(), text: 'half a thought', cursor: 14 },
+    ...over,
+  });
+
+  /** A harness whose planning and standing-follow sockets the test drives from inside the REST call. */
+  function sockets(call: (emit: (e: unknown) => void, both: (e: unknown) => void) => Promise<unknown>) {
+    let planning: (e: unknown) => void = () => {};
+    let standing: (e: unknown) => void = () => {};
+    const h = harness({
+      streamPlanning: vi.fn().mockImplementation((_id: string, cb: (e: unknown) => void) => {
+        planning = cb;
+        return { close: vi.fn() };
+      }),
+      followSession: vi.fn().mockImplementation((_id: string, cb: (e: unknown) => void) => {
+        standing = cb;
+        return { ready: Promise.resolve(true), ended: new Promise(() => {}), close: vi.fn() };
+      }),
+      compactConversation: vi.fn().mockImplementation(() => call((e) => planning(e), (e) => { planning(e); standing(e); })),
+    });
+    return { h, planning: (e: unknown) => planning(e), standing: (e: unknown) => standing(e) };
+  }
+
+  const play = (from: TuiState, actions: Action[]): TuiState => actions.reduce((state, action) => reduce(state, action).state, from);
+  const compactionsOf = (state: TuiState) => state.conversation.blocks.filter((b) => b.type === 'compaction');
+
+  it('folds the condensed block in where it happened: nothing is redrawn, so scroll, draft and earlier blocks stay', async () => {
+    const { h } = sockets(async (emit) => {
+      emit(started());
+      emit(generated);
+      emit(ended('condensed'));
+      return { plan, summary: 'the state', keptMessages: 4 };
+    });
+    const start = session();
+
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    const state = play(start, h.actions);
+
+    expect(h.api.compactConversation).toHaveBeenCalledWith('session-1');
+    expect(types(h.actions)).not.toContain('chatRestored');
+    expect(state.conversation.blocks.slice(0, 4)).toEqual(start.conversation.blocks);
+    expect(compactionsOf(state)).toEqual([expect.objectContaining({ compactionId: 'c1', status: 'condensed', summary: 'Conversation condensed: the state', origin: 'ordewell', trigger: 'manual' })]);
+    // Held in place: a redraw would have reset it to the tail (0).
+    expect(state.scroll).toBeGreaterThanOrEqual(7);
+    expect(state.editor.text).toBe('half a thought');
+    expect(state.planner).toBe('idle');
+  });
+
+  it('shows the compaction running while the planner works, then settles it', async () => {
+    let midway: Action[] = [];
+    const { h } = sockets(async (emit) => {
+      emit(started());
+      midway = [...h.actions];
+      emit(generated);
+      emit(ended('condensed'));
+      return { plan, summary: 'the state', keptMessages: 4 };
+    });
+    const start = session();
 
     await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
 
-    expect(h.api.compactConversation).toHaveBeenCalledWith('session-1');
-    expect(h.actions).toEqual([
-      { type: 'chatRestored', history: condensed, sessionId: 'session-1' },
-      { type: 'planUpdated', plan, sessionId: 'session-1' },
+    expect(compactionsOf(play(start, midway))).toEqual([expect.objectContaining({ compactionId: 'c1', status: 'running' })]);
+    expect(play(start, midway).planner).toBe('condensing');
+  });
+
+  it('draws the one block when the daemon answered but both frames were lost', async () => {
+    const { h } = sockets(async () => ({ plan, summary: 'the state', keptMessages: 4 }));
+    const start = session();
+
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    const state = play(start, h.actions);
+
+    expect(compactionsOf(state)).toEqual([expect.objectContaining({ compactionId: 'c1', status: 'condensed', summary: 'Conversation condensed: the state' })]);
+    expect(state.scroll).toBeGreaterThanOrEqual(7);
+    expect(state.planner).toBe('idle');
+  });
+
+  it('draws one block however many subscriptions carry the frames, and ignores a late repeat', async () => {
+    let stamp = 0;
+    const stamped = (e: object) => ({ ...e, stream: 'daemon', seq: ++stamp });
+    const lateEnd = stamped(ended('condensed'));
+    const { h, standing } = sockets(async (_emit, both) => {
+      both(stamped(started()));
+      both(stamped(generated));
+      both(lateEnd);
+      return { plan, summary: 'the state', keptMessages: 4 };
+    });
+    const start = session();
+
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    standing(lateEnd);
+    standing(ended('failed'));
+    const state = play(start, h.actions);
+
+    expect(compactionsOf(state)).toEqual([expect.objectContaining({ status: 'condensed' })]);
+  });
+
+  it('keeps every checkpoint as its own block', async () => {
+    const second = { ...summary, content: 'Conversation condensed: later', timestamp: '2026-01-02T00:00:09.000Z', checkpoint: { id: 'c2', keptFrom: 4, trigger: 'manual' as const } };
+    const later = { tasks: [], conversationHistory: [...before, summary, { role: 'user' as const, content: 'and JSON', timestamp: '2026-01-02T00:00:05.000Z' }, { role: 'assistant' as const, content: 'JSON too.', timestamp: '2026-01-02T00:00:06.000Z' }, second] };
+    const { h } = sockets(async (emit) => {
+      emit(started('c2'));
+      emit({ ...generated, plan: later });
+      emit(ended('condensed', 'c2'));
+      return { plan: later, summary: 'later', keptMessages: 2 };
+    });
+    // The first compaction is already on screen, as a session that lived through it has it.
+    const start = session({ conversation: fromTranscript([...before, summary], []) });
+
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    const state = play(start, h.actions);
+
+    expect(compactionsOf(state).map((b) => [b.compactionId, b.summary])).toEqual([
+      ['c1', 'Conversation condensed: the state'],
+      ['c2', 'Conversation condensed: later'],
     ]);
   });
 
-  it('reports a refusal, and a busy planner goes back to idle', async () => {
-    const h = harness({ compactConversation: vi.fn().mockRejectedValue(new Error('The conversation is too short to condense.')) });
-    let state: TuiState = initialState({ sessionId: 'session-1', planner: 'condensing' });
+  it('reports a refusal, and the planner goes back to idle with nothing drawn', async () => {
+    const h = harness({ compactConversation: vi.fn().mockRejectedValue(new DaemonError('The conversation is too short to condense.', 400)) });
+    const start = session();
 
     await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
-    for (const action of h.actions) state = reduce(state, action).state;
+    const state = play(start, h.actions);
 
     expect(types(h.actions)).toEqual(['failed']);
     expect(messageOf(h.actions, 'failed')).toMatch(/too short/);
     expect(state.planner).toBe('idle');
+    expect(compactionsOf(state)).toEqual([]);
+    expect(state.editor.text).toBe('half a thought');
+  });
+
+  it('ends the running block as failed when the call fails and the daemon\'s end frame never came', async () => {
+    const { h } = sockets(async (emit) => {
+      emit(started());
+      throw new DaemonError('rate limited', 500);
+    });
+    const start = session();
+
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    const state = play(start, h.actions);
+
+    expect(compactionsOf(state)).toEqual([expect.objectContaining({ compactionId: 'c1', status: 'failed' })]);
     expect(state.planner).toBe('idle');
   });
 
-  it('keeps the daemon\'s late copy of the summary from landing as a spoken turn too', async () => {
-    const plan = { tasks: [], conversationHistory: condensed };
-    let onExecution: (event: unknown) => void = () => {};
-    let finishExecution: () => void = () => {};
-    const h = harness({
-      compactConversation: vi.fn().mockResolvedValue({ plan, summary: 'the state', keptMessages: 4 }),
-      streamExecution: vi.fn().mockImplementation((_id: string, cb: (event: unknown) => void, onReady?: (error?: Error) => void) => {
-        onExecution = cb;
-        onReady?.();
-        return new Promise<void>((resolve) => { finishExecution = resolve; });
-      }),
+  it('ends the running block as stopped when the user stopped it', async () => {
+    const { h } = sockets(async (emit) => {
+      emit(started());
+      throw new DaemonError('The planner turn was stopped.', 409, 'planner_turn_stopped');
     });
+    const start = session({ stopRequested: true });
 
-    // A run is executing, so the session socket is live while the compaction
-    // runs — and the daemon broadcasts the summary on it before answering.
-    const running = runEffect({ type: 'execute', sessionId: 'session-1' }, h.deps);
     await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
-    onExecution({
-      type: 'planner_message', content: 'Conversation condensed: …', timestamp: '2026-01-02T00:00:00Z',
-    });
-    finishExecution();
-    await running;
+    const state = play(start, h.actions);
 
-    let state: TuiState = initialState({ sessionId: 'session-1' });
-    for (const action of h.actions) ({ state } = reduce(state, action));
-    const messages = messagesOf(state);
-    expect(messages.filter((m) => m.role === 'planner')).toHaveLength(0);
-    expect(messages.filter((m) => m.role === 'system' && m.text === 'Conversation condensed: …')).toHaveLength(1);
+    expect(compactionsOf(state)).toEqual([expect.objectContaining({ status: 'stopped' })]);
+    expect(state.planner).toBe('idle');
+  });
+
+  it('holds a message typed meanwhile and sends it after the compaction, never into it', async () => {
+    const { h } = sockets(async (emit) => {
+      emit(started());
+      emit(generated);
+      emit(ended('condensed'));
+      return { plan, summary: 'the state', keptMessages: 4 };
+    });
+    const start = reduce(session(), { type: 'key', key: { name: 'enter' } }).state;
+
+    expect(start.queuedPrompts).not.toBe(initialState().queuedPrompts);
+    expect(start.editor.text).toBe('');
+    await runEffect({ type: 'compactConversation', sessionId: 'session-1' }, h.deps);
+    const settled = reduce(play(start, h.actions.slice(0, -1)), h.actions.at(-1)!);
+
+    expect(settled.effects).toEqual([{ type: 'sendMessage', sessionId: 'session-1', message: 'half a thought' }]);
   });
 });
 
@@ -2097,12 +2457,11 @@ describe('a structured task\'s log, messages and interrupt', () => {
   });
 
   it('sends a message and leaves the queue to the stream', async () => {
-    const sendTaskMessage = vi.fn().mockResolvedValue({ id: 'm1' });
-    const h = harness({ sendTaskMessage } as Partial<OrdewellApi>);
+    const h = harness();
 
     await runEffect({ type: 'sendTaskMessage', sessionId: 's1', taskId: 't1', text: 'use Postgres' }, h.deps);
 
-    expect(sendTaskMessage).toHaveBeenCalledWith('s1', 't1', 'use Postgres');
+    expect(h.api.execute).toHaveBeenCalledWith('s1', { command: 'message_task', task: 't1', text: 'use Postgres' });
     expect(h.actions).toEqual([]);
   });
 
@@ -2111,13 +2470,13 @@ describe('a structured task\'s log, messages and interrupt', () => {
 
     await runEffect({ type: 'removeTaskMessage', sessionId: 's1', taskId: 't1', messageId: 'm1' }, h.deps);
 
-    expect(h.api.removeQueuedTaskMessage).toHaveBeenCalledWith('s1', 't1', 'm1');
+    expect(h.api.execute).toHaveBeenCalledWith('s1', { command: 'remove_queued', task: 't1', id: 'm1' });
     expect(h.actions).toEqual([]);
   });
 
   it('shows the daemon\'s words when a message to take back had already gone out', async () => {
     const refusal = new DaemonError('That message to task #1 "Build" was already delivered or taken back.', 400, 'refused');
-    const h = harness({ removeQueuedTaskMessage: vi.fn().mockRejectedValue(refusal) } as Partial<OrdewellApi>);
+    const h = harness({ execute: vi.fn().mockRejectedValue(refusal) });
 
     await runEffect({ type: 'removeTaskMessage', sessionId: 's1', taskId: 't1', messageId: 'm1' }, h.deps);
 
@@ -2126,18 +2485,18 @@ describe('a structured task\'s log, messages and interrupt', () => {
 
   it('continues a finished task, holding the execution stream open when asked to watch (ADR-0018, K1)', async () => {
     const order: string[] = [];
-    const continueTask = vi.fn().mockImplementation(async () => { order.push('continueTask'); return { ok: true }; });
+    const execute = vi.fn().mockImplementation(async () => { order.push('execute'); return { ok: true, message: 'Done.' }; });
     const streamExecution = vi.fn().mockImplementation((_id: string, _cb: (e: unknown) => void, onReady?: (error?: Error) => void) => {
       order.push('streamExecution');
       onReady?.();
       return Promise.resolve();
     });
-    const h = harness({ continueTask, streamExecution } as Partial<OrdewellApi>);
+    const h = harness({ execute, streamExecution } as Partial<OrdewellApi>);
 
     await runEffect({ type: 'continueTask', sessionId: 's1', taskId: 't1', text: 'also handle arrays', watch: true }, h.deps);
 
-    expect(continueTask).toHaveBeenCalledWith('s1', 't1', 'also handle arrays');
-    expect(order).toEqual(['streamExecution', 'continueTask']);
+    expect(execute).toHaveBeenCalledWith('s1', { command: 'retry_task', task: 't1', from: 'session', message: 'also handle arrays' });
+    expect(order).toEqual(['streamExecution', 'execute']);
   });
 
   it('continues without a second stream while a run is already watched', async () => {
@@ -2145,17 +2504,16 @@ describe('a structured task\'s log, messages and interrupt', () => {
 
     await runEffect({ type: 'continueTask', sessionId: 's1', taskId: 't1', text: 'go on' }, h.deps);
 
-    expect(h.deps.api.continueTask).toHaveBeenCalledWith('s1', 't1', 'go on');
+    expect(h.deps.api.execute).toHaveBeenCalledWith('s1', { command: 'retry_task', task: 't1', from: 'session', message: 'go on' });
     expect(h.deps.api.streamExecution).not.toHaveBeenCalled();
   });
 
   it('interrupts the task, leaving what it says to the timeline', async () => {
-    const interruptTask = vi.fn().mockResolvedValue({ ok: true });
-    const h = harness({ interruptTask } as Partial<OrdewellApi>);
+    const h = harness();
 
     await runEffect({ type: 'interruptTask', sessionId: 's1', taskId: 't1' }, h.deps);
 
-    expect(interruptTask).toHaveBeenCalledWith('s1', 't1');
+    expect(h.api.execute).toHaveBeenCalledWith('s1', { command: 'interrupt_task', task: 't1' });
     expect(h.actions).toEqual([]);
   });
 
@@ -2176,6 +2534,19 @@ describe('a structured task\'s log, messages and interrupt', () => {
 
     expect(messageOf(h.actions, 'failed')).toMatch(/still waiting for approval/);
   });
+
+  // The user may have loaded another session before the answer failed; the
+  // reducer drops a failure that names a session no longer on screen.
+  it.each([
+    { type: 'respondApproval', sessionId: 's1', approvalId: 'ap-1', granted: true },
+    { type: 'answerTaskApproval', sessionId: 's1', approvalId: 'ap-1', answer: { decision: 'allow' } },
+  ] as Effect[])('names the session a lost $type was for', async (effect) => {
+    const h = harness({ respondToApproval: vi.fn().mockRejectedValue(new Error('HTTP 409')) } as Partial<OrdewellApi>);
+
+    await runEffect(effect, h.deps);
+
+    expect(h.actions).toContainEqual(expect.objectContaining({ type: 'failed', sessionId: 's1' }));
+  });
 });
 
 
@@ -2189,7 +2560,7 @@ describe('following the session', () => {
         const ended = new Promise<'lost' | void>((resolve) => { end = resolve; });
         const close = vi.fn(() => end());
         follows.push({ sessionId, emit: cb, close, end });
-        return { ready: Promise.resolve(), ended, close };
+        return { ready: Promise.resolve(true), ended, close };
       }),
       ...api,
     });
@@ -2261,7 +2632,10 @@ describe('following the session', () => {
     const order = types(h.actions);
     expect(h.actions).toContainEqual({ type: 'runSnapshot', view, sessionId: 's9' });
     expect(order.indexOf('runSnapshot')).toBeGreaterThan(order.indexOf('sessionLoaded'));
-    expect(order.indexOf('runSnapshot')).toBeLessThan(order.indexOf('planUpdated'));
+    // Held while the load was answered, it goes on top of the plan the load read.
+    expect(order.indexOf('runSnapshot')).toBeGreaterThan(order.indexOf('planUpdated'));
+    const state = h.actions.reduce((s, a) => reduce(s, a).state, initialState({ sessionId: 's1' }));
+    expect(state.run.tasks.map((t) => [t.id, t.status])).toEqual([['a', 'in_progress']]);
   });
 
   it('delivers a connect snapshot arriving after the load as it does any other', async () => {
@@ -2318,11 +2692,11 @@ describe('following the session', () => {
 
     expect(types(h.actions)).not.toContain('sessionCleared');
     expect(h.follows[0].close).not.toHaveBeenCalled();
-    expect(h.actions).toContainEqual({ type: 'failed', message: 'The planner turn was stopped', code: 'planner_turn_stopped', turn: true });
+    expect(h.actions).toContainEqual({ type: 'failed', message: 'The planner turn was stopped', code: 'planner_turn_stopped', turn: true, sessionId: 'session-new' });
   });
 
   it('drops the follow of a first turn the daemon never registered', async () => {
-    const h = following({ startConversation: vi.fn().mockRejectedValue(new Error('planner down')) });
+    const h = following({ startConversation: vi.fn().mockRejectedValue(new DaemonError('planner down', 500)) });
     await runEffect({ type: 'startConversation', goal: 'ship it' }, h.deps);
 
     expect(h.follows[0].close).toHaveBeenCalled();
@@ -2343,6 +2717,64 @@ describe('following the session', () => {
     await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'one' }, h.deps);
     h.follows[0].end('lost');
     await vi.waitFor(() => expect(h.actions).toContainEqual({ type: 'followLost', sessionId: 's1' }));
+  });
+
+  it('reopens a follow that dropped while idle, so a run nobody here started is still seen', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = following();
+      await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'one' }, h.deps);
+      h.follows[0].end('lost');
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(h.api.followSession).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(h.api.followSession).toHaveBeenCalledTimes(2);
+      expect(h.follows[1].sessionId).toBe('s1');
+      expect(h.actions).toContainEqual({ type: 'followRestored', sessionId: 's1' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A lost follow leaves no entry, only a pending retry. Closing or deleting
+  // the session must cancel that timer, or it reopens a session the user is done with.
+  it('does not reopen a session the user closed while its follow was down', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = following();
+      await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'one' }, h.deps);
+      h.follows[0].end('lost');
+      await Promise.resolve();
+      await Promise.resolve();
+      await runEffect({ type: 'closeSession', sessionId: 's1' }, h.deps);
+
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(h.api.followSession).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not reopen a session the user deleted while its follow was down', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = following();
+      await runEffect({ type: 'sendMessage', sessionId: 's1', message: 'one' }, h.deps);
+      h.follows[0].end('lost');
+      await Promise.resolve();
+      await Promise.resolve();
+      await runEffect({ type: 'deleteSession', sessionId: 's1' }, h.deps);
+
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(h.api.followSession).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('leaves a loss to the run\'s own stream while one is open, so it is reported once', async () => {
@@ -2373,5 +2805,79 @@ describe('following the session', () => {
     await Promise.resolve();
 
     expect(types(h.actions)).not.toContain('followLost');
+  });
+});
+
+
+describe('the welcome repositories and branches', () => {
+  const ready = { status: 'ready' as const, repos: [{ path: '.', head: { kind: 'branch' as const, branch: 'main', commit: 'a1b2c3d' }, dirty: false }], shared: [] };
+
+  it('reads the preview at startup with the workspace, and says it is loading first', async () => {
+    const h = harness({ getIsolationPreview: vi.fn().mockResolvedValue({ preview: ready }) });
+
+    await runEffect({ type: 'refresh' }, h.deps);
+
+    expect(h.api.getIsolationPreview).toHaveBeenCalledWith('/ws');
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewLoading', read: 1 });
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewLoaded', preview: ready, read: 1 });
+  });
+
+  it('reads it again when the shared settings change what a run would isolate', async () => {
+    const h = harness({ getIsolationPreview: vi.fn().mockResolvedValue({ preview: ready }) });
+
+    await runEffect({ type: 'loadScope' }, h.deps);
+
+    expect(h.api.getIsolationPreview).toHaveBeenCalledWith('/ws');
+    expect(types(h.actions)).toEqual(expect.arrayContaining(['isolationPreviewLoading', 'isolationPreviewLoaded']));
+  });
+
+  it('keeps a failed read as failed, with the reason, instead of claiming no repository', async () => {
+    const h = harness({ getIsolationPreview: vi.fn().mockRejectedValue(new Error('the server had stopped')) });
+
+    await runEffect({ type: 'loadIsolationPreview' }, h.deps);
+
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewFailed', read: 1, message: 'the server had stopped' });
+    expect(h.actions.some((a) => a.type === 'failed')).toBe(false);
+  });
+
+  it('revives a stopped daemon and reads the preview once on the retry', async () => {
+    const getIsolationPreview = vi.fn()
+      .mockRejectedValueOnce(refused())
+      .mockResolvedValueOnce({ preview: ready });
+    const h = harness({ getIsolationPreview });
+
+    await runEffect({ type: 'loadIsolationPreview' }, h.deps);
+
+    expect(getIsolationPreview).toHaveBeenCalledTimes(2);
+    expect(reviveMock(h.deps)).toHaveBeenCalledTimes(1);
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewLoaded', preview: ready, read: 2 });
+  });
+
+  it('asks the welcome to read again when a revive replaces the daemon', async () => {
+    const h = harness({
+      getRunners: vi.fn()
+        .mockRejectedValueOnce(refused())
+        .mockResolvedValue({ runners: [{ id: 'claude-code', name: 'Claude Code', enabled: true }], orchestratorModel: 'm/1' }),
+    });
+
+    await runEffect({ type: 'loadRunners' }, h.deps);
+
+    expect(types(h.actions)).toContain('daemonReconnected');
+  });
+
+  it('numbers overlapping reads so the reducer can drop the older answer', async () => {
+    const answers: Array<(value: { preview: IsolationPreview }) => void> = [];
+    const h = harness({ getIsolationPreview: vi.fn().mockImplementation(() => new Promise((resolve) => { answers.push(resolve); })) });
+
+    const first = runEffect({ type: 'loadIsolationPreview' }, h.deps);
+    const second = runEffect({ type: 'loadIsolationPreview' }, h.deps);
+    await vi.waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]({ preview: ready });
+    await second;
+    answers[0]({ preview: { status: 'no-repo', repos: [], shared: [] } });
+    await first;
+
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewLoaded', preview: ready, read: 2 });
+    expect(h.actions).toContainEqual({ type: 'isolationPreviewLoaded', preview: { status: 'no-repo', repos: [], shared: [] }, read: 1 });
   });
 });

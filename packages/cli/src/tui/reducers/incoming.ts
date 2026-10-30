@@ -80,9 +80,12 @@ function runTaskToView(t: RunTask): TaskView {
     description: planText(t.description ?? t.title),
     prompt: typeof t.prompt === 'string' ? sanitize(t.prompt) : undefined,
     type: t.type === 'user' || t.type === 'script' ? t.type : 'ai',
+    ...(t.attempted === true ? { attempted: true } : {}),
     attemptUsage: Array.isArray(t.attemptUsage) ? t.attemptUsage : undefined,
     status: planLabel(t.status, 'pending'),
     idleSince: t.idleSince ?? null,
+    ...(t.completionReceived === 'done' || t.completionReceived === 'failed' || t.completionReceived === 'blocked' ? { completionReceived: t.completionReceived } : {}),
+    ...(t.attaching === 1 || t.attaching === 2 ? { attaching: t.attaching } : {}),
     dependencies: Array.isArray(t.dependencies) ? t.dependencies.map((id) => planLabel(id)) : [],
     assignedRunner: typeof t.assignedRunner === 'string' ? planLabel(t.assignedRunner) : undefined,
     taskMode: typeof t.taskMode === 'string' ? planLabel(t.taskMode) : undefined,
@@ -94,7 +97,7 @@ function runTaskToView(t: RunTask): TaskView {
           ...(Array.isArray(model.availableVariants) ? { availableVariants: model.availableVariants.map((variant) => planLabel(variant)) } : {}),
         }
       : undefined,
-    isolation: t.isolation as TaskView['isolation'],
+    isolation: t.isolation,
     awaitingReason: t.status === 'awaiting_user' && isAwaitingReason(t.awaitingReason) ? t.awaitingReason : undefined,
     ...(t.status === 'awaiting_user' && t.awaitingReason === 'usage-limit' && typeof t.resumeAt === 'string' ? { resumeAt: t.resumeAt } : {}),
     ...(t.status === 'skipped' && typeof t.skipReason === 'string' ? { skipReason: sanitize(t.skipReason) } : {}),
@@ -153,7 +156,7 @@ export function foldRun(state: TuiState, input: RunInput): TuiState {
   return run === state.run ? state : withRun(state, run);
 }
 
-export function applySettings(state: TuiState, settings: Partial<SettingsResponse>): TuiState {
+export function applySettings(state: TuiState, settings: Partial<SettingsResponse>, applyRun = true): TuiState {
   return {
     ...state,
     orchestratorModel:
@@ -170,8 +173,8 @@ export function applySettings(state: TuiState, settings: Partial<SettingsRespons
       settings.modelAllowlist && typeof settings.modelAllowlist === 'object'
         ? (settings.modelAllowlist as Record<string, string[]>)
         : state.allowlist,
-    runSettings: settings.run ?? state.runSettings,
-    runSettingsKnown: state.runSettingsKnown || settings.run !== undefined,
+    runSettings: applyRun && settings.run ? settings.run : state.runSettings,
+    runSettingsKnown: state.runSettingsKnown || (applyRun && settings.run !== undefined),
   };
 }
 

@@ -9,6 +9,56 @@ export interface RunnerManifest {
   contextFile?: string;
   contextFileAltPath?: string;
   modes?: RunnerMode[];
+  /** How to ask whether the user is signed in. Absent when the runner offers no status command. */
+  auth?: RunnerAuthSpec;
+}
+
+/** What a runner's status command answered, with both streams kept apart. */
+export interface RunnerAuthStatus {
+  /** The exit status; never negative, since a timeout or a failed spawn is not an answer. */
+  code: number;
+  stdout: string;
+  stderr: string;
+  /** stdout and stderr together, for a reader that matches a line on either. */
+  output: string;
+  /** The merged probe environment, so a reader can consult the config the command read. */
+  env: NodeJS.ProcessEnv;
+  /**
+   * What the answer is: the status command's output, or a failed turn's own
+   * words. A reader that parses the status output (JSON, say) cannot parse
+   * the turn's message, and one that judges a turn's words by the runner's
+   * config must not let the probe's exit code guess for it.
+   */
+  kind: 'status' | 'turn';
+}
+
+/**
+ * A runner's own answer to "is the user signed in?" — the CLI args that ask,
+ * the args that log in, and how to read the answer. Declared here because a
+ * surface must run the same login the runner's own CLI would, with no second
+ * table to drift.
+ */
+export interface RunnerAuthSpec {
+  /** The CLI args that answer whether the user is signed in, e.g. `auth status`. */
+  statusArgs: string[];
+  /** The CLI args that run the login, e.g. `auth login`. */
+  loginArgs: string[];
+  /**
+   * Matched against the status command's stdout+stderr when it exits non-zero,
+   * and against a failed turn's own words to tell a signed-out failure from an
+   * unrelated one.
+   */
+  signedOut?: RegExp;
+  /**
+   * A runner-specific reader that overrides the exit-code/regex rule. `null`
+   * means the answer said nothing about the login, which stays `unknown`
+   * rather than guessing from an exit code or from a line meant for another
+   * credential route. The reader owns both kinds of answer — the status
+   * command's output and a failed turn's own words — told apart by
+   * {@link RunnerAuthStatus.kind}; where the reader exists, it is the only
+   * judge of either.
+   */
+  read?: (answer: RunnerAuthStatus) => 'signed-in' | 'signed-out' | null;
 }
 
 export interface RunnerFeatures {
@@ -28,9 +78,26 @@ export interface DiscoveryCommand {
   parser?: ModelDiscoveryParser;
 }
 
+/**
+ * The environment a runner is launched with: the daemon's own, under the
+ * workspace's (ADR-0016). A runner's files can move with it, as Claude Code's
+ * do under `CLAUDE_CONFIG_DIR`.
+ */
+export type RunnerEnv = Readonly<Record<string, string | undefined>>;
+
 export type ApiAuthMethod =
   | { type: 'env'; varName: string; header: string; prefix?: string }
-  | { type: 'file'; path: string; jsonPath: string; header: string; prefix?: string };
+  /** `path` is `~` expanded; a function of the runner's environment when that relocates the file. */
+  | { type: 'file'; path: string | ((env: RunnerEnv) => string); jsonPath: string; header: string; prefix?: string };
+
+/** What a runner's settings reader may look at, with `~` expanded in every path. */
+export interface RunnerSettingsFiles {
+  /** The file's content, or null when it is missing or unreadable. A leading `~` is the home `env` gives the runner. */
+  read(file: string): string | null;
+  /** The names of the entries in `dir`, or none when it is missing. A leading `~` is read as in {@link read}. */
+  list(dir: string): string[];
+  env: RunnerEnv;
+}
 
 export interface ApiDiscoveryConfig {
   url: string;
@@ -48,10 +115,11 @@ export interface RunnerModelDiscovery {
    * Stdio JSON-RPC discovery (Codex `app-server`): spawn the command, send
    * `initialize` then `model/list`, and read the catalog from the response.
    * Tried BEFORE apiDiscovery and command discovery. When the call fails,
-   * `cacheFile` (the runner's own on-disk catalog cache, `~` expanded) is
-   * read before falling through to the remaining discovery methods.
+   * `cacheFile` (the runner's own on-disk catalog cache, `~` expanded, or
+   * found from the runner's environment) is read before falling through to
+   * the remaining discovery methods.
    */
-  appServer?: { command: string; args: string[]; cacheFile?: string };
+  appServer?: { command: string; args: string[]; cacheFile?: string | ((env: RunnerEnv) => string) };
   /**
    * Optional last-resort list for a CLI that cannot enumerate
    * models. Used only when command discovery fails entirely or the CLI is
@@ -82,6 +150,14 @@ export interface RunnerModelDiscovery {
    * fails, discovery falls through to `discoveryCommands` + `canonicalAliases`.
    */
   apiDiscovery?: ApiDiscoveryConfig;
+  /**
+   * Models registered in the runner's own settings, such as gateway IDs no
+   * catalog lists, read as the runner itself resolves its settings files.
+   * Appended to whatever the other methods produced, success or fallback: an
+   * ID they already offer keeps their entry. Missing or unreadable files add
+   * nothing.
+   */
+  settingsModels?: (files: RunnerSettingsFiles) => DiscoveredModel[];
   preferredPatterns?: { id: string; label: string }[];
   variants?: { id: string; label: string }[];
   discoveryCommands?: DiscoveryCommand[];

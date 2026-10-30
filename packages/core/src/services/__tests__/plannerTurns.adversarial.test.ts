@@ -4,6 +4,7 @@ import type { ConversationTurn, IAiService, TurnRun } from '../AiService';
 import { AUTORUN_OFF } from '../PlanPrompts';
 import { RUN_SETTINGS_DEFAULTS, type GlobalRunSettings } from '../SettingsService';
 import { PlannerConversation, type PlannerConversationHost } from '../PlannerConversation';
+import { fakePlanChanges, passed } from './planChangesTestKit';
 import type { IConfig } from '../../interfaces/IConfig';
 import type { SessionMessage } from '../SessionMessage';
 import { HUNG_TURN_GRACE_MS, WAKE_UP_TURN_TIMEOUT_MS } from '../Supervisor';
@@ -86,6 +87,9 @@ function fakeAi(turn: ConversationTurn): IAiService {
 
 function conversationHost(ai: IAiService, planState: LegacyPlanState | null = dialoguePlan()) {
   const state = { plan: planState, persists: 0 };
+  const checks = fakePlanChanges({ tasks: () => state.plan?.tasks ?? [], runners: () => ['claude-code'], catalog: () => ({ modelsByRunner: {} }) });
+  // An edit passes as it stands; a plan meets the real rules.
+  checks.rules.mockImplementation((change, phase) => (change.kind === 'ops' ? passed({ tasks: [...state.plan?.tasks ?? []], summary: ['updated'] }) : checks.real(change, phase)));
   const host: PlannerConversationHost = {
     plan: () => state.plan,
     goal: () => 'build me a parser',
@@ -107,10 +111,10 @@ function conversationHost(ai: IAiService, planState: LegacyPlanState | null = di
     },
     broadcast: vi.fn(),
     broadcastPlan: vi.fn(),
-    validateOps: vi.fn(() => ({ ok: true, tasks: state.plan?.tasks ?? [], errors: [], summary: ['updated'] })),
-    taskSkills: () => ({ findSkill: () => undefined, searchedDirs: () => [] }),
+    planChanges: checks.planChanges,
     notice: vi.fn(),
     usageLimit: vi.fn((said) => ({ text: said.message, resendAt: null })),
+    contextPaused: vi.fn((details) => ({ ...details, at: new Date().toISOString(), inputs: [] })),
     adoptTasks: vi.fn((tasks) => tasks.length),
     capturePrd: vi.fn(),
     turnAborted: vi.fn(),
@@ -204,6 +208,7 @@ describe('a settings change during a wake-up turn', () => {
     // The user turns autorun off while the turn runs, then stops the turn: it
     // never answered, so the next turn must say so again.
     settings.autorun = false;
+    session.applyRunSettings({ autorun: false });
     session.abortPlannerTurn();
     await first;
 
@@ -253,31 +258,29 @@ const turnStarts = (messages: ReadonlyArray<SessionMessage>) =>
   messages.flatMap((m) => (m.type === 'planner_turn_started' ? [m] : []));
 
 describe('a hung wake-up turn whose retry follows it', () => {
-  it('never clears the retry turn\'s held edit when it settles late', async () => {
-    const env = await wokenUp({ settings: { supervisorLevel: 'act' }, config: { autonomousMode: true } });
+  it('is not retried once it committed an edit, and takes back nothing of it when it settles late', async () => {
+    // One task, waiting: a second, running silent past the timeout, would go quiet and wake it again.
+    const env = await wokenUp({ settings: { supervisorLevel: 'act' }, config: { autonomousMode: true } }, [task('t1', 1)]);
     env.planner.state.ignoresStop = true;
     const tools = env.planner.tools();
 
-    // The turn takes an edit through its tool and holds it.
+    // The turn commits an edit through its tool as the call answers (ADR-0022 P2), and its wake-up goes with it.
     const first = await tools.editPlan!({ ops: [{ op: 'add', task: { title: 'A', prompt: 'a' } }] }, ctx);
     expect(first.isError).toBeFalsy();
-    expect(env.messages).toContainEqual(expect.objectContaining({ type: 'plan_edit_held', held: expect.objectContaining({}) }));
+    expect(env.session.planState!.pendingTurns ?? []).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(WAKE_UP_TURN_TIMEOUT_MS);
     await settled();
     await vi.advanceTimersByTimeAsync(HUNG_TURN_GRACE_MS);
-    await until(() => env.planner.calls.length === 2);
+    await settled();
 
-    // The retry holds its own edit; the hung turn settling now must leave it alone.
-    const retry = await tools.editPlan!({ ops: [{ op: 'add', task: { title: 'B', prompt: 'b' } }] }, ctx);
-    expect(retry.isError).toBeFalsy();
-    const afterRetryHeld = env.messages.length;
+    // A retry on the same wake-up could make the change again.
+    expect(env.planner.calls).toHaveLength(1);
     env.planner.calls[0].finish(prose('Still looking at task 1.'));
     await settled();
 
-    expect(env.messages.slice(afterRetryHeld).filter((m) => m.type === 'plan_edit_held')).toEqual([]);
-    env.planner.calls[1].finish(prose('Task 1 needs an answer.'));
-    await settled();
+    expect(env.session.planTasks.map((t) => t.title)).toContain('A');
+    expect(env.session.planState!.conversationHistory!.map((e) => e.content)).not.toContain('Still looking at task 1.');
   });
 });
 

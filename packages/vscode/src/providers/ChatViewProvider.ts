@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { type GlobalRunSettings, surfacePlan, type AiProvider, type LegacyPlanState, type DiscoveredModel, type PlanStatus, type RunnerId, type RunView } from '@ordewell/core';
+import { type AccountLimitSnapshot, type GlobalRunSettings, type IsolationPreview, surfacePlan, type AiProvider, type LegacyPlanState, type DiscoveredModel, type PlanStatus, type RunnerId, type RunActivity, type RunView } from '@ordewell/core';
 import { ConversationViewHost, type SavedConversation } from '../ConversationViewHost';
 import { RunViewHost } from '../RunViewHost';
 import { renderWebviewHtml } from './webviewHtml';
@@ -103,20 +103,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.conversation.reload(saved);
   }
 
-  /**
-   * Redraw only the conversation, after a compaction edited it. Unlike
-   * `restoreChat` this leaves the plan, task output and isolation state alone,
-   * because a compaction is allowed while a run is executing.
-   */
-  replaceConversation(saved: SavedConversation): void {
-    this.conversation.reload(saved);
-  }
-  /** Lock the input while core is refusing planner messages (a compaction in flight). */
-  setConversationBusy(busy: boolean): void {
-    this.postMessage({ type: 'conversationBusy', busy });
-  }
 
   planApproved(): void { this.setState('approved'); }
+
+  /** The run's own state after an Execute settled; `requestId` drops a reply for a session the webview has left. */
+  showRunActivity(activity: RunActivity, requestId?: number): void {
+    this.postMessage({ type: 'runActivity', activity, ...(requestId !== undefined ? { requestId } : {}) });
+  }
+
+  /** Answer one Runners pill request with what the shared list now holds for that runner. */
+  acknowledgeRunnerChoice(requestId: string, runnerId: RunnerId, enabled: boolean): void {
+    this.postMessage({ type: 'runnerChoiceSaved', requestId, runnerId, enabled });
+  }
 
   /** Drop the handoff card and every per-task isolation indicator. */
   clearIsolationHandoff(): void {
@@ -161,6 +159,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._modelDiscoveryErrors = errors;
     this.postMessage({ type: 'setModelDiscoveryErrors', errors });
   }
+  /** Every runner account's limits as the host's monitor last published them; kept to replay to a webview that loads later. */
+  setAccountLimits(limits: readonly AccountLimitSnapshot[]): void {
+    this._accountLimits = limits;
+    this.postMessage({ type: 'accountLimits', limits });
+  }
+  /** The repositories and branches the startup view shows; `null` says the read is out. Not kept: a webview that connects asks the host for a current one. */
+  setIsolationPreview(preview: IsolationPreview | null): void { this.postMessage({ type: 'isolationPreview', preview }); }
   /** Who can plan, who does plan, and that planner's effort — one message, so the webview never renders a half-switched planner. */
   setPlannerBackends(backends: PlannerBackend[], provider: string, runner?: string, effort?: string): void {
     this._plannerState = { backends, provider, runner, effort };
@@ -179,6 +184,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _configuredProviders: ApiProvider[] = [];
   private _modelDiscoveryErrors: Record<string, string> = {};
   private _plannerState: { backends: PlannerBackend[]; provider: string; runner?: string; effort?: string } | null = null;
+  private _accountLimits: readonly AccountLimitSnapshot[] | null = null;
 
   /**
    * Re-send every cached piece of state to the webview. Safe to call once the
@@ -224,6 +230,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (this._plannerState) {
       this.postMessage({ type: 'setPlannerBackends', ...this._plannerState });
+    }
+    if (this._accountLimits) {
+      this.postMessage({ type: 'accountLimits', limits: this._accountLimits });
     }
     this._emitConsolidatedRunners();
   }

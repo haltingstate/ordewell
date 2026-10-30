@@ -240,6 +240,30 @@ describe('BaseFileSystem — bash tiers', () => {
     expect((await fs.bash('npm test')).output).not.toContain('sed -n');
   });
 
+  // A grant for `sed` or `awk` is the bare binary, so these ran unprompted once
+  // an ordinary substitution or print had been approved, and on a host with no
+  // sandbox one approval of `git rm` deleted the file.
+  it.each([
+    ["sed 's/hello/world/' README.md", "sed -n '1r /tmp/outside-secret.txt' README.md"],
+    ["awk '{print}' README.md", "awk 'BEGIN{while((getline l < \"/tmp/outside-secret.txt\")>0) print l}'"],
+    ["awk '{print}' README.md", "awk 'BEGIN{print ENVIRON[\"OPENAI_API_KEY\"]}'"],
+    ['git log', 'git rm README.md'],
+    ["gawk '{print}' README.md", "gawk 'BEGIN{print SYMTAB[\"ENVIRON\"][\"OPENAI_API_KEY\"]}'"],
+    ['git symbolic-ref --short HEAD', 'git symbolic-ref --short HEAD refs/heads/attacker'],
+    ['git hash-object -t blob README.md', 'git hash-object -w README.md'],
+  ])('runs nothing for "%s" then "%s", whatever was approved', async (approved, next) => {
+    const fs = new TestFileSystem();
+    const asked: string[] = [];
+    fs.setApproval(new ApprovalPolicy({ ask: async (req) => { asked.push(req.subject); return true; } }));
+
+    await fs.bash(approved);
+    const result = await fs.bash(next);
+
+    expect(result.success).toBe(false);
+    expect(fs.bashCalls).toEqual([approved]);
+    expect(asked).not.toContain(next);
+  });
+
   // The model wrote the path from the directory it cd'd into; the refusal names
   // it from the root, which reads as a path it never meant without the reason.
   it('says why a path after an unfollowed cd was judged from the root', async () => {
@@ -662,6 +686,158 @@ describe('BaseFileSystem research-shell coupling', () => {
     expect((await fs.bash('rm -rf build')).success).toBe(false);
     expect((await fs.bash('ls -la src')).success).toBe(true);
     expect(fs.bashCalls).toEqual(['ls -la src']);
+  });
+});
+
+/**
+ * `git ls-remote` reaches whatever host its destination names through git's
+ * own transport, which resolves the name itself and follows a redirect, so
+ * none of the curl guarantees (per-origin grant, SSRF guard, pinned address)
+ * can be given to it. These run the real classifier, policy and confinement,
+ * with nothing executed and no DNS: every value is synthetic.
+ */
+describe('git remote listing in the planner shell', () => {
+  it('does not let an approved worktree listing under -C authorise a listing against a metadata address', async () => {
+    const resolve = vi.fn(async () => ['93.184.216.34']);
+    const fs = new TestFileSystem(resolve);
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    expect((await fs.bash('git -C packages/core worktree list')).success).toBe(true);
+    const result = await fs.bash('git -C packages/core ls-remote http://169.254.169.254/latest/meta-data/');
+
+    expect(result.success).toBe(false);
+    expect(result.output).toContain('Command refused');
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(resolve).not.toHaveBeenCalled();
+    expect(fs.bashCalls).toEqual(['git -C packages/core worktree list']);
+  });
+
+  it('still runs read-only git under -C without asking', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(false);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    expect((await fs.bash('git -C packages/core log --oneline -3')).success).toBe(true);
+    expect((await fs.bash('git -C worktree status')).success).toBe(true);
+    expect(ask).not.toHaveBeenCalled();
+    expect(fs.bashCalls).toHaveLength(2);
+  });
+
+  it('asks again for each remote and repository a listing reaches, whatever flag comes first', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    for (const command of [
+      'git ls-remote --heads origin',
+      'git ls-remote --heads upstream',
+      'git ls-remote --tags --heads upstream',
+      // The same name under -C is another repository's remote.
+      'git -C packages/core ls-remote --heads origin',
+      'git -C packages/web ls-remote --heads origin',
+    ]) expect((await fs.bash(command)).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(5);
+
+    expect((await fs.bash('git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(5);
+  });
+
+  // A followed `cd` selects a repository the way `-C` does, but it is an
+  // auto-tier segment, so the directory never enters the grant: one repository's
+  // `origin` was approved for every other repository's `origin`.
+  it('asks again for a listing in a repository a preceding cd selects', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    expect((await fs.bash('cd packages/web && git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(1);
+
+    expect((await fs.bash('cd packages/evil && git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(2);
+  });
+
+  // `env -C` picks the repository as `-C` does, but a wrapper's own words
+  // never reached the scope: one approval in one repository listed another's.
+  it('asks again for a listing in a repository a wrapper changes into', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    expect((await fs.bash('env -C packages/web git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(1);
+
+    expect((await fs.bash('env -C packages/evil git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(2);
+  });
+
+  // cmd.exe's `chdir` is its `cd`; read as an unknown program, it was granted
+  // under its bare name and the directory it named dropped out.
+  it('asks again for a listing in a repository cmd.exe chdir selects', async () => {
+    const fs = new DialectFileSystem('cmd');
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+
+    expect((await fs.bash('chdir packages/web && git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(1);
+
+    expect((await fs.bash('chdir packages/evil && git ls-remote --heads origin')).success).toBe(true);
+    expect(ask).toHaveBeenCalledTimes(2);
+  });
+
+  // The secret check reads the words as written, but the shell sends what
+  // they expand to: `$MY_SECRET_TOKEN` passed it as text and left as the value.
+  it('refuses a listing whose words the shell expands, before asking', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+    vi.stubEnv('MY_SECRET_TOKEN', 'EnvSecret456');
+    try {
+      for (const command of [
+        'git ls-remote origin $MY_SECRET_TOKEN',
+        'git ls-remote --heads origin refs/heads/$MY_SECRET_TOKEN',
+        'git ls-remote origin "refs/heads/${MY_SECRET_TOKEN}"',
+        'git ls-remote origin $(cat .env)',
+        'git ls-remote origin `cat .env`',
+      ]) {
+        const result = await fs.bash(command);
+        expect(result.success).toBe(false);
+        expect(result.output).toContain('Command refused');
+        expect(result.output).not.toContain('EnvSecret456');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(ask).not.toHaveBeenCalled();
+    expect(fs.bashCalls).toEqual([]);
+  });
+
+  // The patterns travel to the server as ref prefixes, so they leave the machine like a URL does.
+  it('withholds a listing whose patterns carry a secret, before asking and without echoing it', async () => {
+    const fs = new TestFileSystem();
+    const ask = vi.fn().mockResolvedValue(true);
+    fs.setApproval(new ApprovalPolicy({ ask }));
+    fs.setOutboundSecrets(() => ['HeldSecret123']);
+    vi.stubEnv('ORDEWELL_TEST_TOKEN', 'EnvSecret456');
+    try {
+      for (const command of [
+        `git ls-remote origin refs/heads/${fakeSecret('github')}`,
+        'git ls-remote --heads origin HeldSecret123',
+        'git -C packages/core ls-remote origin refs/tags/EnvSecret456',
+        // A `cd` that asks puts the whole line under one grant; what it sends is still checked.
+        'cd $HOME && git ls-remote origin HeldSecret123',
+      ]) {
+        const result = await fs.bash(command);
+        expect(result.success).toBe(false);
+        expect(result.output).toContain('secret');
+        expect(result.output).not.toMatch(/a1b2c3d4|HeldSecret123|EnvSecret456/);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(ask).not.toHaveBeenCalled();
+    expect(fs.bashCalls).toEqual([]);
   });
 });
 

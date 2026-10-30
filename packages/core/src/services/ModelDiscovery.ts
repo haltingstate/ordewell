@@ -1,15 +1,16 @@
 import * as path from 'path';
-import { exec, spawn } from 'child_process';
+import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fsSync from 'fs';
-import * as osMod from 'os';
 import { DiscoveredModel } from '../models/Task';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
-import type { RunnerManifest, DiscoveryCommand, ApiDiscoveryConfig, ApiAuthMethod, ModelDiscoveryParser } from '../plugins/types';
+import type { RunnerManifest, DiscoveryCommand, ApiDiscoveryConfig, ApiAuthMethod, ModelDiscoveryParser, RunnerEnv, RunnerSettingsFiles } from '../plugins/types';
 import { augmentedPath, withPath } from '../utils/shellPath';
 import { globalDataDir } from '../utils/globalDataDir';
-import { planDirectLaunch } from '../utils/launch';
-import { killTree } from '../utils/processTree';
+import { expandRunnerHome } from '../utils/runnerHome';
+import { discoverAppServerModels, type AppServerModel } from './harness/appServerModels';
+
+export type { AppServerModel } from './harness/appServerModels';
 
 const execAsync = promisify(exec);
 
@@ -19,7 +20,7 @@ const execAsync = promisify(exec);
  */
 export type ExecImpl = (
   command: string,
-  options?: { timeout?: number }
+  options?: { timeout?: number; env?: RunnerEnv }
 ) => Promise<{ stdout: string }>;
 
 // Discovery must find `claude`/`opencode` wherever the user installed them,
@@ -32,97 +33,26 @@ const defaultExec: ExecImpl = async (command, options) => {
   // (~0.5MB with three providers today);
   // node's default 1MB maxBuffer would kill the child mid-stream and silently
   // degrade discovery to the variant-less plain parser.
-  const { stdout } = await execAsync(command, { ...options, maxBuffer: 32 * 1024 * 1024, env: withPath(process.env, PATH) });
+  const { stdout } = await execAsync(command, { timeout: options?.timeout, maxBuffer: 32 * 1024 * 1024, env: withPath(options?.env ?? process.env, PATH) });
   return { stdout: String(stdout) };
 };
 
 /**
- * One raw model entry from an app-server `model/list` response (Codex's stdio
- * JSON-RPC protocol). Field names are the protocol's, not Ordewell's.
- */
-export interface AppServerModel {
-  id: string;
-  displayName?: string;
-  hidden?: boolean;
-  defaultReasoningEffort?: string;
-  supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[];
-}
-
-/**
- * Injectable app-server JSON-RPC client: spawn the command, drive
- * `initialize` → `model/list` over stdio, return the raw model list. Returns
- * null on any failure (spawn error, timeout, malformed response) so discovery
- * falls through to the on-disk cache file. Tests inject a fake so discovery
- * never spawns a real app-server.
+ * Injectable app-server JSON-RPC client: ask the runner's `app-server` for its
+ * `model/list` and return the raw entries. Returns null on any failure (spawn
+ * error, timeout, malformed response) so discovery falls through to the
+ * on-disk cache file. Tests inject a fake so discovery never spawns a real
+ * app-server.
  */
 export type AppServerClientImpl = (
   command: string,
   args: string[],
-  options?: { timeout?: number }
+  options?: { timeout?: number; env?: RunnerEnv }
 ) => Promise<AppServerModel[] | null>;
 
-const defaultAppServerClient: AppServerClientImpl = async (command, args, options) => {
-  const PATH = await augmentedPath();
-  // No shell here, so on Windows the command has to be resolved against
-  // PATHEXT first — `codex` alone is a `.cmd` shim that CreateProcess cannot
-  // start. A resolution failure returns the command unchanged, and the spawn's
-  // own error still routes discovery to the on-disk cache.
-  const launch = await planDirectLaunch(command, args).catch(() => null);
-  if (!launch) return null;
-  return new Promise((resolve) => {
-    let child: import('child_process').ChildProcess;
-    try {
-      child = spawn(launch.file, launch.args, {
-        env: withPath(process.env, PATH),
-        stdio: ['pipe', 'pipe', 'ignore'],
-        windowsVerbatimArguments: launch.verbatim,
-      });
-    } catch {
-      resolve(null);
-      return;
-    }
-    let settled = false;
-    const finish = (value: AppServerModel[] | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      // Tree-wide, for the same reason every other dispose path is: when
-      // `codex` resolved to a shim the direct child is the interpreter, and
-      // killing it leaves the app-server alive — holding its port, and
-      // outliving the discovery call that started it.
-      killTree(child);
-      resolve(value);
-    };
-    const timer = setTimeout(() => finish(null), options?.timeout ?? 20000);
-    child.on('error', () => finish(null));
-    child.on('exit', () => finish(null));
-
-    let buffer = '';
-    const send = (id: number, method: string, params: unknown) => {
-      try {
-        child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-      } catch {
-        finish(null);
-      }
-    };
-    child.stdout!.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        let msg: { id?: number; result?: { data?: AppServerModel[] } };
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.id === 1) {
-          send(2, 'model/list', {});
-        } else if (msg.id === 2) {
-          finish(Array.isArray(msg.result?.data) ? msg.result!.data! : null);
-        }
-      }
-    });
-    send(1, 'initialize', { clientInfo: { name: 'ordewell', title: 'Ordewell', version: '0.1.0' } });
-  });
-};
+/** Exported for its test: the real client is the one place that spawns an app-server. */
+export const defaultAppServerClient: AppServerClientImpl = (command, args, options) =>
+  discoverAppServerModels(command, args, { timeout: options?.timeout, env: options?.env });
 
 function effortVariant(effort: string): { id: string; label: string } {
   return { id: effort, label: effort.charAt(0).toUpperCase() + effort.slice(1) };
@@ -186,8 +116,10 @@ interface GeminiApiModel {
   name: string;
   displayName: string;
   supportedGenerationMethods?: string[];
-  /** The model's context window as Gemini itself states it. */
+  /** The longest prompt, as Gemini itself states it: the reply is not part of it. */
   inputTokenLimit?: number;
+  /** The longest reply, limited apart from the prompt. */
+  outputTokenLimit?: number;
 }
 
 function geminiDiscoveryCacheKey(apiKey: string): { key: string; dir: string; file: string } {
@@ -273,6 +205,7 @@ export async function discoverGeminiModels(apiKey: string, baseUrl?: string, fet
             runnerProvider: 'gemini',
             variants: [],
             ...(typeof m.inputTokenLimit === 'number' && m.inputTokenLimit > 0 ? { contextWindow: m.inputTokenLimit } : {}),
+            ...(typeof m.outputTokenLimit === 'number' && m.outputTokenLimit > 0 ? { maxOutputTokens: m.outputTokenLimit } : {}),
           });
         }
       }
@@ -304,26 +237,34 @@ function applyVariants(models: DiscoveredModel[], manifest: RunnerManifest): Dis
   return models.map((m) => (m.variants.length > 0 ? m : { ...m, variants }));
 }
 
+function listDir(dir: string): string[] {
+  try {
+    return fsSync.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Resolve an auth token from a manifest's `apiDiscovery.auth` list. Each method
  * is tried in order; the first that yields a non-empty token wins.
  *
- * - `env`: reads `process.env[varName]`
+ * - `env`: reads `varName` from the runner's environment
  * - `file`: reads a JSON file at `path` (with `~` expansion) and extracts the
  *   value at `jsonPath` (dot-notation, e.g. `claudeAiOauth.accessToken`)
  *
  * Returns `{ header, value }` ready to set on the fetch `headers` object, or
  * `null` when no auth method yields a token.
  */
-function resolveApiAuth(authMethods: ApiAuthMethod[]): { header: string; value: string } | null {
+function resolveApiAuth(authMethods: ApiAuthMethod[], env: RunnerEnv): { header: string; value: string } | null {
   for (const method of authMethods) {
     try {
       let token: string | undefined;
       if (method.type === 'env') {
-        token = process.env[method.varName];
+        token = env[method.varName];
       } else {
-        const filePath = method.path.replace(/^~/, osMod.homedir());
-        if (!fsSync.existsSync(filePath)) continue;
+        const filePath = expandRunnerHome(typeof method.path === 'function' ? method.path(env) : method.path, env);
+        if (!filePath || !fsSync.existsSync(filePath)) continue;
         const data = JSON.parse(fsSync.readFileSync(filePath, 'utf8'));
         token = method.jsonPath.split('.').reduce((obj: unknown, key: string) => {
           if (obj && typeof obj === 'object') return (obj as Record<string, unknown>)[key] as unknown;
@@ -348,9 +289,10 @@ function resolveApiAuth(authMethods: ApiAuthMethod[]): { header: string; value: 
 async function discoverFromApi(
   manifest: RunnerManifest,
   config: ApiDiscoveryConfig,
+  env: RunnerEnv,
   fetchImpl?: typeof fetch
 ): Promise<DiscoveredModel[] | null> {
-  const auth = resolveApiAuth(config.auth);
+  const auth = resolveApiAuth(config.auth, env);
   if (!auth) return null;
 
   try {
@@ -376,7 +318,7 @@ function wasKilled(err: unknown): boolean {
   return !!err && typeof err === 'object' && (err as { killed?: unknown }).killed === true;
 }
 
-async function discoverFromCommand(manifest: RunnerManifest, execImpl: ExecImpl): Promise<{ models: DiscoveredModel[]; fromFallback: boolean }> {
+async function discoverFromCommand(manifest: RunnerManifest, execImpl: ExecImpl, env: RunnerEnv): Promise<{ models: DiscoveredModel[]; fromFallback: boolean }> {
   const discovery = manifest.modelDiscovery;
   const commands: DiscoveryCommand[] = discovery.discoveryCommands ?? [
     { command: discovery.command!, args: discovery.args || [], parser: discovery.parser },
@@ -388,7 +330,7 @@ async function discoverFromCommand(manifest: RunnerManifest, execImpl: ExecImpl)
       try {
         // Generous timeout: a cold runner CLI may spawn its server, install
         // extensions, and fetch its catalog on first invocation after boot.
-        const { stdout } = await execImpl(`${cmd.command} ${cmd.args.join(' ')}`, { timeout: 45000 });
+        const { stdout } = await execImpl(`${cmd.command} ${cmd.args.join(' ')}`, { timeout: 45000, env });
         const models = parseModelOutput(stdout, cmd.parser, manifest);
         if (models.length > 0) return { models: applyVariants(mergeCanonicalAliases(models, manifest), manifest), timedOut };
       } catch (err) {
@@ -486,12 +428,15 @@ export class ModelDiscovery {
    * same background service.
    */
   private inflight: Map<string, Promise<DiscoveredModel[]>> = new Map();
+  /** Bumped by every `clear()`: a discovery begun before one answers its own lookups but fills no cache. */
+  private generation = 0;
   private registry: RunnerRegistry;
   private execImpl: ExecImpl;
   private fetchImpl?: typeof fetch;
   private appServerClient: AppServerClientImpl;
   private readFileImpl: (path: string) => string | null;
   private now: () => number;
+  private env: () => Promise<RunnerEnv>;
 
   constructor(
     registry: RunnerRegistry,
@@ -500,15 +445,18 @@ export class ModelDiscovery {
     appServerClient: AppServerClientImpl = defaultAppServerClient,
     readFileImpl?: (path: string) => string | null,
     now: () => number = Date.now,
+    env: () => Promise<RunnerEnv> = async () => process.env,
   ) {
     this.registry = registry;
     this.execImpl = execImpl;
     this.fetchImpl = fetchImpl;
     this.appServerClient = appServerClient;
     this.now = now;
+    this.env = env;
     this.readFileImpl = readFileImpl ?? ((filePath: string) => {
       try {
-        return fsSync.readFileSync(filePath.replace(/^~/, osMod.homedir()), 'utf8');
+        const file = expandRunnerHome(filePath);
+        return file ? fsSync.readFileSync(file, 'utf8') : null;
       } catch {
         return null;
       }
@@ -521,18 +469,19 @@ export class ModelDiscovery {
    * null when both fail so `discover()` falls through to the remaining
    * methods.
    */
-  private async discoverFromAppServer(manifest: RunnerManifest): Promise<DiscoveredModel[] | null> {
+  private async discoverFromAppServer(manifest: RunnerManifest, env: RunnerEnv): Promise<DiscoveredModel[] | null> {
     const config = manifest.modelDiscovery.appServer;
     if (!config) return null;
 
-    const raw = await this.appServerClient(config.command, config.args);
+    const raw = await this.appServerClient(config.command, config.args, { env });
     if (raw) {
       const models = parseAppServerModels(raw);
       if (models.length > 0) return models;
     }
 
-    if (config.cacheFile) {
-      const content = this.readFileImpl(config.cacheFile);
+    const cacheFile = config.cacheFile && expandRunnerHome(typeof config.cacheFile === 'function' ? config.cacheFile(env) : config.cacheFile, env);
+    if (cacheFile) {
+      const content = this.readFileImpl(cacheFile);
       if (content) {
         const models = parseCodexModelsCache(content);
         if (models.length > 0) return models;
@@ -580,18 +529,28 @@ export class ModelDiscovery {
       return [];
     }
 
-    let models: DiscoveredModel[];
+    const generation = this.generation;
+    // Every runner is asked under the environment it is launched with: its
+    // account, its home and its own files can all move with it.
+    const env = await this.env().catch(() => process.env);
+    const found = await this.discoverFromSources(manifest, env);
+    const models = this.withSettingsModels(found.models, manifest, env);
+    // Asked before a refresh: what the runner says now is the next lookup's to learn.
+    if (generation !== this.generation) return models;
+    if (found.cacheable && models.length > 0) this.cache.set(runner, models);
+    else this.misses.set(runner, { models, at: this.now() });
+    return models;
+  }
+
+  private async discoverFromSources(manifest: RunnerManifest, env: RunnerEnv): Promise<{ models: DiscoveredModel[]; cacheable: boolean }> {
     let cacheable = true;
     const discovery = manifest.modelDiscovery;
 
     // 0. App-server JSON-RPC discovery (Codex). Live catalog first, the
     //    runner's own cache file second; falls through on total failure.
     if (discovery.appServer) {
-      const appServerModels = await this.discoverFromAppServer(manifest);
-      if (appServerModels && appServerModels.length > 0) {
-        this.cache.set(runner, appServerModels);
-        return appServerModels;
-      }
+      const appServerModels = await this.discoverFromAppServer(manifest, env);
+      if (appServerModels && appServerModels.length > 0) return { models: appServerModels, cacheable: true };
       // Both live and cache-file sources failed — whatever the remaining
       // methods produce is a degraded fallback; don't cache it, so a
       // transient failure heals on the next lookup.
@@ -602,32 +561,49 @@ export class ModelDiscovery {
     //    Returns null when no auth token is available or the request fails —
     //    in both cases we fall through to command-based discovery.
     if (discovery.apiDiscovery) {
-      const apiModels = await discoverFromApi(manifest, discovery.apiDiscovery, this.fetchImpl);
+      const apiModels = await discoverFromApi(manifest, discovery.apiDiscovery, env, this.fetchImpl);
       if (apiModels && apiModels.length > 0) {
-        models = applyVariants(mergeCanonicalAliases(apiModels, manifest), manifest);
-        if (cacheable && models.length > 0) this.cache.set(runner, models);
-        return models;
+        return { models: applyVariants(mergeCanonicalAliases(apiModels, manifest), manifest), cacheable };
       }
     }
 
     // 2. Command-based discovery (CLI subcommand or --help parsing).
     if (discovery.method === 'command' && (discovery.command || discovery.discoveryCommands?.length)) {
-      const result = await discoverFromCommand(manifest, this.execImpl);
-      models = result.models;
+      const result = await discoverFromCommand(manifest, this.execImpl, env);
       // A fallback-only result means the CLI wasn't reachable — don't cache
       // it, so a transient failure (PATH, network, cold start) heals on the
       // next lookup instead of persisting until an explicit refresh.
-      cacheable = !result.fromFallback;
-    } else {
-      models = buildFallbackModels(manifest);
+      return { models: result.models, cacheable: !result.fromFallback };
     }
+    return { models: buildFallbackModels(manifest), cacheable };
+  }
 
-    if (cacheable && models.length > 0) this.cache.set(runner, models);
-    else this.misses.set(runner, { models, at: this.now() });
-    return models;
+  /**
+   * Append the models registered in the runner's own settings. Read on every
+   * discovery rather than cached apart, so a refresh picks up an edit;
+   * whatever the sources already offer keeps its entry and metadata.
+   */
+  private withSettingsModels(models: DiscoveredModel[], manifest: RunnerManifest, env: RunnerEnv): DiscoveredModel[] {
+    const read = manifest.modelDiscovery.settingsModels;
+    if (!read) return models;
+    const files: RunnerSettingsFiles = {
+      read: (filePath) => {
+        const file = expandRunnerHome(filePath, env);
+        return file ? this.readFileImpl(file) : null;
+      },
+      list: (dir) => {
+        const expanded = expandRunnerHome(dir, env);
+        return expanded ? listDir(expanded) : [];
+      },
+      env,
+    };
+    const seen = new Set(models.map((m) => m.modelId));
+    const added = read(files).filter((m) => !seen.has(m.modelId));
+    return added.length > 0 ? [...models, ...applyVariants(added, manifest)] : models;
   }
 
   clear(): void {
+    this.generation++;
     this.cache.clear();
     this.misses.clear();
     // A refresh asks again at once; it must not join a run that began before it.

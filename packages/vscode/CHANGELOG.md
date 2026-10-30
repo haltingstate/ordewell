@@ -2,51 +2,296 @@
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-29
+
+### Fixed
+
+- **Repository configuration introduced during a run waits for your consent.**
+  A landing that adds or edits the configuration a runner loads at launch
+  holds the next task start, which names each path until the configuration is
+  committed for a new run or removed. Configuration already present when the
+  run started, and instruction files, are not held.
+- **A repository MCP server cannot take Ordewell's name.** A Claude Code change
+  or ops task does not start when its directory declares a server named
+  `ordewell`, since Claude Code does not document which server wins. Rename or
+  remove that server to start the task.
+
+## [0.11.2] - 2026-10-29
+
 ### Added
 
-- **Task handoffs.** Task cards show the summary, numbered findings with
-  severity and evidence, artifacts and a count of findings left in the log.
+- **`/resume` opens the session browser.** It answers as an alias of
+  `/sessions` in the chat, and is listed beside it in `/help` and the command
+  suggestions (#139; thanks @Logic769).
+
+### Fixed
+
+- **Claude Code's named usage limits resume tasks at reset.** A five-hour limit
+  message is recognized; when a reset time is available, the task resumes with
+  its existing session and any kept worktree.
+- **Claude Code's configured picker models are available.** Models in
+  `modelPicker.options` appear in planner and task pickers, using the runner's
+  home and workspace environment. Planner settings are checked against the
+  workspace's own catalog, including before its models have been listed.
+- **A task connecting Ordewell's tools shows its status.** Its card and chat
+  show when the runner is connecting, and stopping it stops the runner without
+  waiting for the connection.
+- **Failed tasks have a Retry button.** It appears on task and subtask cards
+  during and after a run. The Force Start, Skip, Retry and Cancel Task palette
+  commands now ask for an eligible task, including blocked tasks for Skip.
+- **Replacing a plan asks for confirmation.** Regenerate Plan confirms when an
+  existing plan has tasks, and `/new` warns when it will stop a run.
+- **Session and task handling is more reliable.** Late errors and fork editors
+  stay with their session, and overlapping task starts, landings and conflict
+  repairs keep their worktrees and holds until safe to release.
+- **Smaller fixes.** Clear All Tasks restores run settings from the settings
+  file; Toggle Runner keeps the last runner enabled; Save Session explains when
+  nothing was saved; and command errors after `/new` appear in the chat.
+
+## [0.11.1] - 2026-10-27
+
+### Changed
+
+- **The Marketplace overview no longer opens with a session recording.** The
+  listing leads with the written introduction.
+- **No extension code changed.** This release carries the version bump and the
+  listing text.
+
+## [0.11.0] - 2026-10-27
+
+### Upgrade notes
+
+New installations now start in Guarded autonomy. A read-only task can test
+changes in its own throwaway worktree and lands nothing, and the planner's
+plan edits apply as it makes them. A saved autonomy level or `ORDEWELL_AUTONOMOUS_MODE`
+override is kept. Run settings now apply to the session on screen and set the
+defaults for new or reopened sessions; other open sessions keep their values.
+Autonomy, Parallel tasks and the Planned-with trailer remain shared.
+
+The inert `ordewell.researchEnabled` setting has been removed. See the
+[project changelog](https://github.com/ordewell/ordewell/blob/main/CHANGELOG.md)
+for daemon and API upgrade information.
+
+### Added
+
+- **Sign in to a coding agent from the chat.** A signed-out Claude Code or
+  Codex stays selectable, with a red dot and **Log in** on its Planner and
+  Runners pills and its own row on the first screen, with the active planner
+  first. The action remains available after the chat starts. It runs that
+  agent's login in an integrated terminal with the workspace's environment and
+  confirms its status afterwards;
+  signing in another agent leaves the planner choice alone. A confirmed
+  signed-out planner is refused before a turn is sent, with its login command
+  in the message; task runners are not blocked by this preflight. Unknown
+  status never blocks, including Codex API-key or custom-provider setups its
+  status command cannot judge. OpenCode has no declared status or login command
+  and stays unflagged.
+- **Account limits in the footers.** When Codex, Claude Code or OpenCode Go
+  plans, the planner footer shows what that account has used of its plan's
+  windows (five hours, a week, a month) beside the planner's context and cost,
+  and a task log's footer shows its own runner's, in the order context,
+  limits, cost.
+  Limits are read from each runner's own account, with your workspace's
+  environment, about once a minute while the window has focus; the footer
+  stays on one line, with reset times in the hover. They are never saved and
+  never pause work.
+- **An API planner compacts its own context.** An OpenAI, OpenRouter,
+  OpenAI-compatible or Gemini planner targets a prompt budget of 90% of its
+  model's known window, first trimming older file reads, then condensing the
+  conversation. The original history is kept, including after a manual
+  `/compact`. The context meter says when automatic compaction is unavailable because the
+  window is unknown or the setting is off. The chat shows a Compacting status
+  with Stop, then one quiet "Context compacted automatically" marker whose
+  summary opens on demand. If a call still cannot fit, only the planner pauses,
+  with your message kept and
+  tasks still running, and a Retry compaction button above the composer
+  attempts recovery. `"plannerAutoCompaction": false` in
+  `~/.ordewell/settings.json` turns it off.
+- **The first screen shows the repositories and branches tasks will use**
+  in a repository card, with each one's commit, any uncommitted changes, and
+  whether code tasks get isolated worktrees. It only reads, and refreshes on
+  focus and on a settings or workspace change. The screen also explains
+  whether plan submission waits for approval or starts automatically with
+  autorun.
+- **"Completion received" as soon as a task reports.** The card says so at
+  once while the attempt winds down; the verdict still comes when it ends.
+- **Read-only and research tasks can read the web** through Ordewell's own
+  `fetch` and `web_search`, under the planner's web-read policy and without
+  asking you; each decision is in the task's log, not the planner chat.
+- **Task handoffs.** A task's expanded details show the summary, numbered
+  findings with severity and evidence, artifacts and a count of findings left
+  in the log.
   Dependents can pull the full handoff, and a loop's check gets its fix's
   handoff and its own previous findings. Research run updates carry summaries
   and whole findings; long reports stay in attempt logs.
+- **A read-only task's saved patch.** A task that tried a change can keep it as
+  a patch. Its task card and its log show how many files and lines the patch
+  changes, where it is saved and what it left out, with an Open patch button
+  that opens the file in an editor tab. Saving requires an isolated worktree in
+  a single repository and a working sandbox. A dependent change task can apply
+  it with `apply_patch`, resolve any conflicts and validate it at its own base.
 - **Script tasks.** A plan can hold a task with no runner and no model, a list
   of commands or one script that Ordewell runs at the workspace root; its exit
   status is its verdict. The plan shows its body, read-only, in place of a
   prompt.
 - **The planner can carry out a small effect in your turn** with
-  `run_script`: a push, a tag or one cloud setting, as a script task you
-  approve on the approval card, which shows exactly what will run.
+  `run_script`: a push, a tag or one cloud setting, as a script task. In a
+  user turn, its approval card shows exactly what will run, unless the effect
+  allowlist covers it or Full with autorun permits it on an approved plan.
+  A supervisor at Act may run it without asking; Watch can only suggest it.
 - **`ordewell.effectAllowlist` names script tasks that run without asking.**
   A rule matches the whole command, flags included, and a task runs unasked
   only when every command is covered. It has no built-in rules.
 - **Check-and-fix loops.** A task can be a loop's check: while it fails with
   rounds left, the tasks of its body fix what it found and the check runs
   again, with no planner turn in between. The plan shows each loop's rounds.
-- **Research tasks.** The planner can hand a longer investigation to a
-  read-only task whose report wakes it with the result, at every supervisor
-  level. Research tasks run within the run's Parallel limit like any other
-  task.
+- **Research tasks.** When the planner must decide something on what a
+  read-only task finds, it marks that task as research, and its report wakes it
+  with the result, at every supervisor level. Research tasks run within the
+  run's Parallel limit like any other task.
 - **The planner chooses a strategy before it outlines a plan**, from answering
   a question with no plan to exploring an open problem one round at a time,
   and each of its turns tells it how full its context is and what remains of
   its budgets.
 - **Planner skills `diagnose` and `explore`**, for a failure to explain and an
   open problem. Type `/diagnose` or `/explore`, or let the planner load one.
-- **Sealed runs.** Where the planner's sandbox runs, a command it would have
-  had to ask about runs sealed instead: the workspace read-only, no network,
+- **Sealed runs.** Where the planner's sandbox runs, a command its rules would
+  refuse without asking can run sealed instead: the workspace read-only, no network,
   no home directory and none of your credentials.
 - **`ordewell.plannerNativeShell` lets a Claude Code or OpenCode 2.x planner on
   macOS use its own shell**, off by default and on checked versions only, with
   every command run in Ordewell's sealed profile with the network. A
   workspace cannot set it.
+- **A daily version check.** Once a day Ordewell asks ordewell.ai whether a
+  newer version is out and shows one line when it is. The request carries the
+  version you run and a random install ID, shared with the CLI through
+  `~/.ordewell/version-check.json` and replaced every 30 days; nothing else is
+  sent, though ordewell.ai sees the IP address of any request, which the notice
+  says too. The first start shows a notice and sends nothing. Turn it off with
+  VS Code's telemetry setting
+  (`telemetry.telemetryLevel`), `ORDEWELL_NO_VERSION_CHECK=1` or
+  `DO_NOT_TRACK=1`: off, no notice, no ID and no request.
+- **Real commit messages.** A change task can state a commit message, and the
+  commits Ordewell writes to land it use it instead of git's default merge
+  message. Handoffs show the commit.
+- **A `Planned-with: Ordewell` trailer** ends the commits Ordewell writes. Turn
+  it off with `ordewell trailer off` (it is not in the settings panel).
+- **Installed coding agents that are switched off now show in the Runners
+  block.** Clicking one saves it in the shared enabled-runner list, so the
+  planner can use it on the next turn, including in an existing conversation.
 
 ### Changed
 
+- **Run settings belong to this window's open session.** The Run block shows
+  and changes its supervisor level, auto-merge at gates, autorun and retry
+  limit. Changes apply to its active run and are saved in
+  `~/.ordewell/settings.json` as defaults for new or reopened sessions. Other
+  open sessions keep their values, including for their next run. Headless
+  settings commands and file edits set defaults for sessions opened afterwards;
+  use `ordewell supervisor reads <n>` or the file for the wake-up read budget.
+  Autonomy and Parallel tasks apply across sessions; the Planned-with setting
+  is read at each commit.
+- **Settings makes its open state clearer.** The collapsed header is simpler,
+  and the first screen and sign-in controls follow light themes.
+- **New installations start in Guarded autonomy.** A settings file with no
+  level used to mean Full; tasks now run in their runner's safe mode and
+  a planner request the allowlist does not cover asks you. A level you saved
+  is kept.
+- **The planner's `submit_plan` and `edit_plan` apply as the call answers.**
+  The plan shows the change while the planner is still replying, a change
+  stays if the reply is stopped or fails, and the "Proposed: lands when this
+  reply ends" preview is gone.
+- **A queued task can be edited while others run.** A task that has not
+  started keeps its runner, model, effort, mode, prompt, dependency, skill and
+  ops editors during a run.
+- **Marking a task complete or not done is deliberate.** It is refused while a
+  run could still advance the task, and asks you to confirm once it is
+  stopped. A task's status circle only shows its status; the mark is at the
+  bottom of its details.
+- **Open log is now Open chat**, and a task offers it only once an attempt has
+  started.
+- **Execute Plan shows Starting… at once** and becomes Stop when a task
+  starts.
+- **The planner's activity stays visible for the whole turn**, including
+  while it streams its thinking.
+- **Supervisor reads is no longer in the Run block.** Set it with
+  `ordewell supervisor reads <n>` or in `settings.json`; a saved value is
+  kept.
+- **The chat and task logs fold what an agent did.** Each run of thinking,
+  calls, subagents and setup notices between two messages is one line that
+  says what it did, such as "Ran 4 commands, fetched 2 pages (2 failed)", and
+  opens to its rows. Each row, each step of a subagent and each long report
+  opens on its own. A line with something failed or denied in it is coloured
+  as a failure, and a call that never ran is never counted as run. Requests
+  waiting for an answer, errors and every message stay in view, and a script
+  task's log folds nothing: each command shows its whole output and exit. The
+  Expand all and Collapse all buttons are gone.
+- **Merge and Split are planner requests, not task-card buttons.** Ask the
+  planner in chat to merge or split tasks; the task cards no longer carry the
+  controls, their selection banner or their inline error.
 - **A read-only task is the same on every runner.** It reads with its runner's
   own tools, runs commands sealed with its worktree writable, so a review can
   run the tests, and lands nothing: its report is its result.
 - **A runner that cannot connect to Ordewell's tools holds its task** instead
   of failing it, and every hold shows its reason on the task's status badge.
+- **The planner chooses between its own agents and a research task by what the
+  result is, not by how long it will take.** A conclusion it needs this turn
+  stays in the turn; evidence that needs a worktree, another runner's judgement
+  or your eye, or that a later task acts on, is a task of its own, marked as
+  research only when the planner must decide something on its report, and a
+  search that takes rounds is the `explore` skill.
+- **The planner is sent its plan whole once, then only what changed.** The
+  whole plan goes again after a reorder, a reset or compaction, or a turn that
+  did not land.
+- **Opening a session another Ordewell host is running is refused.** The
+  message names the window or process that holds it. Before, a second window
+  loaded the session as well, and the two removed each other's task worktrees
+  and overwrote its file
+  ([ADR-0049](../../docs/adr/isolation/0049-a-session-has-one-live-host.md)).
+- **A plan marker and a handoff preview use the terminal's words.** The marker
+  reads `Plan generated · 3 tasks`, and the preview names the findings count,
+  severity, commit and the first line of the summary.
+- **The inert `ordewell.researchEnabled` setting is gone.** It never changed
+  what the planner did.
+
+### Fixed
+
+- **A coding-agent planner keeps Ordewell's tools across turns.** A lost
+  connection is checked before the next turn and recovered by restarting once
+  and resuming the conversation. If the tools still cannot attach, the turn
+  fails visibly without being sent.
+- **Copying selected chat text works in VS Code 1.143.** Mouse selections in
+  the planner conversation and `Planner ctx` footer keep focus for Cmd+C,
+  Ctrl+C and context-menu Copy after the composer has been used.
+- **A supervisor's Merge all after a run that merged itself no longer shows a
+  refusal**; the run update says the work is already merged.
+- **A Runners pill click is saved.** Switching a runner off or on in the chat
+  header now saves it in the enabled runners every surface shares, so the
+  planner stops offering it on the next turn of a conversation already under
+  way, and on supervisor wake-ups too. The pills show that saved list after a
+  reload, and the last runner on cannot be switched off from them.
+- **A task log's header follows the attempt on screen.** Its usage is that
+  attempt's, with the task total beneath it, its `/` commands come from that
+  attempt, and a runner that has gone quiet reads Stalled after the next status
+  update.
+- **A task log tab reopens after a window reload.** The tab finds its task
+  again, and a tab whose task left the plan closes instead of staying empty.
+- **A subtask's log tab is named by its dotted reference** (`Task 2.1 · …`),
+  and its card carries the same Waits for Merge all, Conflict and Repairing
+  badges as its parent's.
+- **An early Stop releases the chat.** Stopping before the planner turn opened
+  no longer leaves the webview drawing the turn as working.
+- **A turn waiting on your approval card is no longer called a hang** by the
+  chat's watchdog.
+- **Approving a plan no longer marks a manual task approved before the run
+  reaches it**, and a task whose approval the planner withdraws is announced
+  instead of changing silently.
+- **Merge all's guidance in the handoff card is the terminal's next step**,
+  including for a lone repository whose merge conflicted: your tree is as it
+  was, and you merge the branch yourself with git.
+- **A script task's or a manual task's log tab no longer names a runner** it does
+  not have.
+
 ## [0.10.12] - 2026-10-22
 
 ### Fixed
@@ -1052,3 +1297,7 @@ First public release.
 
 Full project changelog:
 https://github.com/ordewell/ordewell/blob/main/CHANGELOG.md
+
+[Unreleased]: https://github.com/ordewell/ordewell/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/ordewell/ordewell/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/ordewell/ordewell/compare/v0.10.12...v0.11.0

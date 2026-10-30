@@ -4,7 +4,8 @@ import {
   Session, LegacyPlanState, Task, flattenTasks, RunnerId, DiscoveredModel, enabledRunners,
   saveState, clearState, ModelResolver, RunnerRegistry, plannerNotReadyFor, describePlannerNotReady, CHAT_COMMANDS, taskStartedNotice,
   createEmptyPlan, installedPlannerAnswered, isRunnerApproval, loopRemovalRefusal, pastGateConfirmation, titledRefs, PlannerNotReadyError, PlannerTurnDiscardedError, PlannerTurnStoppedError, type INotification, type IRunner,
-  type ExecutionCommand,
+  taskActionCommand, runHoldsEditors, cardEditNeedsUnstarted, confirmedOverride, manualOverrideConfirmation, manualOverrideStopFirst, overrideNeedsConfirmation, titledTaskRefOf, type ExecutionCommand, type OverrideDirection, type TaskAction, type TaskEditOptions,
+  recordedRunnerAuth, runnerForProvider, type RunnerInstallation,
 } from '@ordewell/core';
 import type { TaskDraft, TaskEdit } from '../shared/protocol';
 import type { ChatViewProvider } from '../providers/ChatViewProvider';
@@ -21,6 +22,12 @@ export interface PlanManagerDeps {
   config: VsCodeConfig;
   fsAdapter: VsCodeFileSystem;
   runner: IRunner;
+  /**
+   * The host's login probe, asked again before a turn whose recorded verdict
+   * says signed out: the refusal offers the runner's own login as a way back,
+   * and that happens outside this process.
+   */
+  runnerInstallation?: Pick<RunnerInstallation, 'refresh' | 'plannerUsability'>;
   notifications: INotification;
   getCurrentPlan: () => LegacyPlanState;
   setCurrentPlan: (plan: LegacyPlanState) => void;
@@ -29,7 +36,12 @@ export interface PlanManagerDeps {
   /** Whether a planner turn holds the session — read off the session, never tracked here. */
   isGeneratingPlan: () => boolean;
   persistState: () => void;
-  saveCurrentSession: () => void;
+  /** Null once written; otherwise why nothing was. */
+  saveCurrentSession: () => string | null;
+  /** Push this window's run settings after its session is restored, loaded or replaced (ADR-0030). */
+  sendRunSettings: () => void;
+  /** Redraw the planner list after a re-probe changed the verdict, so the pill stops saying signed out. */
+  refreshPlannerState?: () => Promise<void>;
   log: (msg: string) => void;
 }
 
@@ -105,11 +117,35 @@ export function reportPlannerError(err: unknown, deps: PlanManagerDeps): void {
  * The rule the session's own planner gate applies to every turn (a harness
  * planner needs no key, ADR-0009), worded with the chat's own commands. Read
  * per provider, as the vendor transport reads its key: a fallback to another
- * vendor's key passed here only for the transport to refuse the turn.
+ * vendor's key passed here only for the transport to refuse the turn. The
+ * signed-out verdict is this workspace's own (ADR-0016): one daemon serves
+ * several workspaces, whose accounts differ.
  */
-export function plannerPreflightError(config: PlanManagerDeps['config']): string | null {
-  const reason = plannerNotReadyFor(config);
+export function plannerPreflightError(config: PlanManagerDeps['config'], workspace: string): string | null {
+  const reason = plannerNotReadyFor(config, (runner) => recordedRunnerAuth(runner, workspace));
   return reason ? describePlannerNotReady(reason, CHAT_COMMANDS) : null;
+}
+
+/**
+ * Ask this workspace's account again when the last verdict was signed out. The
+ * gate is synchronous and the refusal itself offers the runner's own login as
+ * a way back, which runs in another process; without this the user who took
+ * that route stays refused until a runner-list refresh.
+ */
+export function recheckSignedOutPlanner(
+  deps: Pick<PlanManagerDeps, 'config' | 'fsAdapter' | 'runnerInstallation' | 'refreshPlannerState'>,
+): Promise<void> | null {
+  const installation = deps.runnerInstallation;
+  if (!installation) return null;
+  const runner = runnerForProvider(deps.config.aiProvider);
+  const root = deps.fsAdapter.getWorkspaceRoot();
+  if (!runner || recordedRunnerAuth(runner, root)?.state !== 'signed-out') return null;
+  installation.refresh();
+  return installation.plannerUsability(runner).then(async () => {
+    // The gate re-probed so the turn can go ahead; the pill and empty state
+    // must stop saying signed out too, or they offer a login already done.
+    if (recordedRunnerAuth(runner, root)?.state !== 'signed-out') await deps.refreshPlannerState?.();
+  });
 }
 
 /**
@@ -149,12 +185,17 @@ export async function handleStartPlanning(
   // with no pick of the user's, the session reads the enabled runners itself
   // once its planner gate opens, rather than plan for an agent not installed.
   const requested = !pendingRunners?.length && !installedPlannerAnswered() ? undefined : runners;
+  // A login done with the runner's own command is seen before the gate judges.
+  const recheck = recheckSignedOutPlanner(deps);
+  if (recheck) await recheck;
   // A goal still waiting for the probe is replaced by this one in the session.
   await inPlannerTurn(deps, async () => {
     const plan = await deps.session.startPlanning(userDescription, requested);
     deps.setCurrentGoal(userDescription);
     deps.setCurrentPlan(plan);
     finishPlannerTurn(plan, deps);
+    // A plan makes this window's session the one its Run block speaks for.
+    deps.sendRunSettings();
   });
 }
 
@@ -162,6 +203,10 @@ export async function handleContinueConversation(
   text: string,
   deps: PlanManagerDeps,
 ): Promise<void> {
+  // A reply is a planner turn too, and the signed-out refusal's way back runs
+  // in another process: ask again before the session's gate judges.
+  const recheck = recheckSignedOutPlanner(deps);
+  if (recheck) await recheck;
   await inPlannerTurn(deps, async () => {
     const prior = JSON.stringify(deps.getCurrentPlan().tasks);
     adoptTurnPlan(prior, await deps.session.continueConversation(text), deps);
@@ -178,35 +223,11 @@ export async function handleSendMessageNow(
   text: string,
   deps: PlanManagerDeps,
 ): Promise<void> {
+  const recheck = recheckSignedOutPlanner(deps);
+  if (recheck) await recheck;
   await inPlannerTurn(deps, async () => {
     const prior = JSON.stringify(deps.getCurrentPlan().tasks);
     adoptTurnPlan(prior, await deps.session.forceSendPrompt(text), deps);
-  });
-}
-
-/**
- * Planner-driven merge (issue #18): route a merge request through the planner
- * conversation loop so the LLM produces the combined task, validated atomically
- * via applyTaskOps with corrective retries — not a mechanical client-side stub.
- * A pre-flight compatibility failure (canMergeTasks) throws before any LLM call.
- */
-export async function handleMergePlan(taskIds: string[], deps: PlanManagerDeps): Promise<void> {
-  if (taskIds.length < 2) return;
-  await inPlannerTurn(deps, async () => {
-    const prior = JSON.stringify(deps.getCurrentPlan().tasks);
-    adoptTurnPlan(prior, await deps.session.requestMerge(taskIds), deps);
-  });
-}
-
-/**
- * Planner-driven split (issue #18): ask the planner LLM to decompose one task
- * into a sequence of smaller tasks. Same conversation-loop / repair path as
- * merge; the model generates the breakdown (no manual per-task specs).
- */
-export async function handleSplitPlan(taskId: string, deps: PlanManagerDeps): Promise<void> {
-  await inPlannerTurn(deps, async () => {
-    const prior = JSON.stringify(deps.getCurrentPlan().tasks);
-    adoptTurnPlan(prior, await deps.session.requestSplit(taskId), deps);
   });
 }
 
@@ -220,48 +241,50 @@ export async function executeUserCommand(session: Pick<Session, 'execute'>, comm
   if (!outcome.ok) throw new Error(outcome.message);
 }
 
-/** A new run leaves a skipped task skipped, as it leaves a completed one done: running it again is a retry. */
-function approvedTasks(tasks: Task[]): Task[] {
-  return tasks.map((t) => ({
-    ...t,
-    status: t.status === 'completed' || t.status === 'skipped' ? t.status : 'approved',
-    subtasks: approvedTasks(t.subtasks ?? []),
-  }));
-}
-
-export async function handleApprovePlan(deps: PlanManagerDeps): Promise<void> {
+export async function handleApprovePlan(deps: PlanManagerDeps, requestId?: number): Promise<void> {
   deps.log('=== handleApprovePlan START ===');
-  // A run under way keeps going: Execute then approves what waits for approval, and the session says how many (#95).
-  if (deps.session.isExecuting) {
-    try {
-      await executeUserCommand(deps.session, { command: 'run_plan' });
-    } catch (err) {
-      vscode.window.showErrorMessage(`Could not approve the waiting tasks: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    return;
-  }
-  const plan = deps.getCurrentPlan();
-  // The run_plan below is the approval, and the Session records it. New task objects, not edits in place: the plan's tasks are the Session's
-  // snapshot of its store, and the plan object itself must stay the same one
-  // so `loadPlan` keeps the live planner conversation. Saved once, after the
-  // approval is complete — an earlier write would persist approved status over
-  // tasks that have not been approved yet.
-  plan.tasks = approvedTasks(plan.tasks);
-  deps.session.loadPlan(plan, deps.getCurrentGoal(), deps.fsAdapter.getWorkspaceRoot());
-  deps.chatProvider.planApproved();
-  saveState(plan, deps.fsAdapter.getWorkspaceRoot(), deps.session.sessionId);
-  deps.saveCurrentSession();
+  // The session this Execute was asked of: a load or a new session meanwhile
+  // must not make its late answer speak for the one now on screen.
+  const session = deps.session;
   try {
-    deps.log('Running the plan through the command seam...');
-    await executeUserCommand(deps.session, { command: 'run_plan' });
-    // Cleared only once the seam accepts it: a refused Execute replaced no run,
-    // and the Session still holds every mark and the handoff.
-    deps.chatProvider.clearIsolationHandoff();
-    deps.log(`run_plan returned. isRunning=${deps.session.isExecuting}, status=${deps.session.status}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    deps.log(`Orchestrator start failed: ${msg}`);
-    vscode.window.showErrorMessage(`Failed to start execution: ${msg}`);
+    // A run under way keeps going: Execute then approves what waits for approval, and the session says how many (#95).
+    if (session.isExecuting) {
+      try {
+        await executeUserCommand(session, { command: 'run_plan' });
+      } catch (err) {
+        vscode.window.showErrorMessage(`Could not approve the waiting tasks: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+    const plan = deps.getCurrentPlan();
+    // The run_plan below is the approval, and the Session records it and readies
+    // the tasks; rewriting their statuses here would approve a manual task the
+    // run has not reached. Only a plan the Session does not hold yet is loaded.
+    if (!session.planState) {
+      session.loadPlan(plan, deps.getCurrentGoal(), deps.fsAdapter.getWorkspaceRoot());
+      // Adopting the plan also moves the Run block off the bare welcome's file values.
+      deps.sendRunSettings();
+    }
+    deps.chatProvider.planApproved();
+    saveState(plan, deps.fsAdapter.getWorkspaceRoot(), session.sessionId);
+    deps.saveCurrentSession();
+    try {
+      deps.log('Running the plan through the command seam...');
+      await executeUserCommand(session, { command: 'run_plan' });
+      // Cleared only once the seam accepts it: a refused Execute replaced no run,
+      // and the Session still holds every mark and the handoff.
+      deps.chatProvider.clearIsolationHandoff();
+      deps.log(`run_plan returned. isRunning=${session.isExecuting}, status=${session.status}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      deps.log(`Orchestrator start failed: ${msg}`);
+      vscode.window.showErrorMessage(`Failed to start execution: ${msg}`);
+    }
+  } finally {
+    // The click showed "Starting…" before this ever answered: settle it on the
+    // run's own state, refusal and immediate finish included, so no spinner
+    // outlives the start it was drawn for.
+    deps.chatProvider.showRunActivity(session.activity, requestId);
   }
   deps.log('=== handleApprovePlan END ===');
 }
@@ -277,6 +300,8 @@ function ensureSessionPlan(deps: PlanManagerDeps): void {
   if (plan.tasks.length === 0 && !(plan.conversationHistory && plan.conversationHistory.length > 0)) return;
   try {
     deps.session.loadPlan(plan, deps.getCurrentGoal(), deps.fsAdapter.getWorkspaceRoot(), { persist: false });
+    // The plan that was only on the host is now the session the Run block speaks for.
+    deps.sendRunSettings();
   } catch (err) {
     deps.log(`ensureSessionPlan failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -317,17 +342,21 @@ function settleDirectEdit(deps: PlanManagerDeps): void {
   deps.saveCurrentSession();
 }
 
-function applyTaskEdit(session: Session, taskId: string, edit: TaskEdit): Promise<unknown> {
+function applyTaskEdit(session: Session, taskId: string, edit: TaskEdit, options?: TaskEditOptions): Promise<unknown> {
+  // An idle plan keeps the call it always made, without the card's condition.
+  const update = (changes: Partial<Task>) => options
+    ? session.updateTask(taskId, changes, options)
+    : session.updateTask(taskId, changes);
   switch (edit.kind) {
     // A runner change re-derives the task's model, effort and mode from the
     // new runner's catalog, which only the session can read.
-    case 'runner': return session.setTaskRunner(taskId, edit.runner);
-    case 'model': return session.updateTask(taskId, { assignedModel: edit.assignment });
-    case 'mode': return session.updateTask(taskId, { taskMode: edit.mode });
-    case 'prompt': return session.updateTask(taskId, { prompt: edit.prompt, description: edit.prompt || undefined });
-    case 'dependencies': return session.setTaskDependencies(taskId, edit.dependencies);
-    case 'skills': return session.updateTask(taskId, { skills: edit.skills });
-    case 'ops': return session.updateTask(taskId, { ops: edit.ops });
+    case 'runner': return options ? session.setTaskRunner(taskId, edit.runner, options) : session.setTaskRunner(taskId, edit.runner);
+    case 'model': return update({ assignedModel: edit.assignment });
+    case 'mode': return update({ taskMode: edit.mode });
+    case 'prompt': return update({ prompt: edit.prompt, description: edit.prompt || undefined });
+    case 'dependencies': return options ? session.setTaskDependencies(taskId, edit.dependencies, options) : session.setTaskDependencies(taskId, edit.dependencies);
+    case 'skills': return update({ skills: edit.skills });
+    case 'ops': return update({ ops: edit.ops });
   }
 }
 
@@ -338,8 +367,18 @@ function applyTaskEdit(session: Session, taskId: string, edit: TaskEdit): Promis
  * attempted.
  */
 export async function handleTaskEdit(taskId: string, edit: TaskEdit, deps: PlanManagerDeps): Promise<void> {
+  // The card's own rule, from the same run fact: a run that could still move
+  // a task on holds its editors to a task that has not started, and the
+  // Session checks that again after its own waits. A task that has not started
+  // is held to it in an idle plan too, as a start can claim it while the edit
+  // waits on discovery. A settled task of an idle plan, a failed one a run
+  // ended on included, keeps the wider direct-edit contract.
+  const { session } = deps;
+  const target = flattenTasks(session.planTasks).find((t) => t.id === taskId);
+  const held = runHoldsEditors(session.isExecuting, session.activity);
+  const options: TaskEditOptions | undefined = (target ? cardEditNeedsUnstarted(held, target) : held) ? { requireUnstarted: true } : undefined;
   try {
-    await applyTaskEdit(deps.session, taskId, edit);
+    await applyTaskEdit(deps.session, taskId, edit, options);
   } catch (err) {
     void vscode.window.showWarningMessage(err instanceof Error ? err.message : String(err));
   }
@@ -454,7 +493,7 @@ export function handleStopPlanning(deps: PlanManagerDeps): void {
  * view and the saved state.
  */
 export function handleNewSession(deps: Pick<PlanManagerDeps,
-  'session' | 'chatProvider' | 'fsAdapter' | 'setCurrentPlan' | 'setCurrentGoal' | 'log'>): void {
+  'session' | 'chatProvider' | 'fsAdapter' | 'setCurrentPlan' | 'setCurrentGoal' | 'sendRunSettings' | 'log'>): void {
   // Abandons the planner turn in flight, or one still waiting for the probe:
   // it settles as discarded, which is not reported into the new session.
   deps.session.reset();
@@ -464,6 +503,8 @@ export function handleNewSession(deps: Pick<PlanManagerDeps,
   deps.chatProvider.conversation.reset();
   deps.chatProvider.run.reset();
   clearState(deps.fsAdapter.getWorkspaceRoot());
+  // With no session open, the Run block shows the file the next one opens with (ADR-0030).
+  deps.sendRunSettings();
   deps.log('New session started');
 }
 
@@ -490,7 +531,40 @@ export async function confirmPastGate(taskId: string, session: Pick<Session, 'me
  */
 export async function forceStartPastGate(taskId: string, deps: Pick<PlanManagerDeps, 'session' | 'chatProvider'>): Promise<void> {
   if (!(await confirmPastGate(taskId, deps.session))) return;
-  await startTask(deps, { command: 'force_start', task: taskId });
+  await startTask(deps, taskActionCommand('force-start', taskId));
+}
+
+/**
+ * Mark complete and Mark not done, from the card and from the command palette
+ * alike (ADR-0029). An AI or script task's override vouches for work no verdict
+ * passed, so a real modal explains it first and the seam gets the user's yes on
+ * the command; the core refuses it anyway while a run could advance the task,
+ * and the modal is not offered then. A manual task's is the user's own sign-off
+ * and asks nothing. The task is named by id and the status the user was asked
+ * about travels with the yes, so a task that moved on while the modal was open
+ * is refused rather than overridden.
+ */
+export async function markTaskByHand(direction: OverrideDirection, taskId: string, deps: Pick<PlanManagerDeps, 'session'>): Promise<void> {
+  const { session } = deps;
+  const tasks = session.planState?.tasks ?? [];
+  const task = flattenTasks(tasks).find((t) => t.id === taskId);
+  const command = taskActionCommand(direction, taskId);
+  if (!task || !overrideNeedsConfirmation(task)) {
+    await executeUserCommand(session, command);
+    return;
+  }
+  const label = `task ${titledTaskRefOf(tasks, taskId) ?? taskId}`;
+  // The seam's own guard, not a narrower reading of it: a queued force start or
+  // a usage-limit hold refuses an override too, though nothing is starting,
+  // running or scheduled (ADR-0029).
+  if (session.activity.advancesOnItsOwn) {
+    showRefusal(new Error(manualOverrideStopFirst(direction, label)));
+    return;
+  }
+  const yes = direction === 'complete' ? 'Mark complete' : 'Mark not done';
+  const choice = await vscode.window.showWarningMessage(manualOverrideConfirmation(direction, label), { modal: true }, yes);
+  if (choice !== yes) return;
+  await executeUserCommand(session, confirmedOverride(command, task.status));
 }
 
 /**
@@ -503,37 +577,52 @@ async function startTask(deps: Pick<PlanManagerDeps, 'session' | 'chatProvider'>
   deps.chatProvider.clearIsolationHandoff();
 }
 
+/** The webview's names for the task controls that are one command each; Force start and Run go through the merge gate's confirmation instead. */
+const SYSTEM_TASK_ACTIONS = {
+  cancel: 'cancel',
+  cancelResume: 'cancel-resume',
+  resumeNow: 'resume-now',
+  retry: 'retry',
+  skip: 'skip',
+  markComplete: 'complete',
+  markIncomplete: 'uncomplete',
+} as const satisfies Record<string, TaskAction>;
+
 export async function handleSystemCommand(
   command: string,
   taskId: string,
   deps: PlanManagerDeps,
+  requestId?: number,
 ): Promise<void> {
   try {
     switch (command) {
-      case 'cancel':
-        await executeUserCommand(deps.session, { command: 'stop_task', task: taskId });
-        break;
-      case 'cancelResume':
-        await executeUserCommand(deps.session, { command: 'cancel_resume', task: taskId });
-        break;
       case 'cancelPlannerResend':
         deps.session.cancelPlannerResend();
         break;
-      case 'resumeNow':
-        await executeUserCommand(deps.session, { command: 'retry_task', task: taskId, from: 'session' });
-        break;
-      case 'retry':
-        await executeUserCommand(deps.session, { command: 'retry_task', task: taskId, from: 'fresh' });
+      // A planner turn: it streams to the chat as any does, and fails as one.
+      case 'retryPlannerCompaction':
+        try {
+          // The retry is a planner turn too, and the signed-out refusal's
+          // login runs outside this host: ask the account again before the
+          // session's gate judges.
+          const recheck = recheckSignedOutPlanner(deps);
+          if (recheck) await recheck;
+          await deps.session.retryPlannerCompaction();
+        } catch (err) {
+          reportPlannerError(err, deps);
+        }
         break;
       // Skip lands nothing, so it is never a mark: only Mark complete vouches for work.
+      case 'cancel':
+      case 'cancelResume':
+      case 'resumeNow':
+      case 'retry':
       case 'skip':
-        await executeUserCommand(deps.session, { command: 'skip_task', task: taskId });
+        await executeUserCommand(deps.session, taskActionCommand(SYSTEM_TASK_ACTIONS[command], taskId));
         break;
       case 'markComplete':
-        await executeUserCommand(deps.session, { command: 'mark_complete', task: taskId });
-        break;
       case 'markIncomplete':
-        await executeUserCommand(deps.session, { command: 'mark_not_done', task: taskId });
+        await markTaskByHand(SYSTEM_TASK_ACTIONS[command], taskId, deps);
         break;
       case 'forceStart':
         await forceStartPastGate(taskId, deps);
@@ -545,11 +634,11 @@ export async function handleSystemCommand(
           await forceStartPastGate(taskId, deps);
           break;
         }
-        await startTask(deps, { command: 'run_task', task: taskId });
+        await startTask(deps, taskActionCommand('run', taskId));
         break;
       }
       case 'executePlan':
-        await handleApprovePlan(deps);
+        await handleApprovePlan(deps, requestId);
         break;
       case 'stopExecution':
         // The seam answers a stop with nothing running, and nothing about to start, as an ok no-op; a refusal is a stop that could not be kept.
@@ -608,11 +697,15 @@ export function handleSessionMessage(
     case 'execution_complete': {
       const plan = deps.getCurrentPlan();
       deps.chatProvider.showPlan(plan);
+      deps.chatProvider.showRunActivity(deps.session.activity);
       deps.persistState();
       break;
     }
     case 'execution_stopped': {
       deps.chatProvider.showPlan(deps.getCurrentPlan(), 'draft');
+      // A Stop can come from another surface while this webview still shows a
+      // starting plan: the run's own word clears it.
+      deps.chatProvider.showRunActivity(deps.session.activity);
       deps.persistState();
       break;
     }
@@ -646,10 +739,10 @@ export function handleSessionMessage(
     case 'task_updated':
     case 'planner_turn_started':
     case 'planner_skill_loaded':
-    case 'plan_edit_held':
     case 'planner_turn_ended':
     case 'planner_text_retracted':
     case 'planner_usage':
+    case 'planner_compaction':
     case 'subagent_started':
     case 'subagent_finished':
     case 'approval_settled':

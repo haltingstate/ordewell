@@ -122,6 +122,34 @@ describe('a structured turn that ends without a task_complete call', () => {
     }
   });
 
+  it('does not flag a task that waits for input before it printed anything', async () => {
+    vi.useFakeTimers();
+    try {
+      const { orchestrator, structured } = await started();
+      structured.waitForInput();
+
+      vi.advanceTimersByTime(2 * IDLE_TIMEOUT_MS);
+      expect(task(orchestrator)).toMatchObject({ status: 'awaiting_user', awaitingReason: 'input' });
+      expect(orchestrator.getIdleSince('t1')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never flags a task that reported before it printed anything', async () => {
+    vi.useFakeTimers();
+    try {
+      const { orchestrator, structured } = await started();
+      structured.reportComplete({ status: 'done', summary: 'did it' });
+      await vi.waitFor(() => expect(task(orchestrator).status).toBe('completed'));
+
+      vi.advanceTimersByTime(2 * IDLE_TIMEOUT_MS);
+      expect(orchestrator.getIdleSince('t1')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('is ignored once its attempt was cancelled', async () => {
     const { orchestrator, structured } = await started();
     await orchestrator.cancelTask('t1');
@@ -129,6 +157,52 @@ describe('a structured turn that ends without a task_complete call', () => {
     structured.emitTurnEnd('completed');
 
     expect(task(orchestrator).status).toBe('pending');
+  });
+});
+
+// A runner whose start never resolves — stuck launching, or waiting for its
+// tools to attach — has no session to watch, and was never flagged quiet.
+describe('a runner that never finishes starting', () => {
+  it('is flagged quiet once it has been silent for the idle window, and no longer once the task is stopped', async () => {
+    vi.useFakeTimers();
+    try {
+      const runner = {
+        spawn: vi.fn((): Promise<IRunnerSession> => new Promise(() => {})),
+        stop: vi.fn(),
+        stopAll: vi.fn(),
+        activeCount: 0,
+      } satisfies IRunner;
+      const orchestrator = TaskOrchestrator.compose({
+        config: fakeConfig(),
+        notifications: fakeNotification(),
+        runner,
+        output: new BufferedTaskOutputSource(),
+        registry: new RunnerRegistry(),
+        workspaceRoot: () => '/repo',
+        workspaceEnv: async () => ({ env: {}, blockedEnvrc: null, refused: [], trackedEnvFile: null }),
+      });
+      const quiet: string[] = [];
+      orchestrator.subscribe({ onTaskIdle: ({ taskId }) => quiet.push(taskId) });
+      orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Only', prompt: 'do it' })]);
+      void orchestrator.forceStartTask('t1');
+      // Not vi.waitFor: under fake timers it moves the clock as it polls.
+      for (let i = 0; i < 50 && runner.spawn.mock.calls.length === 0; i++) await flushMicrotasks();
+      expect(runner.spawn).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(IDLE_TIMEOUT_MS - 1);
+      expect(orchestrator.getIdleSince('t1')).toBeNull();
+      vi.advanceTimersByTime(1);
+      expect(orchestrator.getIdleSince('t1')).not.toBeNull();
+      expect(quiet).toEqual(['t1']);
+      expect(task(orchestrator).status).toBe('in_progress');
+
+      await orchestrator.cancelTask('t1');
+      expect(orchestrator.getIdleSince('t1')).toBeNull();
+      vi.advanceTimersByTime(2 * IDLE_TIMEOUT_MS);
+      expect(quiet).toEqual(['t1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -473,5 +547,26 @@ describe('through the Session', () => {
       lastUpdated: new Date().toISOString(),
     }, 'Goal', '/repo');
     await expect(sendTaskMessage(inactive, 't1', 'hi')).rejects.toThrow(TaskControlError);
+  });
+});
+
+describe('a plan edit while a task waits on the user mid-attempt', () => {
+  it('keeps a task at a checkpoint waiting there', async () => {
+    const { orchestrator, structured } = await started({ autonomy: 'HITL' });
+    void structured.callCheckpoint('ok?');
+    expect(task(orchestrator)).toMatchObject({ status: 'awaiting_user', awaitingReason: 'checkpoint' });
+
+    orchestrator.reconcilePlan(orchestrator.storeInstance.planTasks.map((t) => ({ ...t, status: 'pending' as const, awaitingReason: undefined })));
+
+    expect(task(orchestrator)).toMatchObject({ status: 'awaiting_user', awaitingReason: 'checkpoint' });
+  });
+
+  it('keeps a task waiting for input waiting', async () => {
+    const { orchestrator, structured } = await started();
+    structured.waitForInput();
+
+    orchestrator.reconcilePlan(orchestrator.storeInstance.planTasks.map((t) => ({ ...t })));
+
+    expect(task(orchestrator)).toMatchObject({ status: 'awaiting_user', awaitingReason: 'input' });
   });
 });

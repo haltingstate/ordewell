@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { EMPTY_TASK_LOG } from '@ordewell/core';
 import { chatActivity } from '../layout';
 import { initialState, type TaskLogState, type TaskView, type TuiState } from '../state';
@@ -12,6 +12,15 @@ function viewing(taskId: string): TaskLogState {
 }
 
 const state = (over: Partial<TuiState>): TuiState => initialState({ sessionId: 's1', ...over });
+
+// The resume label shortens a same-day time and names the date on another day,
+// so the clock is fixed rather than read: a real clock makes this a date bomb.
+beforeEach(() => {
+  vi.useFakeTimers({ now: new Date(2026, 9, 14, 11, 0), toFake: ['Date'] });
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('chatActivity: the planner chat', () => {
   it('is empty while the planner is idle, even with tasks running', () => {
@@ -33,6 +42,11 @@ describe('chatActivity: a task chat', () => {
     expect(chatActivity(state({ tasks, taskView: viewing('t1') }))).toEqual({ label: 'Working…', busy: true });
   });
 
+  it('says its runner is connecting Ordewell\'s tools, not working, while nothing has been sent to it (ADR-0025)', () => {
+    expect(chatActivity(state({ tasks: [task({ status: 'in_progress', attaching: 1 })], taskView: viewing('t1') }))).toEqual({ label: 'Connecting Ordewell\'s tools…', busy: true });
+    expect(chatActivity(state({ tasks: [task({ status: 'in_progress', attaching: 2 })], taskView: viewing('t1') }))).toEqual({ label: 'Connecting Ordewell\'s tools, retry…', busy: true });
+  });
+
   it('is empty when another task is running and the selected one is not', () => {
     const tasks = [task({ status: 'in_progress' }), task({ id: 't2', order: 2, status: 'completed' })];
     expect(chatActivity(state({ status: 'executing', tasks, taskView: viewing('t2') }))).toBeNull();
@@ -52,7 +66,7 @@ describe('chatActivity: a task chat', () => {
     const resumeAt = new Date(2026, 9, 14, 12, 12).toISOString();
     const tasks = [task({ status: 'awaiting_user', awaitingReason: 'usage-limit', resumeAt })];
     const activity = chatActivity(state({ tasks, taskView: viewing('t1') }));
-    expect(activity?.label).toMatch(/^paused · resumes .*12:12/);
+    expect(activity?.label).toBe('paused · resumes 12:12pm');
     expect(activity?.busy).toBe(false);
   });
 });

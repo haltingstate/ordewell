@@ -3,12 +3,15 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StructuredRunner } from '../StructuredRunner';
 import { VerdictEngine } from '../VerdictEngine';
-import { createTask, type Verdict } from '../../models/Task';
+import { createTask, type LegacyPlanState, type Verdict } from '../../models/Task';
+import type { SessionMessage } from '../SessionMessage';
+import { makeSession, taskOf, testWorkspace } from './sessionTestKit';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import type { IRunnerSession, StructuredEvent, StructuredTurnEnd } from '../../interfaces/IRunner';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
+import type { AttachState } from '../harness/ordewellBinding';
 import { OrdewellMcpServer, type CheckpointAnswer, type McpClientConfig } from '../mcp';
 import { claudeSteerRecording, fakeSpawn, fixture, sseResponse, type FakeAgentProcess, type FakeEventStream, type ScriptedReply } from './harnessTestKit';
 
@@ -26,7 +29,9 @@ type Turn = { onEvent: (event: AgentEvent) => void; resolve: () => void; reject:
 
 /** A task adapter driven by hand: each `send` stays open until the test ends it. */
 class HandAdapter implements TaskModeAgentAdapter {
-  async mcpAttached(): Promise<boolean> { return true; }
+  /** The runner's report on Ordewell's server: connected at once, unless a test holds it. */
+  attach: () => Promise<AttachState> = async () => 'connected';
+  mcpAttached(): Promise<AttachState> { return this.attach(); }
   readonly agentId = 'claude-code';
   readonly exited = false;
   readonly starts: AgentStartOptions[] = [];
@@ -562,6 +567,29 @@ describe('the Ordewell task tools (ADR-0022)', () => {
     expect(adapters[0].interrupts).toBe(0);
   });
 
+  it('says a report was received as the call returns, while the report itself waits for the turn to close', async () => {
+    const { runner, adapters } = served(() => {}, 1_000);
+    const session = await runner.spawn(options());
+    const { events } = observe(session);
+    const reports: unknown[] = [];
+    session.onTaskComplete((report) => reports.push(report));
+    const client = await connect(servedConfig(adapters[0]));
+
+    const refused = await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Done.', artifacts: [{ kind: 'url', url: 'javascript:alert(1)' }] } });
+    expect(refused).toMatchObject({ isError: true });
+    expect(events.filter((e) => e.type === 'completion_received')).toEqual([]);
+
+    await client.callTool({ name: 'task_complete', arguments: { status: 'blocked', summary: 'No schema.', reason: 'the schema file is missing' } });
+    expect(events.filter((e) => e.type === 'completion_received')).toEqual([{ type: 'completion_received', status: 'blocked' }]);
+    expect(reports).toEqual([]);
+    expect(session.turnState()).toBe('working');
+
+    adapters[0].endTurn();
+    await until(() => reports.length === 1);
+    expect(events.filter((e) => e.type === 'completion_received')).toHaveLength(1);
+    session.kill();
+  });
+
   it('publishes a completion whose turn never closes after the interrupt grace', async () => {
     const { runner, adapters } = served(() => {}, 10);
     const session = await runner.spawn(options());
@@ -713,6 +741,108 @@ describe('the Ordewell task tools (ADR-0022)', () => {
     engine.reset();
   });
 
+  describe('the receipt of a report on a running plan (ADR-0018, L1)', () => {
+    const plan = (): LegacyPlanState => ({
+      tasks: [
+        createTask({ id: 'a1', order: 1, title: 'First', prompt: 'Do the task', taskMode: 'acceptEdits' }),
+        createTask({ id: 'b2', order: 2, title: 'Second', prompt: 'Then this', taskMode: 'acceptEdits', dependencies: ['a1'] }),
+      ],
+      generatedAt: '2026-10-26T00:00:00Z', lastUpdated: '2026-10-26T00:00:00Z', status: 'approved', runners: ['claude-code'],
+    });
+
+    async function running(configure: (adapter: HandAdapter) => void = () => {}) {
+      const { runner, adapters } = served(configure, 1_000);
+      const messages: SessionMessage[] = [];
+      const session = makeSession({ runner, broadcast: (m) => messages.push(m) });
+      session.loadPlan(plan(), 'goal', testWorkspace);
+      await session.execute({ command: 'run_plan' }, { kind: 'user' });
+      await until(() => adapters[0]?.sent.length === 1);
+      const client = await connect(servedConfig(adapters[0]));
+      const row = (taskId: string) => session.runSnapshot().tasks.find((t) => t.id === taskId)!;
+      const lastStatus = (taskId: string) => messages.filter((m) => m.type === 'status_update').at(-1)?.tasks.find((t) => t.id === taskId);
+      return { session, adapters, client, row, lastStatus };
+    }
+
+    it('shows the report received at once, with no verdict, landing or dependent until its turn closes', async () => {
+      const { session, adapters, client, row, lastStatus } = await running();
+
+      await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Built it.' } });
+
+      expect(row('a1')).toMatchObject({ status: 'in_progress', completionReceived: 'done', verdict: null });
+      expect(lastStatus('a1')).toMatchObject({ status: 'in_progress', completionReceived: 'done' });
+      expect(taskOf(session, 'a1')?.handoff).toBeUndefined();
+      expect(taskOf(session, 'b2')?.status).toBe('approved');
+      expect(adapters).toHaveLength(1);
+
+      adapters[0].emit({ type: 'usage', record: { source: 'claude-code', inputTokens: 1234 } });
+      adapters[0].endTurn();
+      await until(() => taskOf(session, 'a1')?.status === 'completed');
+
+      expect(row('a1').completionReceived).toBeUndefined();
+      expect(lastStatus('a1')?.completionReceived).toBeUndefined();
+      expect(taskOf(session, 'a1')?.verdict?.outcome).toBe('pass');
+      expect(taskOf(session, 'a1')?.attemptUsage?.[0].totals.inputTokens).toBe(1234);
+      await until(() => adapters.length === 2);
+      await session.execute({ command: 'stop_run' }, { kind: 'user' });
+    });
+
+    it('receives a failed or blocked report as what it said, and the verdict that follows fails', async () => {
+      for (const status of ['failed', 'blocked'] as const) {
+        const { session, adapters, client, row } = await running();
+
+        await client.callTool({ name: 'task_complete', arguments: { status, summary: 'Could not.', reason: 'the schema file is missing' } });
+        expect(row('a1')).toMatchObject({ status: 'in_progress', completionReceived: status, verdict: null });
+
+        adapters[0].endTurn();
+        await until(() => taskOf(session, 'a1')?.status === 'failed');
+        expect(row('a1').completionReceived).toBeUndefined();
+        expect(adapters).toHaveLength(1);
+        await session.execute({ command: 'stop_run' }, { kind: 'user' });
+      }
+    });
+
+    it('takes the receipt back when the runner reads a message after reporting', async () => {
+      const { session, adapters, client, row } = await running();
+      await session.execute({ command: 'message_task', task: 'a1', text: 'Also add tests' }, { kind: 'user' });
+      const [message] = row('a1').queued ?? [];
+
+      await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Built it.' } });
+      expect(row('a1').completionReceived).toBe('done');
+      adapters[0].emit({ type: 'message_delivered', id: message.id });
+
+      expect(row('a1').completionReceived).toBeUndefined();
+      adapters[0].endTurn();
+      await tick();
+      expect(taskOf(session, 'a1')?.status).toBe('in_progress');
+      await session.execute({ command: 'stop_run' }, { kind: 'user' });
+    });
+
+    it('keeps the receipt while a queued message waits, and takes it back once that message opens a turn', async () => {
+      const { session, adapters, client, row } = await running();
+      await session.execute({ command: 'message_task', task: 'a1', text: 'Also add tests' }, { kind: 'user' });
+
+      await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Built it.' } });
+      expect(row('a1').completionReceived).toBe('done');
+
+      adapters[0].endTurn();
+      await until(() => adapters[0].sent.length === 2);
+      expect(row('a1')).toMatchObject({ status: 'in_progress', verdict: null });
+      expect(row('a1').completionReceived).toBeUndefined();
+      await session.execute({ command: 'stop_run' }, { kind: 'user' });
+    });
+
+    it('drops the receipt when the run is stopped before the report settles', async () => {
+      const { session, client, row } = await running();
+      await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Built it.' } });
+      expect(row('a1').completionReceived).toBe('done');
+
+      await session.execute({ command: 'stop_run' }, { kind: 'user' });
+
+      expect(row('a1').completionReceived).toBeUndefined();
+      expect(taskOf(session, 'a1')?.status).not.toBe('completed');
+    });
+  });
+
   it('holds a checkpoint call open until the session answers it, and returns the answer', async () => {
     const { runner, adapters } = served();
     const session = await runner.spawn(options());
@@ -814,6 +944,89 @@ describe('the Ordewell task tools (ADR-0022)', () => {
 
     expect(adapters[0].starts[0]).toHaveProperty('mcp');
     session.kill();
+  });
+});
+
+describe('the startup while Ordewell\'s tools attach (ADR-0025)', () => {
+  const plan = (): LegacyPlanState => ({
+    tasks: [createTask({ id: 'a1', order: 1, title: 'First', prompt: 'Do the task', taskMode: 'acceptEdits' })],
+    generatedAt: '2026-10-29T00:00:00Z', lastUpdated: '2026-10-29T00:00:00Z', status: 'approved', runners: ['claude-code'],
+  });
+
+  /** A plan whose every spawn waits for the test to say what its runner reports of the server. */
+  async function attaching() {
+    const reports: Array<(state: AttachState) => void> = [];
+    const { runner, adapters } = byHand((adapter) => {
+      adapter.attach = () => new Promise<AttachState>((resolve) => reports.push(resolve));
+    });
+    const messages: SessionMessage[] = [];
+    const notices: string[] = [];
+    const session = makeSession({ runner, broadcast: (m) => messages.push(m), onNotice: (n) => notices.push(n.message) });
+    session.loadPlan(plan(), 'goal', testWorkspace);
+    // A start waits for the spawn it claimed, so the test answers the attach while it runs.
+    const started = session.execute({ command: 'run_plan' }, { kind: 'user' });
+    await until(() => reports.length === 1);
+    const row = () => session.runSnapshot().tasks.find((t) => t.id === 'a1')!;
+    const lastStatus = () => messages.filter((m) => m.type === 'status_update').at(-1)?.tasks.find((t) => t.id === 'a1');
+    return { session, started, adapters, reports, notices, row, lastStatus };
+  }
+
+  it('says the runner is connecting Ordewell\'s tools until it reports them connected, and sends the task only then', async () => {
+    const { session, started, adapters, reports, row, lastStatus } = await attaching();
+
+    expect(row()).toMatchObject({ status: 'in_progress', attaching: 1 });
+    expect(lastStatus()).toMatchObject({ status: 'in_progress', attaching: 1 });
+    expect(adapters[0].sent).toEqual([]);
+
+    reports[0]('connected');
+    await started;
+    await until(() => adapters[0].sent.length === 1);
+
+    expect(row().attaching).toBeUndefined();
+    expect(lastStatus()?.attaching).toBeUndefined();
+    expect(row().status).toBe('in_progress');
+    await session.execute({ command: 'stop_run' }, { kind: 'user' });
+  });
+
+  it('says the respawn is connecting them once the first spawn missed, then holds the task with nothing sent when it misses too', async () => {
+    const { started, adapters, reports, notices, row, lastStatus } = await attaching();
+
+    reports[0]('pending');
+    await until(() => reports.length === 2);
+
+    expect(row()).toMatchObject({ status: 'in_progress', attaching: 2 });
+    expect(lastStatus()).toMatchObject({ attaching: 2 });
+    expect(adapters[0].disposed).toBe(1);
+    expect(notices.some((n) => n.includes('respawning once'))).toBe(true);
+
+    reports[1]('pending');
+    await started;
+    await until(() => row().status === 'pending');
+
+    expect(row().attaching).toBeUndefined();
+    expect(lastStatus()?.attaching).toBeUndefined();
+    expect(row().holdReason).toBe('could not connect to Ordewell\'s tools; start it again');
+    expect(adapters.map((a) => a.sent)).toEqual([[], []]);
+  });
+
+  it('takes the runner back at once when the task is stopped while its tools attach, and a late report starts nothing', async () => {
+    const { session, started, adapters, reports, row, lastStatus } = await attaching();
+
+    await session.execute({ command: 'stop_task', task: 'a1' }, { kind: 'user' });
+
+    expect(row().status).toBe('pending');
+    expect(row().attaching).toBeUndefined();
+    expect(lastStatus()?.attaching).toBeUndefined();
+    // Before its runner reports anything: the stop reaches the spawn still attaching.
+    await started;
+    expect(adapters[0].disposed).toBe(1);
+
+    // A report that would have meant a respawn comes too late to start one.
+    reports[0]('pending');
+    await tick();
+    expect(row().attaching).toBeUndefined();
+    expect(adapters).toHaveLength(1);
+    expect(adapters.map((a) => a.sent)).toEqual([[]]);
   });
 });
 

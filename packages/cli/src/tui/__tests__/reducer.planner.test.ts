@@ -76,6 +76,23 @@ describe('/planner', () => {
     expect(stepperOf(state).items.find((i) => i.id === 'claude-code')?.detail).toMatch(/no API key/i);
   });
 
+  it('offers a signed-out agent, flags its row and names its own login', () => {
+    const { state } = run('/planner', {
+      ...ready,
+      runners: [
+        { id: 'claude-code', name: 'Claude Code', enabled: true, auth: { state: 'signed-out', loginCommand: ['claude', 'login'] } },
+        { id: 'codex', name: 'Codex', enabled: true, auth: { state: 'signed-in' } },
+        { id: 'opencode', name: 'OpenCode', enabled: true },
+      ],
+    });
+    const items = stepperOf(state).items;
+    const claude = items.find((i) => i.id === 'claude-code');
+    expect(claude).toMatchObject({ warn: true, detail: 'not logged in · /login claude-code' });
+    expect(claude?.disabled).toBeUndefined();
+    expect(items.find((i) => i.id === 'codex')).toMatchObject({ detail: expect.stringMatching(/no API key/i) });
+    expect(items.find((i) => i.id === 'codex')?.warn).toBeUndefined();
+  });
+
   it('leaves an agent whose CLI is not installed off the list', () => {
     const opened = run('/planner', { ...ready, runners: [{ id: 'codex', name: 'Codex', enabled: true }] }).state;
 
@@ -84,8 +101,14 @@ describe('/planner', () => {
     expect(ids).toContain('codex');
   });
 
-  const saved = (provider: string, modelId: string, effort: string, notice: string) =>
-    ({ type: 'setPlannerChoice', provider, modelId, effort, notice });
+  it('names the agents to install when nothing can plan', () => {
+    const { state } = run('/planner', { ...ready, runners: [], configuredProviders: [] });
+
+    expect(stepperOf(state).items[0]?.detail).toContain('Claude Code, Codex or OpenCode');
+  });
+
+  const saved = (provider: string, modelId: string, effort: string, notice: string, noticeLevel?: 'error') =>
+    ({ type: 'setPlannerChoice', provider, modelId, effort, notice, ...(noticeLevel ? { noticeLevel } : {}) });
 
   /** Harness › Model › Effort, each confirmed with enter. */
   it('saves harness, model and effort as each is entered, moving on after each', () => {
@@ -108,6 +131,32 @@ describe('/planner', () => {
     const catalog = [{ ...models[0], variants: [{ id: 'low', label: 'Low effort' }] }];
     const out = choose(choose(choose(run('/planner', { ...ready, models: catalog }).state, 'claude-code').state, 'opus').state, 'low');
     expect(out.effects).toEqual([saved('claude-code', 'opus', 'low', 'Planner: Claude Code · Claude Opus 5.5 · Low effort')]);
+  });
+
+  it('confirms a signed-out pick at error level, with the same words', () => {
+    const out = choose(run('/planner', {
+      ...ready,
+      runners: [
+        { id: 'claude-code', name: 'Claude Code', enabled: true, auth: { state: 'signed-out', loginCommand: ['claude', 'auth', 'login'] } },
+        { id: 'codex', name: 'Codex', enabled: true, auth: { state: 'signed-in' } },
+        { id: 'opencode', name: 'OpenCode', enabled: true },
+      ],
+    }).state, 'claude-code');
+
+    expect(out.effects).toEqual([saved('claude-code', 'opus', '', 'Planner: Claude Code · Claude Opus 5.5', 'error')]);
+  });
+
+  it('confirms a signed-in pick plainly', () => {
+    const out = choose(run('/planner', {
+      ...ready,
+      runners: [
+        { id: 'claude-code', name: 'Claude Code', enabled: true, auth: { state: 'signed-in', loginCommand: ['claude', 'auth', 'login'] } },
+        { id: 'codex', name: 'Codex', enabled: true },
+        { id: 'opencode', name: 'OpenCode', enabled: true },
+      ],
+    }).state, 'claude-code');
+
+    expect(out.effects).toEqual([saved('claude-code', 'opus', '', 'Planner: Claude Code · Claude Opus 5.5')]);
   });
 
   it('saves nothing and prints nothing for a step entered unchanged', () => {

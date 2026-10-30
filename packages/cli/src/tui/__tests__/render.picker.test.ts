@@ -4,9 +4,13 @@ import { style } from '../ansi';
 import { initialState, type PickerState, type TuiState } from '../state';
 import { reduce } from '../reducer';
 import { openStepper, type StepperDefinition } from '../reducers/stepper';
+import { inkOf } from './paint';
 
 beforeAll(() => {
   style.enabled = false;
+  // These assertions read layout as plain text, not a tty: inverse video is an
+  // escape too (see `style.attributes`). The paint describes turn it on.
+  style.attributes = false;
 });
 
 function pickerScreen(over: Partial<PickerState>, state: Partial<TuiState> = {}): string[] {
@@ -123,8 +127,10 @@ describe('picker rows', () => {
 describe('picker paint', () => {
   beforeAll(() => {
     style.enabled = true;
+    style.attributes = true;
     return () => {
       style.enabled = false;
+      style.attributes = false;
     };
   });
 
@@ -142,6 +148,27 @@ describe('picker paint', () => {
     expect(row).toContain(style.grey('CLI not installed'));
   });
 
+  it('paints a warn row in red but leaves its detail grey', () => {
+    const out = pickerScreen({
+      items: [
+        { id: 'codex', label: 'Codex', detail: 'coding agent' },
+        { id: 'claude-code', label: 'Claude Code', detail: 'not logged in · /login claude-code', warn: true },
+      ],
+    });
+    const row = out.find((l) => l.includes('Claude Code'))!;
+    expect(inkOf(row, 'Claude Code').fg).toBe('red');
+    expect(inkOf(row, 'not logged in · /login claude-code').fg).toBe('grey');
+  });
+
+  it('keeps a warn row on the active bar with only its label red', () => {
+    const out = pickerScreen({
+      items: [{ id: 'claude-code', label: 'Claude Code', detail: 'not logged in · /login claude-code', warn: true, selected: true }],
+    });
+    const row = out.find((l) => l.includes('Claude Code'))!;
+    expect(inkOf(row, 'Claude Code')).toMatchObject({ fg: 'red', inverse: true });
+    expect(inkOf(row, 'not logged in · /login claude-code')).toMatchObject({ fg: null, inverse: true });
+  });
+
   it('paints key names bold and their meaning grey', () => {
     const out = pickerScreen({ items: harnesses });
     expect(out).toContain(` ${style.bold('enter')} ${style.grey('selects')}${style.grey(' · ')}${style.bold('esc')} ${style.grey('cancels')}`);
@@ -151,7 +178,7 @@ describe('picker paint', () => {
 describe('stepper', () => {
   const definition: StepperDefinition = {
     title: 'Planner',
-    advanceOnEnter: true,
+    afterSave: 'advance',
     steps: [
       {
         id: 'harness',
@@ -198,18 +225,20 @@ describe('stepper', () => {
 
   it('highlights the active step in the header', () => {
     style.enabled = true;
+    style.attributes = true;
     try {
       const out = render(openStepper(initialState({ rows: 24, cols: 60 }), definition).state);
       expect(out.some((l) => l.includes(style.highlight(style.bold('Harness'))))).toBe(true);
     } finally {
       style.enabled = false;
+      style.attributes = false;
     }
   });
 
   it('draws a number step as one input line with its minimum, and says enter sets it where enter stays', () => {
     const counts: StepperDefinition = {
       title: 'Settings',
-      advanceOnEnter: false,
+      afterSave: 'stay',
       steps: [
         { id: 'pace', label: 'Pace', items: () => [{ id: 'fast', label: 'Fast', selected: true }] },
         { id: 'parallel', label: 'Parallel', hint: 'How many tasks run at once.', number: { min: 1, current: () => 7 } },

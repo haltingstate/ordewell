@@ -185,6 +185,20 @@ describe('ModelResolver.pickerOptions', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('shares the vendor catalog with a view for another runner environment', async () => {
+    const fetchImpl = vi.fn(fakeFetch([['/models', { data: [{ id: 'vendor/catalog', name: 'Catalog' }] }]]));
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl: fetchImpl as unknown as typeof fetch });
+    const view = resolver.withRunnerEnv('elsewhere', async () => ({ CLAUDE_CONFIG_DIR: '/elsewhere' }));
+
+    await resolver.pickerOptions();
+    expect(view.getCachedPickerOptions().map((o) => o.id)).toContain('vendor/catalog');
+    await view.pickerOptions();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    view.invalidate();
+    expect(resolver.getCachedPickerOptions()).toEqual([]);
+  });
+
   it('records a per-provider fetch failure in getDiscoveryErrors', async () => {
     // OpenRouter catalog 500s; Gemini succeeds. The picker still yields the
     // Gemini option, and the OpenRouter failure is flagged for the surfaces.
@@ -398,5 +412,194 @@ describe('ModelResolver.refresh', () => {
 
     expect(resolveProvider('gemini:gemini-2.5-pro', lists)).toBe('google');
     expect(resolveProvider('google/gemini-2.5-pro', lists)).toBe('openrouter');
+  });
+});
+
+describe('ModelResolver.maxOutputTokensFor', () => {
+  it('keeps the reply cap OpenRouter states for a model\'s serving provider, and none it did not state', async () => {
+    const fetchImpl = fakeFetch([['/models', { data: [
+      { id: 'vendor/capped', name: 'Capped', context_length: 131072, top_provider: { max_completion_tokens: 8192 } },
+      { id: 'vendor/uncapped', name: 'Uncapped', context_length: 131072, top_provider: { max_completion_tokens: null } },
+    ] }]]);
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl });
+    await resolver.pickerOptions();
+
+    expect(resolver.maxOutputTokensFor('openrouter', 'vendor/capped')).toBe(8192);
+    expect(resolver.maxOutputTokensFor('openrouter', 'vendor/uncapped')).toBeUndefined();
+    expect(resolver.maxOutputTokensFor('openrouter', 'vendor/unlisted')).toBeUndefined();
+  });
+
+  it('keeps the outputTokenLimit Gemini\'s own models endpoint states, and none it did not state', async () => {
+    const fetchImpl = fakeFetch([
+      ['/v1beta/models', { models: [
+        { name: 'models/gemini-2.5-pro', displayName: 'Gemini 2.5 Pro', supportedGenerationMethods: ['generateContent'], inputTokenLimit: 1048576, outputTokenLimit: 65536 },
+        { name: 'models/gemini-unsized', displayName: 'Unsized', supportedGenerationMethods: ['generateContent'] },
+      ] }],
+    ]);
+    const resolver = new ModelResolver(fakeRegistry({}), configWith({ geminiKey: 'gem-key', openrouterKey: '' }), { fetchImpl });
+    await resolver.pickerOptions();
+
+    expect(resolver.maxOutputTokensFor('google', 'gemini-2.5-pro')).toBe(65536);
+    expect(resolver.maxOutputTokensFor('google', 'gemini-unsized')).toBeUndefined();
+    expect(resolver.contextWindowFor('google', 'gemini-unsized')).toBeUndefined();
+  });
+});
+
+describe('ModelResolver.warmPickerOptions', () => {
+  function countingFetch(): { fetchImpl: typeof fetch; calls: () => number } {
+    let calls = 0;
+    const inner = fakeFetch([['/models', { data: [{ id: 'vendor/model', name: 'Model', context_length: 64000 }] }]]);
+    return { fetchImpl: ((...args: Parameters<typeof fetch>) => { calls++; return inner(...args); }) as typeof fetch, calls: () => calls };
+  }
+
+  it('loads the catalogs in the background once, sharing a load already under way, and never again once held', async () => {
+    const { fetchImpl, calls } = countingFetch();
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl });
+
+    resolver.warmPickerOptions();
+    resolver.warmPickerOptions();
+    const asked = resolver.pickerOptions();
+    expect(resolver.contextWindowFor('openrouter', 'vendor/model')).toBeUndefined();
+    await asked;
+
+    expect(calls()).toBe(1);
+    expect(resolver.contextWindowFor('openrouter', 'vendor/model')).toBe(64000);
+    resolver.warmPickerOptions();
+    expect(calls()).toBe(1);
+  });
+
+  it('raises nothing from a load that failed in the background', async () => {
+    const fetchImpl = (async () => { throw new Error('offline'); }) as typeof fetch;
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl });
+
+    resolver.warmPickerOptions();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(resolver.contextWindowFor('openrouter', 'vendor/model')).toBeUndefined();
+  });
+});
+
+
+describe('ModelResolver — one catalog family across runner environments', () => {
+  /** An exec that lists `<runner>/<account>`, the account being the env's CLAUDE_CONFIG_DIR, and counts each listing per account. */
+  function accountExec() {
+    const listed: string[] = [];
+    const exec: ExecImpl = vi.fn(async (command: string, options?: { env?: Record<string, string | undefined> }) => {
+      const account = options?.env?.CLAUDE_CONFIG_DIR ?? 'daemon';
+      listed.push(account);
+      return { stdout: `${command.split(' ')[0]}/${account} Model\n` };
+    });
+    return { exec, listed };
+  }
+
+  function gatedFetch(stale: string, fresh: string) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0]) => {
+      if (!String(input).includes('/models')) return new Response('not found', { status: 404 });
+      const id = calls++ === 0 ? stale : fresh;
+      if (id === stale) await gate;
+      return new Response(JSON.stringify({ data: [{ id, name: id }] }), { status: 200 });
+    }) as typeof fetch;
+    return { fetchImpl, release };
+  }
+
+  it('keeps one view per key, each with a runner catalog of its own', async () => {
+    const { exec, listed } = accountExec();
+    const resolver = new ModelResolver(fakeRegistry({ foo: manifest('foo') }), config, { execImpl: exec });
+    const b = resolver.withRunnerEnv('b', async () => ({ CLAUDE_CONFIG_DIR: 'b' }));
+
+    expect(resolver.withRunnerEnv('b', async () => ({ CLAUDE_CONFIG_DIR: 'elsewhere' }))).toBe(b);
+    expect(resolver.withRunnerEnv('c', async () => ({ CLAUDE_CONFIG_DIR: 'c' }))).not.toBe(b);
+    expect((await resolver.modelsForRunners(['foo'])).foo?.map((m) => m.modelId)).toEqual(['foo/daemon']);
+    expect((await b.modelsForRunners(['foo'])).foo?.map((m) => m.modelId)).toEqual(['foo/b']);
+    await b.modelsForRunners(['foo']);
+    expect(listed).toEqual(['daemon', 'b']);
+  });
+
+  it('reaches every runner environment from one invalidate or runner refresh, made on any of them', async () => {
+    const { exec, listed } = accountExec();
+    const resolver = new ModelResolver(fakeRegistry({ foo: manifest('foo') }), configWith(), { execImpl: exec, fetchImpl: fakeFetch([]) });
+    const b = resolver.withRunnerEnv('b', async () => ({ CLAUDE_CONFIG_DIR: 'b' }));
+    const both = () => Promise.all([resolver.modelsForRunners(['foo']), b.modelsForRunners(['foo'])]);
+
+    await both();
+    resolver.invalidate();
+    await both();
+    b.refreshRunnerModels();
+    await both();
+
+    expect(listed.filter((account) => account === 'daemon')).toHaveLength(3);
+    expect(listed.filter((account) => account === 'b')).toHaveLength(3);
+  });
+
+  it('leaves the vendor cache to the load after invalidate() when one begun before it ends last', async () => {
+    const { fetchImpl, release } = gatedFetch('vendor/stale', 'vendor/fresh');
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl });
+
+    const before = resolver.pickerOptions();
+    resolver.invalidate();
+    const after = await resolver.pickerOptions();
+    release();
+
+    expect((await before).map((o) => o.id)).toEqual(['vendor/stale']);
+    expect(after.map((o) => o.id)).toEqual(['vendor/fresh']);
+    expect(resolver.getCachedPickerOptions().map((o) => o.id)).toEqual(['vendor/fresh']);
+    expect((await resolver.pickerOptions()).map((o) => o.id)).toEqual(['vendor/fresh']);
+  });
+
+  it('leaves a view\'s runner cache to the discovery after invalidate() when one begun before it ends last', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let call = 0;
+    const exec: ExecImpl = vi.fn(async () => {
+      if (call++ === 0) { await gate; return { stdout: 'foo/stale Stale\n' }; }
+      return { stdout: 'foo/fresh Fresh\n' };
+    });
+    const resolver = new ModelResolver(fakeRegistry({ foo: manifest('foo') }), configWith(), { execImpl: exec, fetchImpl: fakeFetch([]) });
+    const view = resolver.withRunnerEnv('b', async () => ({}));
+
+    const before = view.modelsForRunners(['foo']);
+    resolver.invalidate();
+    await view.modelsForRunners(['foo']);
+    release();
+    await before;
+
+    expect(view.getCachedRunnerModels('foo').map((m) => m.modelId)).toEqual(['foo/fresh']);
+  });
+});
+
+describe('ModelResolver.plannerCatalog', () => {
+  it('judges a harness planner by its own runner catalog, variants included, discovering it if not held', async () => {
+    const exec: ExecImpl = vi.fn().mockResolvedValue({ stdout: 'claude-a Claude A\n' });
+    const variants = [{ id: 'high', label: 'High' }];
+    const resolver = new ModelResolver(fakeRegistry({ 'claude-code': manifest('claude-code', { variants }) }), config, { execImpl: exec });
+
+    expect(resolver.cachedPlannerCatalog('claude-code')).toEqual([]);
+    expect(await resolver.plannerCatalog('claude-code')).toEqual([{ id: 'claude-a', variants }]);
+    expect(resolver.cachedPlannerCatalog('claude-code')).toEqual([{ id: 'claude-a', variants }]);
+    await resolver.plannerCatalog('claude-code');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('judges a vendor planner by the picker catalog, which every runner environment shares', async () => {
+    const fetchImpl = vi.fn(fakeFetch([['/models', { data: [{ id: 'vendor/catalog', name: 'Catalog' }] }]]));
+    const resolver = new ModelResolver(fakeRegistry({}), configWith(), { fetchImpl: fetchImpl as unknown as typeof fetch });
+    const view = resolver.withRunnerEnv('b', async () => ({}));
+
+    expect(resolver.cachedPlannerCatalog('openrouter')).toEqual([]);
+    expect(await resolver.plannerCatalog('openrouter')).toEqual([{ id: 'vendor/catalog' }]);
+    expect(view.cachedPlannerCatalog('openrouter')).toEqual([{ id: 'vendor/catalog' }]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers an empty catalog, never a throw, when nothing can be discovered', async () => {
+    const exec: ExecImpl = vi.fn().mockRejectedValue(new Error('not installed'));
+    const fetchImpl = (async () => { throw new Error('offline'); }) as typeof fetch;
+    const resolver = new ModelResolver(fakeRegistry({ codex: manifest('codex', { fallbackModels: [] }) }), configWith(), { execImpl: exec, fetchImpl });
+
+    expect(await resolver.plannerCatalog('codex')).toEqual([]);
+    expect(await resolver.plannerCatalog('openrouter')).toEqual([]);
   });
 });

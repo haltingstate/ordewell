@@ -1,17 +1,20 @@
 import type { ApprovalDecision } from './interfaces/IApproval';
 import type { AiProvider, PlannerBackendId } from './interfaces/IConfig';
-import type { IsolationMergeResult } from './interfaces/IWorktreeIsolation';
+import type { IsolationMergeResult, IsolationPreview } from './interfaces/IWorktreeIsolation';
 import type { SessionMeta } from './models/Session';
 import type { DiscoveredModel } from './models/Task';
 import type { PlannerNotReady } from './services/plannerReadiness';
+import type { SessionHeld } from './services/sessionLease';
 import type { PendingApproval } from './services/PendingApprovals';
-import type { RunView, SessionMessage, SessionNotice, SurfacePlan, SurfacePlanState } from './services/SessionMessage';
+import type { AccountLimitsMessage, RunView, SessionMessage, SessionNotice, SurfacePlan, SurfacePlanState } from './services/SessionMessage';
 import type { ConversationCompaction, RewindTarget } from './services/PlannerConversation';
 import type { PlannerModelRecall } from './services/PlannerModelMemory';
 import type { OrchestratorOption } from './services/ProviderRouting';
 import type { RunnerModeInfo } from './services/ModeResolver';
 import type { GlobalRunSettings, UserSettings } from './services/SettingsService';
 import type { TaskLogEvent } from './models/TaskLog';
+import type { CommandPayload } from './services/ExecutionCommands';
+import type { RunnerAuth } from './services/runnerAuth';
 
 /**
  * The daemon contract: every HTTP body the local daemon sends, in one place.
@@ -49,7 +52,9 @@ export type DaemonErrorCode =
   /** The request asked for something the plan, task or conversation does not allow. */
   | 'refused'
   | 'checkpoint_not_waiting'
-  | 'approval_not_outstanding';
+  | 'approval_not_outstanding'
+  /** Another live Ordewell host runs this session (ADR-0049); `sessionHeld` names it. */
+  | 'session_held';
 
 /** The body of every non-2xx answer a route gives. */
 export interface ErrorBody {
@@ -59,6 +64,10 @@ export interface ErrorBody {
   workspace?: string;
   /** Set with `planner_not_ready`: the reason as data, so a client can word it in its own commands. */
   plannerNotReady?: PlannerNotReady;
+  /** Set with `session_held`: the host that holds the session, and the runners a gone one left. */
+  sessionHeld?: SessionHeld;
+  /** Set on a command the seam refused after the act ran and stopped: the Merge all git would not take. */
+  payload?: CommandPayload;
 }
 
 /**
@@ -74,9 +83,23 @@ export interface OkResponse extends Worded {
   ok: boolean;
 }
 
-/** A task start's answer: `queued` says why it did not start now, when the task waits for its dependencies instead. */
-export interface TaskStartResponse extends OkResponse {
-  queued?: string;
+/** `GET /api/server`: which process owns the port, so a stop can be verified before it signals one. */
+export interface ServerInfoResponse {
+  pid: number;
+  port: number;
+}
+
+/**
+ * `POST /api/plans/:id/execute-command`: the body is an `ExecutionCommand`, run
+ * as the user (ADR-0029), and this is its answer. `message` is the seam's own
+ * line, `payload` what a button needs beyond it (a queued message's id, a force
+ * start's queued line). A refusal is the one `ErrorBody` every route gives, code
+ * `refused`.
+ */
+export interface ExecuteCommandResponse {
+  ok: true;
+  message: string;
+  payload?: CommandPayload;
 }
 
 /**
@@ -131,21 +154,13 @@ export interface CancelPlanningResponse {
   cancelled: boolean;
 }
 
-/** `POST …/resume/cancel` (cancelled is true: a task with no resume scheduled is refused) and `POST …/converse/resend/cancel` (false when nothing waited). */
+/** `POST …/converse/resend/cancel`: `cancelled` is false when nothing waited. */
 export interface CancelResumeResponse extends Worded {
   cancelled: boolean;
 }
 
 export interface TaskMessageResponse {
   id: string;
-}
-
-export interface ForceSendResponse extends Worded {
-  sent: boolean;
-}
-
-export interface RemoveMessageResponse extends Worded {
-  removed: boolean;
 }
 
 export interface MergeGateEntry {
@@ -191,12 +206,16 @@ export interface RunnerEntry {
   id: string;
   name: string;
   enabled: boolean;
+  /** The runner's own login verdict, beside `enabled`: a signed-out agent is still offered, flagged. */
+  auth?: RunnerAuth;
 }
 
 export interface RunnersResponse {
   runners: RunnerEntry[];
   orchestratorModel: string;
 }
+
+type PlannerCompactionMessage = Extract<SessionMessage, { type: 'planner_compaction' }>;
 
 /** Sessions: a saved one comes off its file, a live one from the pool's store. */
 export interface SessionResponse {
@@ -208,6 +227,8 @@ export interface SessionResponse {
    * file has no run to speak of, and a surface does not rebuild one from it.
    */
   run?: RunView;
+  /** The planner compaction running now, as {@link AdoptSessionResponse.plannerCompaction}. */
+  plannerCompaction?: PlannerCompactionMessage;
 }
 
 export interface AdoptSessionResponse extends OkResponse {
@@ -215,6 +236,18 @@ export interface AdoptSessionResponse extends OkResponse {
   goal: string;
   /** The adopted session's run, as {@link SessionResponse.run}. */
   run?: RunView;
+  /**
+   * The planner turn holding the session when it was adopted. Absent when none
+   * is, which is what lets a surface that lost a turn end settle it.
+   */
+  plannerTurnId?: string;
+  /**
+   * The planner compaction running when the session was adopted, as its start
+   * was announced (ADR-0017). It has no turn of its own, so `plannerTurnId`
+   * cannot tell a surface that joins mid-compaction the planner is busy; this
+   * can, and the id is the one its end will carry. Absent when none is.
+   */
+  plannerCompaction?: PlannerCompactionMessage;
 }
 
 export interface TaskLogAttemptsResponse {
@@ -240,7 +273,10 @@ export interface SettingsResponse {
   maxParallel: number;
   modelAllowlist: UserSettings['modelAllowlist'];
   plannerModels: UserSettings['plannerModels'];
-  /** The user's run settings (ADR-0030), each at its default until set. */
+  /**
+   * The run settings (ADR-0030): the named open session's own copy when one is
+   * asked about, else the file's values, each at its default until set.
+   */
   run: GlobalRunSettings;
 }
 
@@ -269,6 +305,15 @@ export interface WorkspacesResponse {
   workspaces: string[];
 }
 
+/**
+ * The repositories and branches a run would isolate, as a surface shows them
+ * before there is a run. Read-only: nothing about it is authoritative once a
+ * run starts, which reads the base branch again.
+ */
+export interface IsolationPreviewResponse {
+  preview: IsolationPreview;
+}
+
 export interface ApprovalsResponse {
   pending: PendingApproval[];
   approvedScopes: string[];
@@ -282,7 +327,7 @@ export interface ApprovalAnswerResponse extends OkResponse {
 /**
  * Where a frame stands in its session's broadcast stream. A client holding
  * several sockets on one session gets every broadcast on each, and a frame's
- * content is no identity: two clears of a held edit are the same JSON. `seq`
+ * content is no identity: two identical status frames are the same JSON. `seq`
  * rises by one per broadcast of the session for as long as the daemon runs,
  * whichever Session object holds the id; `stream` names the daemon process,
  * so a restarted daemon's numbering is never compared with the last one's.
@@ -299,10 +344,11 @@ export type ApprovalRequestMessage = Extract<SessionMessage, { type: 'approval_r
 
 /**
  * What a session's socket sends right after `connected`: its run as it stands,
- * so a client that joins mid-run has the run view before the next update —
- * the held edit's preview included — and the planner's approval requests
+ * so a client that joins mid-run has the run view before the next update,
+ * and the planner's approval requests
  * still waiting, which no later frame would announce again. `seq` is the last
- * broadcast it accounts for. Every frame after it is a {@link SessionFrame}.
+ * broadcast it accounts for. Session broadcasts are {@link SessionFrame}s;
+ * host-owned account limits have their own snapshot and revision.
  */
 export interface RunSnapshotFrame extends Partial<StreamStamp> {
   type: 'run_snapshot';
@@ -310,4 +356,11 @@ export interface RunSnapshotFrame extends Partial<StreamStamp> {
   view: RunView;
   /** Absent from a daemon older than the field: nothing is known, not "none waiting". */
   approvals?: ApprovalRequestMessage[];
+}
+
+/** Independent of run snapshot stamps: quota reads have their own revision. */
+export interface AccountLimitsFrame extends AccountLimitsMessage {
+  sessionId: string;
+  stream: string;
+  revision: number;
 }

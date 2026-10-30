@@ -1,5 +1,14 @@
 import type { RunnerManifest } from '../types';
-import { parseAnthropicModels, parseClaudeHelp } from './claudeModels';
+import { claudeConfigDir, parseAnthropicModels, parseClaudeHelp, readClaudeSettingsModels } from './claudeModels';
+
+/**
+ * A turn on a signed-out account ends with this line, which the status
+ * command's JSON reader cannot parse; the reader matches it on a failed
+ * turn's words as the failure fallback. Anchored to the whole phrase: a
+ * failure can quote another tool that is not logged in, and that is not this
+ * runner's own verdict.
+ */
+const TURN_NOT_LOGGED_IN = /not logged in\s*·\s*please run \/login/i;
 
 export const CLAUDE_CODE_MANIFEST: RunnerManifest = {
   name: 'claude-code',
@@ -39,18 +48,24 @@ export const CLAUDE_CODE_MANIFEST: RunnerManifest = {
     // 3. canonicalAliases — stable --model contracts (opus/sonnet/haiku/fable)
     //    merged into any successful result to fill gaps, and used as the full
     //    last-resort list when both API and CLI are unavailable.
+    //
+    // Whichever source answers, the models the user added to Claude's own
+    // picker (`modelPicker.options` in its managed or user settings, usually
+    // gateway IDs) are appended (settingsModels): the CLI accepts them as
+    // `--model` values though no catalog above lists them.
     apiDiscovery: {
       url: 'https://api.anthropic.com/v1/models?limit=100',
       headers: { 'anthropic-version': '2023-06-01' },
       auth: [
         { type: 'env', varName: 'ANTHROPIC_API_KEY', header: 'X-Api-Key' },
-        { type: 'file', path: '~/.claude/.credentials.json', jsonPath: 'claudeAiOauth.accessToken', header: 'Authorization', prefix: 'Bearer ' },
+        { type: 'file', path: (env) => `${claudeConfigDir(env)}/.credentials.json`, jsonPath: 'claudeAiOauth.accessToken', header: 'Authorization', prefix: 'Bearer ' },
       ],
       parser: parseAnthropicModels,
     },
     discoveryCommands: [
       { command: 'claude', args: ['--help'], parser: parseClaudeHelp },
     ],
+    settingsModels: (files) => readClaudeSettingsModels(files),
     canonicalAliases: [
       { modelId: 'opus', modelLabel: 'Opus' },
       { modelId: 'sonnet', modelLabel: 'Sonnet' },
@@ -65,6 +80,32 @@ export const CLAUDE_CODE_MANIFEST: RunnerManifest = {
       { id: 'xhigh', label: 'Extra high effort' },
       { id: 'max', label: 'Max effort' },
     ],
+  },
+
+  auth: {
+    statusArgs: ['auth', 'status'],
+    loginArgs: ['auth', 'login'],
+    // The reader matches this on a failed turn's own words; the status
+    // command's JSON reader cannot parse that line.
+    signedOut: TURN_NOT_LOGGED_IN,
+    // The status command prints JSON on stdout; an older CLI prints prose
+    // instead, which must stay unknown rather than claiming the user is signed
+    // out. stderr is read only when stdout is empty: CLI warnings go there,
+    // and parsing the two streams as one document would hide a signed-out
+    // answer behind any warning beside it. A failed turn's words are never
+    // JSON: only the failure phrase is the runner's own verdict there.
+    read: ({ stdout, stderr, code, kind, output }) => {
+      if (code === 0) return 'signed-in';
+      const answer = stdout.trim() || stderr.trim();
+      try {
+        const parsed: unknown = JSON.parse(answer);
+        if (parsed && typeof parsed === 'object' && (parsed as { authMethod?: unknown }).authMethod === 'none') return 'signed-out';
+      } catch {
+        // Not JSON: nothing here says why the command failed.
+      }
+      if (kind === 'turn' && TURN_NOT_LOGGED_IN.test(output)) return 'signed-out';
+      return null;
+    },
   },
 
   contextFile: 'CLAUDE.md',

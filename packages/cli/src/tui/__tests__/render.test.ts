@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { render } from '../render';
 import { bodyRows, chatBodyLines, helpLayout } from '../layout';
 import { stripAnsi, style, width } from '../ansi';
@@ -39,8 +39,8 @@ const reply = (content: string): Action => ({
 });
 
 const tasks: TaskView[] = [
-  { id: 'a', order: 1, title: 'Add the login route', type: 'ai', status: 'completed', dependencies: [] },
-  { id: 'b', order: 2, title: 'Write the tests', type: 'ai', status: 'running', dependencies: ['a'] },
+  { id: 'a', order: 1, title: 'Add the login route', type: 'ai', status: 'completed', dependencies: [], attempted: true },
+  { id: 'b', order: 2, title: 'Write the tests', type: 'ai', status: 'running', dependencies: ['a'], attempted: true },
   { id: 'c', order: 3, title: 'Review by hand', type: 'user', status: 'pending', dependencies: ['b'] },
 ];
 
@@ -234,6 +234,155 @@ describe('welcome mark', () => {
   });
 });
 
+describe('signed-out planners', () => {
+  type AuthState = 'signed-in' | 'signed-out' | 'unknown';
+  const claude = (state: AuthState, loginCommand?: string[]) => ({
+    id: 'claude-code', name: 'Claude Code', enabled: true,
+    auth: loginCommand ? { state, loginCommand } : { state },
+  });
+  const codex = (state: AuthState = 'signed-out') => ({
+    id: 'codex', name: 'Codex', enabled: true,
+    auth: { state, loginCommand: ['codex', 'login'] },
+  });
+  const plain = (over: Partial<TuiState>): string[] => screen(over).map(stripAnsi).map((l) => l.trimEnd());
+  const welcome = (over: Partial<TuiState>): string[] =>
+    plain({ cols: 80, rows: 24, workspace: '/w', ...over });
+  const underWorkspace = (lines: string[]): string[] => {
+    const workspace = lines.findIndex((l) => l.startsWith('/w'));
+    expect(workspace).toBeGreaterThanOrEqual(0);
+    return lines.slice(workspace + 1).filter((l) => l.includes('not logged in'));
+  };
+  const warnings = (lines: string[]): string[] => lines.filter((l) => l.includes('not logged in'));
+  const CLAUDE = 'Claude Code not logged in. /login to sign in.';
+  const CODEX = 'Codex not logged in. /login codex to sign in.';
+
+  it('warns directly under the workspace row when the active agent is signed out', () => {
+    const lines = welcome({
+      ...DETECTED, plannerProvider: 'claude-code', runners: [claude('signed-out', ['claude', 'auth', 'login'])],
+    });
+    expect(underWorkspace(lines)[0]).toBe(CLAUDE);
+  });
+
+  it('names every signed-out agent\'s own login, the active planner first', () => {
+    // Codex comes first in the daemon's list; the plan at hand still leads.
+    const lines = welcome({
+      ...DETECTED, plannerProvider: 'claude-code', runners: [codex(), claude('signed-out', ['claude', 'auth', 'login'])],
+    });
+    expect(warnings(lines)).toEqual([CLAUDE, CODEX]);
+    expect(lines.join('\n')).not.toContain('/login claude-code');
+  });
+
+  it('names the login of a signed-out agent that is not the planner', () => {
+    const lines = welcome({
+      ...DETECTED, plannerProvider: 'openrouter', configuredProviders: ['openrouter'], runners: [claude('signed-out', ['claude', 'auth', 'login'])],
+    });
+    expect(warnings(lines)).toEqual(['Claude Code not logged in. /login claude-code to sign in.']);
+  });
+
+  it('says nothing when signed in, unknown, without a login command, or before detection', () => {
+    const cases: Partial<TuiState>[] = [
+      { ...DETECTED, plannerProvider: 'claude-code', runners: [claude('signed-in', ['claude', 'auth', 'login'])] },
+      { ...DETECTED, plannerProvider: 'claude-code', runners: [claude('unknown', ['claude', 'auth', 'login'])] },
+      { ...DETECTED, plannerProvider: 'claude-code', runners: [claude('signed-out')] },
+      { ...DETECTED, plannerProvider: 'claude-code', runners: [{ id: 'opencode', name: 'OpenCode', enabled: true }] },
+      { ...DETECTED, runnersKnown: false, plannerProvider: 'claude-code', runners: [claude('signed-out', ['claude', 'auth', 'login'])] },
+    ];
+    for (const over of cases) expect(welcome(over).join('\n')).not.toContain('not logged in');
+  });
+
+  it('paints each warning red and keeps every line inside the pane', () => {
+    style.enabled = true;
+    try {
+      for (const cols of [40, 30]) {
+        const out = screen({
+          ...DETECTED, cols, rows: 40, workspace: '/w', plannerProvider: 'claude-code',
+          runners: [codex(), claude('signed-out', ['claude', 'auth', 'login'])],
+        });
+        const painted = out.filter((l) => stripAnsi(l).includes('not logged in.'));
+        // One alarm line per agent; the rest of a wrapped sentence inherits its colour.
+        expect(painted).toHaveLength(2);
+        for (const line of painted) expect(line).toContain('\x1b[31m');
+        for (const line of out) expect(width(line)).toBeLessThanOrEqual(cols);
+      }
+    } finally {
+      style.enabled = false;
+    }
+  });
+
+  it('paints only the signed-out agent\'s name red in the Runners row', () => {
+    style.enabled = true;
+    try {
+      const out = screen({
+        ...DETECTED, cols: 80, plannerProvider: 'claude-code',
+        runners: [claude('signed-out', ['claude', 'auth', 'login']), codex('signed-in')],
+      });
+      const row = out.find((l) => stripAnsi(l).trimStart().startsWith('Runners'));
+      expect(row).toBeDefined();
+      expect(stripAnsi(row!)).toContain('Claude Code, Codex');
+      expect(row!).toContain('\x1b[31mClaude Code\x1b[0m');
+      expect(row!).not.toContain('\x1b[31mCodex');
+      expect(width(row!)).toBeLessThanOrEqual(80);
+    } finally {
+      style.enabled = false;
+    }
+  });
+
+  it('paints the selected planner\'s value red while its agent is signed out', () => {
+    style.enabled = true;
+    try {
+      const out = screen({
+        ...DETECTED, cols: 80, plannerProvider: 'claude-code', orchestratorModel: 'opus', plannerEffort: 'high',
+        models: [
+          { id: 'opus', label: 'Opus', provider: 'anthropic', runners: ['claude-code'], variants: [{ id: 'low', label: 'Low' }, { id: 'high', label: 'High effort' }] },
+        ],
+        runners: [claude('signed-out', ['claude', 'auth', 'login'])],
+      });
+      const row = out.find((l) => stripAnsi(l).trimStart().startsWith('Planner'));
+      expect(row).toBeDefined();
+      expect(row!).toContain('\x1b[31mClaude Code\x1b[0m');
+      expect(row!).toContain('\x1b[31mopus\x1b[0m');
+      expect(row!).toContain('\x1b[31mHigh effort\x1b[0m');
+      // The separators stay grey: it is one planner value, not three warnings.
+      expect(row!).toContain('\x1b[90m · \x1b[0m');
+      expect(width(row!)).toBeLessThanOrEqual(80);
+    } finally {
+      style.enabled = false;
+    }
+  });
+
+  it('leaves the selected planner\'s value plain when it is signed in, unknown, has no login, or is a vendor', () => {
+    style.enabled = true;
+    try {
+      const cases: Partial<TuiState>[] = [
+        { ...DETECTED, plannerProvider: 'claude-code', orchestratorModel: 'opus', runners: [claude('signed-in', ['claude', 'auth', 'login'])] },
+        { ...DETECTED, plannerProvider: 'claude-code', orchestratorModel: 'opus', runners: [claude('unknown', ['claude', 'auth', 'login'])] },
+        { ...DETECTED, plannerProvider: 'claude-code', orchestratorModel: 'opus', runners: [claude('signed-out')] },
+        { ...DETECTED, plannerProvider: 'openrouter', orchestratorModel: 'x/y', configuredProviders: ['openrouter'] },
+      ];
+      for (const over of cases) {
+        const row = screen({ cols: 80, ...over }).find((l) => stripAnsi(l).trimStart().startsWith('Planner'));
+        expect(row).toBeDefined();
+        expect(row!).not.toContain('\x1b[31m');
+      }
+    } finally {
+      style.enabled = false;
+    }
+  });
+
+  it('keeps the Runners row inside a narrow pane', () => {
+    style.enabled = true;
+    try {
+      const out = screen({
+        ...DETECTED, cols: 40, rows: 40, plannerProvider: 'claude-code',
+        runners: [claude('signed-out', ['claude', 'auth', 'login']), codex()],
+      });
+      for (const line of out) expect(width(line)).toBeLessThanOrEqual(40);
+    } finally {
+      style.enabled = false;
+    }
+  });
+});
+
 describe('transcript', () => {
   it('shows the newest messages', () => {
     const out = text({ conversation: chatOf(['planner', 'Which database?']) });
@@ -308,6 +457,7 @@ describe('transcript', () => {
   describe('setup rows', () => {
     const claude = {
       ...DETECTED,
+      runSettingsKnown: true,
       plannerProvider: 'claude-code',
       orchestratorModel: 'opus',
       runners: [{ id: 'claude-code', name: 'Claude Code', enabled: true }],
@@ -492,6 +642,15 @@ describe('plan pane', () => {
 });
 
 describe('status line', () => {
+  // A fake clock keeps the resume label's two forms — a same-day time and a
+  // dated one — from depending on when the suite runs.
+  beforeEach(() => {
+    vi.useFakeTimers({ now: new Date(2026, 9, 14, 11, 0), toFake: ['Date'] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   const viewing = (taskId: string, over: Partial<TuiState> = {}): Partial<TuiState> => ({
     taskView: { taskId, view: EMPTY_TASK_LOG, attempts: [1], attempt: 1, pending: [], loaded: true, followLatest: true, queuedIndex: 0 },
     ...over,
@@ -522,7 +681,11 @@ describe('status line', () => {
   it('states a usage-limit pause\'s resume time in that task\'s chat', () => {
     const resumeAt = new Date(2026, 9, 14, 12, 12).toISOString();
     const paused = [{ ...tasks[1], status: 'awaiting_user', awaitingReason: 'usage-limit' as const, resumeAt }];
-    expect(text({ tasks: paused, ...viewing('b') })).toMatch(/paused · resumes .*12:12/);
+    expect(text({ tasks: paused, ...viewing('b') })).toContain('paused · resumes 12:12pm');
+
+    // Another day names the date, so a resume tomorrow is never read as today's.
+    const tomorrow = [{ ...tasks[1], status: 'awaiting_user', awaitingReason: 'usage-limit' as const, resumeAt: new Date(2026, 9, 15, 8, 10).toISOString() }];
+    expect(text({ tasks: tomorrow, ...viewing('b') })).toContain('paused · resumes Oct 15, 8:10am');
   });
 });
 
@@ -538,6 +701,12 @@ describe('plan pane run hints', () => {
     expect(text({ tasks: waiting, ...taskChat })).toContain('Plan 1/3 · 1 task waits for you');
   });
 
+  it('says a start is starting in the plan title and the status row', () => {
+    const out = text({ tasks, status: 'starting' });
+    expect(out).toContain('Plan 1/3 · starting…');
+    expect(out).toContain('Starting the plan…');
+  });
+
   it('carries the Merge all pause in its title, in either chat', () => {
     expect(text({ cols: 140, tasks, status: 'executing', runMerge: mergePaused })).toContain('paused for Merge all: /handoff merge');
     expect(text({ cols: 140, tasks, status: 'executing', runMerge: mergePaused, ...taskChat })).toContain('paused for Merge all: /handoff merge');
@@ -547,8 +716,10 @@ describe('plan pane run hints', () => {
     expect(text({ tasks, status: 'executing', runMerge: mergePaused })).toContain('Plan 1/3 · paused · /handoff merge');
   });
 
-  it('falls back to the status row where a narrow terminal has no plan pane', () => {
-    expect(text({ cols: 60, tasks: waiting })).toContain('1 task waits for you');
+  it('carries the hint in the stacked plan\'s title where a narrow terminal puts the plan under the chat', () => {
+    const out = text({ cols: 60, tasks: waiting });
+    expect(out).toContain('Plan 1/3 · 1 task waits for you');
+    expect(out.match(/1 task waits for you/g)).toHaveLength(1);
   });
 });
 
@@ -764,7 +935,7 @@ describe('overlays', () => {
 
   it('names the conversation commands in the help sheet', () => {
     const sheet = helpLayout(200, 120).lines.map(stripAnsi).join('\n');
-    for (const command of ['/fork', '/rewind', '/compact']) expect(sheet).toContain(command);
+    for (const command of ['/fork', '/rewind', '/compact', '/resume']) expect(sheet).toContain(command);
   });
 
   it('names the detail-all toggle in the help sheet', () => {
@@ -809,15 +980,15 @@ describe('footer', () => {
     expect(out).not.toMatch(/f start/);
   });
 
-  it('advertises opening the log on the selected task', () => {
-    expect(text({ tasks, focus: 'plan', cols: 140 })).toMatch(/enter log/);
+  it('advertises opening the chat on the selected task', () => {
+    expect(text({ tasks, focus: 'plan', cols: 140 })).toMatch(/enter chat/);
   });
 
   it('wraps the plan hints instead of truncating the tail off a narrow terminal', () => {
     // A single truncated line hid the keys the footer exists to teach.
     const out = render(initialState({ tasks, focus: 'plan', rows: 40, cols: 60 }));
 
-    expect(out.join('\n')).toMatch(/enter log/);
+    expect(out.join('\n')).toMatch(/enter chat/);
     expect(out.every((line) => line.length <= 60)).toBe(true);
   });
 
@@ -1512,8 +1683,8 @@ describe('plan markers', () => {
   it('then says what the plan became, and how many tasks it has', () => {
     const building: SessionMessage = { type: 'plan_token', turnId: 't1', token: '{"tasks":' };
 
-    expect(blockRows(heard(80, building, plan('Plan generated with 2 tasks.', 't1')), '◇')).toEqual(['◇ Plan generated (2 tasks)']);
-    expect(blockRows(heard(80, plan('Plan updated — now 1 task.')), '◇')).toEqual(['◇ Plan updated (1 task)']);
+    expect(blockRows(heard(80, building, plan('Plan generated with 2 tasks.', 't1')), '◇')).toEqual(['◇ Plan generated · 2 tasks']);
+    expect(blockRows(heard(80, plan('Plan updated — now 1 task.')), '◇')).toEqual(['◇ Plan updated · 1 task']);
   });
 });
 
@@ -1527,11 +1698,11 @@ describe('the token line', () => {
   it('sits on the chat pane\'s bottom row with how full the context is, and no token count', () => {
     const state = heard(80, { type: 'planner_message', content: 'Which database?', timestamp: '' }, usage({ contextFill: { usedTokens: 36_000, windowTokens: 200_000 } }));
 
-    expect(bottomRow(state)).toBe('ctx 36k (18%)');
+    expect(bottomRow(state)).toBe('Planner ctx 36k (18%)');
   });
 
   it('draws the used tokens without a share while the window is unknown', () => {
-    expect(bottomRow(heard(80, usage({ contextFill: { usedTokens: 36_000 } })))).toBe('ctx 36k');
+    expect(bottomRow(heard(80, usage({ contextFill: { usedTokens: 36_000 } })))).toBe('Planner ctx 36k');
   });
 
   it('draws nothing when neither the context nor a cost is known, however many tokens were counted', () => {
@@ -1541,7 +1712,7 @@ describe('the token line', () => {
   it('shows a cost only when one was reported', () => {
     const state = heard(80, usage({ totals: { inputTokens: 12_400, outputTokens: 3_100, reportedCost: { usd: 0.42 } }, contextFill: { usedTokens: 36_000, windowTokens: 200_000 } }));
 
-    expect(bottomRow(state)).toBe('ctx 36k (18%) · $0.42');
+    expect(bottomRow(state)).toBe('Planner ctx 36k (18%) · $0.42');
   });
 
   it('counts what subagents cost in the total, once', () => {
@@ -1555,7 +1726,7 @@ describe('the token line', () => {
     const back = reduce(long, { type: 'key', key: { name: 'pageup' } }).state;
 
     expect(back.scroll).toBeGreaterThan(0);
-    expect(bottomRow(back)).toBe('ctx 36k (18%)');
+    expect(bottomRow(back)).toBe('Planner ctx 36k (18%)');
     expect(render(back).map(stripAnsi).join('\n')).not.toContain('reply 39');
   });
 
@@ -1566,7 +1737,7 @@ describe('the token line', () => {
       { type: 'planner_turn_started', turnId: 'w1', prompt: '', wakeUps: ['Run update: task 1 failed'], supervisor: true },
     );
 
-    expect(bottomRow(state)).toBe('ctx 36k (18%)');
+    expect(bottomRow(state)).toBe('Planner ctx 36k (18%)');
   });
 
   it('takes no row until usage is reported', () => {
@@ -1659,7 +1830,7 @@ describe('a reloaded session', () => {
   it('draws what the live view drew, for everything the session saves', () => {
     expect(render(live).map(stripAnsi).join('\n')).toContain('∴ Thinking');
     expect(saved(reloaded)).toEqual(saved(live));
-    expect(saved(reloaded).at(-1)).toBe('ctx 3k (2%) · $0.02');
+    expect(saved(reloaded).at(-1)).toBe('Planner ctx 3k (2%) · $0.02');
   });
 
   it('draws the same in full detail too', () => {
@@ -1681,7 +1852,7 @@ describe('queued prompts with the conversation', () => {
 
     expect(rows[bubble]).toBe('◇ Use SQLite · queued · esc to unsend · ctrl-s sends now');
     expect(bubble).toBeGreaterThan(rows.findIndex((r) => r.startsWith('○ Bash(npm test)')));
-    expect(rows[bodyRows(state) - 1]).toBe('ctx 900');
+    expect(rows[bodyRows(state) - 1]).toBe('Planner ctx 900');
     expect(bubble).toBeLessThan(bodyRows(state) - 1);
   });
 });

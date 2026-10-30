@@ -5,8 +5,8 @@ import type { SettingsChange, WebviewToHost } from '../shared/protocol';
 import { isKnownSlashCommand } from '../commands/SlashParser';
 import { handleIsolationAction } from './isolation';
 import {
-  handleAddTask, handleCheckpointAnswer, handleResolveApproval, handleMergePlan, handleNewSession, handleRemoveTask,
-  handleSendMessage, handleSendMessageNow, handleSplitPlan, handleStopPlanning, handleSystemCommand, handleTaskControl, handleTaskEdit, type PlanManagerDeps,
+  handleAddTask, handleCheckpointAnswer, handleResolveApproval, handleNewSession, handleRemoveTask,
+  handleSendMessage, handleSendMessageNow, handleStopPlanning, handleSystemCommand, handleTaskControl, handleTaskEdit, type PlanManagerDeps,
 } from './PlanManager';
 
 /** What the extension itself answers: the catalog, the planner choice and the task skills — none of it a plan action. */
@@ -18,8 +18,14 @@ export interface ExtensionHandlers {
   setPlannerModel(modelId: string, effort?: string): Promise<void>;
   /** Open (or focus) the on-demand task-log tab for a structured task (ADR-0018, V1). */
   openTaskLog(taskId: string): void;
+  /** Open a workspace-relative file Ordewell kept, such as a handoff's saved patch (ADR-0050). */
+  openFile(path: string): void;
   setPlanDockHeight(height: number): void;
   changeSettings(change: SettingsChange): Promise<void>;
+  /** Sign a coding agent in with its own login in a terminal; no runner means the active planner. */
+  loginPlanner(runner?: string): Promise<void>;
+  /** Save a Runners pill's choice; the host answers `requestId` with what was saved, whether or not the save lands. */
+  setRunnerEnabled(runnerId: RunnerId, enabled: boolean, requestId: string): Promise<void>;
 }
 
 export interface WebviewRouterDeps extends PlanManagerDeps {
@@ -78,8 +84,11 @@ async function dispatchWebviewMessage(msg: WebviewToHost, deps: WebviewRouterDep
     case 'sendHeldPromptNow':
       await sendHeldPromptNow(msg.index, deps);
       return;
+    // A Retry compaction is a planner turn the chat did not send, so nothing
+    // else releases what was typed while it ran.
     case 'sendSystemCommand':
-      await handleSystemCommand(msg.command, msg.taskId ?? '', deps);
+      await handleSystemCommand(msg.command, msg.taskId ?? '', deps, msg.requestId);
+      sendNextHeldPrompt(deps);
       return;
     case 'editTask':
       await handleTaskEdit(msg.taskId, msg.edit, deps);
@@ -114,14 +123,6 @@ async function dispatchWebviewMessage(msg: WebviewToHost, deps: WebviewRouterDep
     case 'interruptTask':
       await handleTaskControl({ kind: 'interrupt' }, msg.taskId, deps);
       return;
-    case 'mergeTasks':
-      await handleMergePlan(msg.taskIds, deps);
-      sendNextHeldPrompt(deps);
-      return;
-    case 'splitTask':
-      await handleSplitPlan(msg.taskId, deps);
-      sendNextHeldPrompt(deps);
-      return;
     case 'isolationAction':
       await handleIsolationAction(msg.action, msg.taskId, deps);
       return;
@@ -141,6 +142,9 @@ async function dispatchWebviewMessage(msg: WebviewToHost, deps: WebviewRouterDep
     case 'openTaskLog':
       deps.extension.openTaskLog(msg.taskId);
       return;
+    case 'openFile':
+      deps.extension.openFile(msg.path);
+      return;
     case 'setPlanDockHeight':
       deps.extension.setPlanDockHeight(msg.height);
       return;
@@ -152,6 +156,14 @@ async function dispatchWebviewMessage(msg: WebviewToHost, deps: WebviewRouterDep
       return;
     case 'changeSettings':
       await deps.extension.changeSettings(msg.change);
+      return;
+    case 'setRunnerEnabled':
+      await deps.extension.setRunnerEnabled(msg.runnerId, msg.enabled, msg.requestId);
+      return;
+    // Awaited on purpose: the flow waits on the user's own terminal, and a
+    // poll that throws must still reach the user instead of vanishing.
+    case 'loginPlanner':
+      await deps.extension.loginPlanner(msg.runner);
       return;
     case 'stopResearch':
       handleStopPlanning(deps);
@@ -218,9 +230,12 @@ async function sendHeldPromptNow(index: number, deps: WebviewRouterDeps): Promis
  * The turn is over once its handler has returned — its abort cleared, its
  * plan applied — so the oldest queued prompt goes now. A handler that returns
  * mid-turn (a slash command) sends nothing: the turn still generating drains
- * the queue when it ends.
+ * the queue when it ends. The one place a held prompt is released, whoever ran
+ * the turn: the Command Palette's compaction calls it too. Released twice for
+ * one turn, as `/compact` is, the second finds the planner busy with the
+ * first prompt's turn and sends nothing.
  */
-function sendNextHeldPrompt(deps: WebviewRouterDeps): void {
+export function sendNextHeldPrompt(deps: WebviewRouterDeps): void {
   if (deps.isGeneratingPlan()) return;
   const next = deps.chatProvider.conversation.nextPrompt();
   if (next !== undefined) sendChat(next, true, undefined, deps).catch((err: unknown) => reportFailure('sendMessage', err, deps));
