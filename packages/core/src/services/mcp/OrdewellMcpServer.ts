@@ -276,7 +276,7 @@ function unknownToolMessage(called: string, inventory: ToolInventory): string {
     `Disabled: ${disabledLine(inventory.withheld)}`,
   ];
   const bare = called.replace(RUNNER_TOOL_PREFIX, '');
-  if (bare !== called && (inventory.served.includes(bare) || inventory.withheld.some((w) => w.name === bare))) {
+  if (bare !== called && inventory.served.includes(bare)) {
     lines.push(`This server names its tools without a runner's prefix: call '${bare}'.`);
   }
   return lines.filter((line) => line.length > 0).join('\n');

@@ -523,10 +523,11 @@ function invocationError(name: string, input: z.ZodObject, error: z.ZodError, ar
     return refusal === undefined ? issue : { ...issue, message: refusal };
   });
   const leaks = leakedMarkupIn(args);
+  const lines = issues.flatMap((issue) => issueLines(issue, args));
   return [
     `Invocation error: ${name} rejected the call before it ran; nothing changed.`,
-    ...issues.slice(0, ISSUE_LINES_MAX).flatMap((issue) => issueLines(issue, args)),
-    ...(issues.length > ISSUE_LINES_MAX ? [`… and ${issues.length - ISSUE_LINES_MAX} more rejected slots`] : []),
+    ...lines.slice(0, ISSUE_LINES_MAX),
+    ...(lines.length > ISSUE_LINES_MAX ? [`… and ${lines.length - ISSUE_LINES_MAX} more rejected slots`] : []),
     `Parameters of ${name}: ${Object.keys(input.shape).join(', ') || 'none'}.`,
     ...(leaks.length > 0 ? [markupRefusal(leaks)] : []),
 
